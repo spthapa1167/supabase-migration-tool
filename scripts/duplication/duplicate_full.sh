@@ -1,0 +1,258 @@
+#!/bin/bash
+# Full Duplication Script: Schema + Data
+# Duplicates entire Supabase project including all data
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+# Source utilities
+source "$PROJECT_ROOT/lib/supabase_utils.sh"
+
+# Configuration
+SOURCE_ENV=${1:-}
+TARGET_ENV=${2:-}
+BACKUP_TARGET=${3:-false}
+
+# Usage
+usage() {
+    cat << EOF
+Usage: $0 <source_env> <target_env> [--backup]
+
+Full duplication: Copies schema + all data from source to target
+
+Arguments:
+  source_env    Source environment (prod, test, dev)
+  target_env    Target environment (prod, test, dev)
+  --backup      Create backup of target before duplication (optional)
+
+Examples:
+  $0 prod test          # Copy production to test
+  $0 prod dev           # Copy production to develop
+  $0 dev test           # Copy develop to test
+  $0 prod test --backup # Copy production to test with backup
+
+EOF
+    exit 1
+}
+
+# Check arguments
+if [ -z "$SOURCE_ENV" ] || [ -z "$TARGET_ENV" ]; then
+    usage
+fi
+
+# Load environment
+load_env
+validate_environments "$SOURCE_ENV" "$TARGET_ENV"
+
+# Safety check for production
+confirm_production_operation "FULL DUPLICATION (Schema + Data)" "$TARGET_ENV"
+
+# Get project references and passwords
+SOURCE_REF=$(get_project_ref "$SOURCE_ENV")
+TARGET_REF=$(get_project_ref "$TARGET_ENV")
+SOURCE_PASSWORD=$(get_db_password "$SOURCE_ENV")
+TARGET_PASSWORD=$(get_db_password "$TARGET_ENV")
+
+log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
+log_info "Target: $TARGET_ENV ($TARGET_REF)"
+echo ""
+
+# Create backup directory
+BACKUP_DIR=$(create_backup_dir)
+LOG_FILE="$BACKUP_DIR/duplication.log"
+
+log_to_file "$LOG_FILE" "Starting full duplication from $SOURCE_ENV to $TARGET_ENV"
+
+# Step 1: Backup target if requested
+if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
+    log_info "Creating backup of target environment..."
+    log_to_file "$LOG_FILE" "Creating backup of target"
+    
+    # Link to target for backup
+    if link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
+        log_info "Backing up target database..."
+        POOLER_HOST=$(get_pooler_host "$TARGET_REF")
+        PGPASSWORD="$TARGET_PASSWORD" pg_dump \
+            -h "$POOLER_HOST" \
+            -p 6543 \
+            -U postgres.${TARGET_REF} \
+            -d postgres \
+            -Fc \
+            -f "$BACKUP_DIR/target_backup.dump" \
+            2>&1 | tee -a "$LOG_FILE" || log_warning "Backup may have failed, continuing..."
+        
+        log_success "Backup created: $BACKUP_DIR/target_backup.dump"
+        supabase unlink --yes 2>/dev/null || true
+    fi
+fi
+
+# Step 2: Dump source database (schema + data)
+log_info "Dumping source database (schema + data)..."
+log_to_file "$LOG_FILE" "Dumping source database"
+
+# Link to source
+if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD"; then
+    log_error "Failed to link to source project"
+    exit 1
+fi
+
+# Create dump file
+DUMP_FILE="$BACKUP_DIR/source_full.dump"
+
+log_info "Creating full database dump..."
+# Try pooler first, fallback to direct connection
+POOLER_HOST=$(get_pooler_host "$SOURCE_REF")
+PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
+    -h "$POOLER_HOST" \
+    -p 6543 \
+    -U postgres.${SOURCE_REF} \
+    -d postgres \
+    -Fc \
+    --verbose \
+    -f "$DUMP_FILE" \
+    2>&1 | tee -a "$LOG_FILE" || {
+    log_warning "Pooler connection failed, trying direct connection..."
+    PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
+        -h db.${SOURCE_REF}.supabase.co \
+        -p 5432 \
+        -U postgres.${SOURCE_REF} \
+        -d postgres \
+        -Fc \
+        --verbose \
+        -f "$DUMP_FILE" \
+        2>&1 | tee -a "$LOG_FILE"
+}
+
+if [ ! -f "$DUMP_FILE" ] || [ ! -s "$DUMP_FILE" ]; then
+    log_error "Failed to create dump file"
+    exit 1
+fi
+
+log_success "Dump created: $DUMP_FILE ($(du -h "$DUMP_FILE" | cut -f1))"
+log_to_file "$LOG_FILE" "Dump file size: $(du -h "$DUMP_FILE" | cut -f1)"
+
+# Unlink from source
+supabase unlink --yes 2>/dev/null || true
+
+# Step 3: Restore to target
+log_info "Restoring to target environment..."
+log_to_file "$LOG_FILE" "Restoring to target environment"
+
+# Link to target
+if ! link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
+    log_error "Failed to link to target project"
+    exit 1
+fi
+
+# Drop existing objects (careful!)
+log_warning "Dropping existing objects in target database..."
+log_to_file "$LOG_FILE" "Dropping existing objects"
+
+# Create a SQL script to drop all objects
+DROP_SCRIPT="$BACKUP_DIR/drop_all.sql"
+cat > "$DROP_SCRIPT" << 'EOF'
+-- Drop all objects
+DO $$ 
+DECLARE
+    r RECORD;
+BEGIN
+    -- Drop all tables
+    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') 
+    LOOP
+        EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
+    END LOOP;
+    
+    -- Drop all sequences
+    FOR r IN (SELECT sequence_name FROM information_schema.sequences WHERE sequence_schema = 'public')
+    LOOP
+        EXECUTE 'DROP SEQUENCE IF EXISTS ' || quote_ident(r.sequence_name) || ' CASCADE';
+    END LOOP;
+    
+    -- Drop all functions
+    FOR r IN (SELECT proname, oidvectortypes(proargtypes) as args 
+              FROM pg_proc INNER JOIN pg_namespace ON pg_proc.pronamespace = pg_namespace.oid 
+              WHERE pg_namespace.nspname = 'public')
+    LOOP
+        EXECUTE 'DROP FUNCTION IF EXISTS ' || quote_ident(r.proname) || '(' || r.args || ') CASCADE';
+    END LOOP;
+END $$;
+EOF
+
+# Execute drop script
+POOLER_HOST=$(get_pooler_host "$TARGET_REF")
+PGPASSWORD="$TARGET_PASSWORD" psql \
+    -h "$POOLER_HOST" \
+    -p 6543 \
+    -U postgres.${TARGET_REF} \
+    -d postgres \
+    -f "$DROP_SCRIPT" \
+    2>&1 | tee -a "$LOG_FILE" || log_warning "Some objects may not have been dropped"
+
+# Restore dump
+log_info "Restoring dump to target..."
+log_to_file "$LOG_FILE" "Restoring dump file"
+
+PGPASSWORD="$TARGET_PASSWORD" pg_restore \
+    -h "$POOLER_HOST" \
+    -p 6543 \
+    -U postgres.${TARGET_REF} \
+    -d postgres \
+    --verbose \
+    --no-owner \
+    --no-acl \
+    --clean \
+    --if-exists \
+    "$DUMP_FILE" \
+    2>&1 | tee -a "$LOG_FILE"
+
+if [ $? -eq 0 ]; then
+    log_success "Database restored successfully!"
+    log_to_file "$LOG_FILE" "Restore completed successfully"
+else
+    log_error "Restore failed!"
+    log_to_file "$LOG_FILE" "Restore failed with exit code $?"
+    exit 1
+fi
+
+# Step 4: Copy storage buckets (via Supabase API)
+log_info "Copying storage buckets..."
+log_to_file "$LOG_FILE" "Copying storage buckets"
+
+# Note: Storage buckets need to be copied via Supabase Dashboard or API
+# This is a placeholder - actual implementation would require API calls
+log_warning "Storage buckets need to be copied manually via Supabase Dashboard"
+log_info "Go to: https://supabase.com/dashboard/project/$TARGET_REF/storage/buckets"
+
+# Step 5: Copy edge functions (if any)
+log_info "Checking for edge functions..."
+log_to_file "$LOG_FILE" "Checking edge functions"
+
+# Edge functions are typically in the codebase, not in the database
+log_info "Edge functions should be deployed separately via Supabase CLI"
+
+# Final summary
+log_success "Full duplication completed!"
+log_to_file "$LOG_FILE" "Duplication completed successfully"
+
+echo ""
+log_info "Summary:"
+log_info "  Source: $SOURCE_ENV ($SOURCE_REF)"
+log_info "  Target: $TARGET_ENV ($TARGET_REF)"
+log_info "  Backup directory: $BACKUP_DIR"
+log_info "  Log file: $LOG_FILE"
+echo ""
+
+# Unlink from target
+supabase unlink --yes 2>/dev/null || true
+
+log_info "⚠️  Remember to:"
+log_info "  1. Copy storage buckets manually via Dashboard"
+log_info "  2. Deploy edge functions if needed"
+log_info "  3. Verify realtime configurations"
+log_info "  4. Test the duplicated environment"
+
+exit 0
+

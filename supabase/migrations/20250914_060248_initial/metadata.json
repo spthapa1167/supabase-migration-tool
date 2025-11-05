@@ -1,0 +1,14 @@
+{
+  "name": "initial",
+  "timestamp": "2025-11-04T20:08:16Z",
+  "description": "Migrated from old format",
+  "author": "satyathapa",
+  "environment": "",
+  "files": {
+    "migration": "migration.sql",
+    "rollback": "rollback.sql",
+    "diff_before": "diff_before.sql",
+    "diff_after": "diff_after.sql"
+  },
+  "status": "pending"
+}
