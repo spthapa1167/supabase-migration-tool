@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)" pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Source utilities
@@ -65,6 +65,9 @@ LOG_FILE="$BACKUP_DIR/schema_duplication.log"
 
 log_to_file "$LOG_FILE" "Starting schema-only duplication from $SOURCE_ENV to $TARGET_ENV"
 
+# Source rollback utilities
+source "$PROJECT_ROOT/lib/rollback_utils.sh" 2>/dev/null || true
+
 # Step 1: Backup target if requested
 if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
     log_info "Creating backup of target environment..."
@@ -72,6 +75,7 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
     
     if link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
         POOLER_HOST=$(get_pooler_host "$TARGET_REF")
+        log_info "Backing up target database (binary format)..."
         PGPASSWORD="$TARGET_PASSWORD" pg_dump \
             -h "$POOLER_HOST" \
             -p 6543 \
@@ -82,6 +86,16 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
             2>&1 | tee -a "$LOG_FILE" || log_warning "Backup may have failed, continuing..."
         
         log_success "Backup created: $BACKUP_DIR/target_backup.dump"
+        
+        # Capture target schema state as SQL for manual rollback in Supabase SQL editor
+        log_info "Creating rollback SQL script for Supabase SQL Editor..."
+        if capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$BACKUP_DIR/rollback_db.sql" "schema"; then
+            log_success "Rollback SQL script created: $BACKUP_DIR/rollback_db.sql"
+            log_info "You can copy this file and run it in Supabase SQL Editor to rollback"
+        else
+            log_warning "Failed to create rollback SQL script, but binary backup exists"
+        fi
+        
         supabase unlink --yes 2>/dev/null || true
     fi
 fi
@@ -254,21 +268,34 @@ BEGIN
 END $$;
 EOF
 
-# Execute drop script
+# Execute drop script (try pooler first, fallback to direct connection)
 POOLER_HOST=$(get_pooler_host "$TARGET_REF")
-PGPASSWORD="$TARGET_PASSWORD" psql \
+if ! PGPASSWORD="$TARGET_PASSWORD" psql \
     -h "$POOLER_HOST" \
     -p 6543 \
     -U postgres.${TARGET_REF} \
     -d postgres \
     -f "$DROP_SCRIPT" \
-    2>&1 | tee -a "$LOG_FILE" || log_warning "Some objects may not have been dropped"
+    2>&1 | tee -a "$LOG_FILE"; then
+    log_warning "Pooler connection failed for drop, trying direct connection..."
+    if ! PGPASSWORD="$TARGET_PASSWORD" psql \
+        -h db.${TARGET_REF}.supabase.co \
+        -p 5432 \
+        -U postgres.${TARGET_REF} \
+        -d postgres \
+        -f "$DROP_SCRIPT" \
+        2>&1 | tee -a "$LOG_FILE"; then
+        log_warning "Some objects may not have been dropped"
+    fi
+fi
 
-# Restore schema dump
+# Restore schema dump (try pooler first, fallback to direct connection)
 log_info "Restoring schema dump..."
 log_to_file "$LOG_FILE" "Restoring schema dump file"
 
-PGPASSWORD="$TARGET_PASSWORD" pg_restore \
+RESTORE_SUCCESS=false
+RESTORE_OUTPUT=$(mktemp)
+if PGPASSWORD="$TARGET_PASSWORD" pg_restore \
     -h "$POOLER_HOST" \
     -p 6543 \
     -U postgres.${TARGET_REF} \
@@ -280,14 +307,46 @@ PGPASSWORD="$TARGET_PASSWORD" pg_restore \
     --if-exists \
     --schema-only \
     "$SCHEMA_DUMP" \
-    2>&1 | tee -a "$LOG_FILE"
+    2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"; then
+    # Check if restore actually succeeded (pg_restore returns 0 even with some errors)
+    # Fail only if there's a FATAL error (connection issue)
+    if ! grep -q "FATAL:" "$RESTORE_OUTPUT" 2>/dev/null; then
+        RESTORE_SUCCESS=true
+    fi
+fi
+rm -f "$RESTORE_OUTPUT"
 
-if [ $? -eq 0 ]; then
+if [ "$RESTORE_SUCCESS" = "false" ]; then
+    log_warning "Pooler connection failed for restore, trying direct connection..."
+    RESTORE_OUTPUT=$(mktemp)
+    if PGPASSWORD="$TARGET_PASSWORD" pg_restore \
+        -h db.${TARGET_REF}.supabase.co \
+        -p 5432 \
+        -U postgres.${TARGET_REF} \
+        -d postgres \
+        --verbose \
+        --no-owner \
+        --no-acl \
+        --clean \
+        --if-exists \
+        --schema-only \
+        "$SCHEMA_DUMP" \
+        2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"; then
+        # Check if restore actually succeeded (pg_restore returns 0 even with some errors)
+        # Fail only if there's a FATAL error (connection issue)
+        if ! grep -q "FATAL:" "$RESTORE_OUTPUT" 2>/dev/null; then
+            RESTORE_SUCCESS=true
+        fi
+    fi
+    rm -f "$RESTORE_OUTPUT"
+fi
+
+if [ "$RESTORE_SUCCESS" = "true" ]; then
     log_success "Schema restored successfully!"
     log_to_file "$LOG_FILE" "Schema restore completed successfully"
 else
     log_error "Schema restore failed!"
-    log_to_file "$LOG_FILE" "Schema restore failed with exit code $?"
+    log_to_file "$LOG_FILE" "Schema restore failed - check log for details"
     exit 1
 fi
 
@@ -295,40 +354,67 @@ fi
 log_info "Applying additional schema elements..."
 log_to_file "$LOG_FILE" "Applying additional schema elements"
 
-# Apply indexes
+# Apply indexes (try pooler first, fallback to direct connection)
 if [ -f "$INDEXES_SQL" ] && [ -s "$INDEXES_SQL" ]; then
     log_info "Applying indexes..."
-    PGPASSWORD="$TARGET_PASSWORD" psql \
+    if ! PGPASSWORD="$TARGET_PASSWORD" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
         -U postgres.${TARGET_REF} \
         -d postgres \
         -f "$INDEXES_SQL" \
-        2>&1 | tee -a "$LOG_FILE" || log_warning "Some indexes may have failed"
+        2>&1 | tee -a "$LOG_FILE"; then
+        log_warning "Pooler connection failed for indexes, trying direct connection..."
+        PGPASSWORD="$TARGET_PASSWORD" psql \
+            -h db.${TARGET_REF}.supabase.co \
+            -p 5432 \
+            -U postgres.${TARGET_REF} \
+            -d postgres \
+            -f "$INDEXES_SQL" \
+            2>&1 | tee -a "$LOG_FILE" || log_warning "Some indexes may have failed"
+    fi
 fi
 
-# Apply constraints
+# Apply constraints (try pooler first, fallback to direct connection)
 if [ -f "$CONSTRAINTS_SQL" ] && [ -s "$CONSTRAINTS_SQL" ]; then
     log_info "Applying constraints..."
-    PGPASSWORD="$TARGET_PASSWORD" psql \
+    if ! PGPASSWORD="$TARGET_PASSWORD" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
         -U postgres.${TARGET_REF} \
         -d postgres \
         -f "$CONSTRAINTS_SQL" \
-        2>&1 | tee -a "$LOG_FILE" || log_warning "Some constraints may have failed"
+        2>&1 | tee -a "$LOG_FILE"; then
+        log_warning "Pooler connection failed for constraints, trying direct connection..."
+        PGPASSWORD="$TARGET_PASSWORD" psql \
+            -h db.${TARGET_REF}.supabase.co \
+            -p 5432 \
+            -U postgres.${TARGET_REF} \
+            -d postgres \
+            -f "$CONSTRAINTS_SQL" \
+            2>&1 | tee -a "$LOG_FILE" || log_warning "Some constraints may have failed"
+    fi
 fi
 
-# Apply policies
+# Apply policies (try pooler first, fallback to direct connection)
 if [ -f "$POLICIES_SQL" ] && [ -s "$POLICIES_SQL" ]; then
     log_info "Applying RLS policies..."
-    PGPASSWORD="$TARGET_PASSWORD" psql \
+    if ! PGPASSWORD="$TARGET_PASSWORD" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
         -U postgres.${TARGET_REF} \
         -d postgres \
         -f "$POLICIES_SQL" \
-        2>&1 | tee -a "$LOG_FILE" || log_warning "Some policies may have failed"
+        2>&1 | tee -a "$LOG_FILE"; then
+        log_warning "Pooler connection failed for policies, trying direct connection..."
+        PGPASSWORD="$TARGET_PASSWORD" psql \
+            -h db.${TARGET_REF}.supabase.co \
+            -p 5432 \
+            -U postgres.${TARGET_REF} \
+            -d postgres \
+            -f "$POLICIES_SQL" \
+            2>&1 | tee -a "$LOG_FILE" || log_warning "Some policies may have failed"
+    fi
 fi
 
 # Step 6: Copy auth configurations (roles, etc.)

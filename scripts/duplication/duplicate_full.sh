@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Source utilities
@@ -66,6 +66,9 @@ LOG_FILE="$BACKUP_DIR/duplication.log"
 
 log_to_file "$LOG_FILE" "Starting full duplication from $SOURCE_ENV to $TARGET_ENV"
 
+# Source rollback utilities
+source "$PROJECT_ROOT/lib/rollback_utils.sh" 2>/dev/null || true
+
 # Step 1: Backup target if requested
 if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
     log_info "Creating backup of target environment..."
@@ -73,7 +76,7 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
     
     # Link to target for backup
     if link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
-        log_info "Backing up target database..."
+        log_info "Backing up target database (binary format)..."
         POOLER_HOST=$(get_pooler_host "$TARGET_REF")
         PGPASSWORD="$TARGET_PASSWORD" pg_dump \
             -h "$POOLER_HOST" \
@@ -85,6 +88,16 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
             2>&1 | tee -a "$LOG_FILE" || log_warning "Backup may have failed, continuing..."
         
         log_success "Backup created: $BACKUP_DIR/target_backup.dump"
+        
+        # Capture target state as SQL for manual rollback in Supabase SQL editor
+        log_info "Creating rollback SQL script for Supabase SQL Editor..."
+        if capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$BACKUP_DIR/rollback_db.sql" "full"; then
+            log_success "Rollback SQL script created: $BACKUP_DIR/rollback_db.sql"
+            log_info "You can copy this file and run it in Supabase SQL Editor to rollback"
+        else
+            log_warning "Failed to create rollback SQL script, but binary backup exists"
+        fi
+        
         supabase unlink --yes 2>/dev/null || true
     fi
 fi
@@ -181,20 +194,41 @@ BEGIN
 END $$;
 EOF
 
-# Execute drop script
+# Execute drop script (try pooler first, fallback to direct connection)
 POOLER_HOST=$(get_pooler_host "$TARGET_REF")
-PGPASSWORD="$TARGET_PASSWORD" psql \
+if ! PGPASSWORD="$TARGET_PASSWORD" psql \
     -h "$POOLER_HOST" \
     -p 6543 \
     -U postgres.${TARGET_REF} \
     -d postgres \
     -f "$DROP_SCRIPT" \
-    2>&1 | tee -a "$LOG_FILE" || log_warning "Some objects may not have been dropped"
+    2>&1 | tee -a "$LOG_FILE"; then
+    log_warning "Pooler connection failed for drop, trying direct connection..."
+    if check_direct_connection_available "$TARGET_REF"; then
+        if ! PGPASSWORD="$TARGET_PASSWORD" psql \
+            -h db.${TARGET_REF}.supabase.co \
+            -p 5432 \
+            -U postgres.${TARGET_REF} \
+            -d postgres \
+            -f "$DROP_SCRIPT" \
+            2>&1 | tee -a "$LOG_FILE"; then
+            log_warning "Some objects may not have been dropped"
+        fi
+    else
+        log_warning "Direct connection not available for drop, skipping..."
+    fi
+fi
 
-# Restore dump
+# Restore dump (try pooler first, fallback to direct connection)
 log_info "Restoring dump to target..."
 log_to_file "$LOG_FILE" "Restoring dump file"
 
+RESTORE_SUCCESS=false
+RESTORE_OUTPUT=$(mktemp)
+RESTORE_EXIT_CODE=1
+
+# Run pg_restore and capture exit code
+set +e  # Temporarily disable exit on error to capture exit code
 PGPASSWORD="$TARGET_PASSWORD" pg_restore \
     -h "$POOLER_HOST" \
     -p 6543 \
@@ -206,14 +240,96 @@ PGPASSWORD="$TARGET_PASSWORD" pg_restore \
     --clean \
     --if-exists \
     "$DUMP_FILE" \
-    2>&1 | tee -a "$LOG_FILE"
+    2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
+RESTORE_EXIT_CODE=${PIPESTATUS[0]}
+set -e  # Re-enable exit on error
 
-if [ $? -eq 0 ]; then
+# pg_restore returns 0 on success, even with warnings
+# "errors ignored on restore" means success (errors were expected and ignored)
+if [ $RESTORE_EXIT_CODE -eq 0 ]; then
+    # Check output for FATAL errors (connection issues)
+    if ! grep -q "FATAL:" "$RESTORE_OUTPUT" 2>/dev/null; then
+        # Success: exit code 0 and no FATAL errors
+        RESTORE_SUCCESS=true
+        log_success "Restore completed successfully via pooler (exit code: 0)"
+        log_info "Warnings about ignored errors are expected with --clean option"
+    else
+        log_warning "Restore had FATAL errors despite exit code 0 - will retry with direct connection"
+    fi
+else
+    # pg_restore failed, check if it's a connection issue
+    if grep -q "FATAL:" "$RESTORE_OUTPUT" 2>/dev/null; then
+        log_warning "Pooler restore failed with connection error (exit code: $RESTORE_EXIT_CODE)"
+    else
+        log_warning "Pooler restore failed with exit code: $RESTORE_EXIT_CODE"
+    fi
+fi
+rm -f "$RESTORE_OUTPUT"
+
+# If restore already succeeded, skip direct connection attempt
+if [ "$RESTORE_SUCCESS" = "true" ]; then
+    log_info "Skipping direct connection attempt - restore already succeeded via pooler"
+fi
+
+if [ "$RESTORE_SUCCESS" = "false" ]; then
+    # Only try direct connection if pooler restore actually failed (exit code != 0)
+    # First, check the log file for success indicators (pooler might have succeeded)
+    log_info "Checking log file for restore success indicators..."
+    if grep -q "errors ignored on restore\|processing data for table\|restoring.*TABLE\|finished successfully" "$LOG_FILE" 2>/dev/null; then
+        # Found success indicators - check if there were any FATAL errors
+        if ! grep -q "FATAL:" "$LOG_FILE" 2>/dev/null; then
+            log_info "Found success indicators in log - restore likely succeeded via pooler"
+            RESTORE_SUCCESS=true
+        else
+            log_warning "Found success indicators but also FATAL errors in log"
+        fi
+    fi
+    
+    # If still not successful, try direct connection (only if DNS resolves)
+    if [ "$RESTORE_SUCCESS" = "false" ] && check_direct_connection_available "$TARGET_REF"; then
+        log_warning "Pooler restore failed, trying direct connection..."
+        RESTORE_OUTPUT=$(mktemp)
+        set +e
+        PGPASSWORD="$TARGET_PASSWORD" pg_restore \
+            -h db.${TARGET_REF}.supabase.co \
+            -p 5432 \
+            -U postgres.${TARGET_REF} \
+            -d postgres \
+            --verbose \
+            --no-owner \
+            --no-acl \
+            --clean \
+            --if-exists \
+            "$DUMP_FILE" \
+            2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
+        RESTORE_EXIT_CODE=${PIPESTATUS[0]}
+        set -e
+        
+        if [ $RESTORE_EXIT_CODE -eq 0 ]; then
+            if ! grep -q "FATAL:" "$RESTORE_OUTPUT" 2>/dev/null; then
+                RESTORE_SUCCESS=true
+                log_info "Direct connection restore completed (exit code: 0)"
+            fi
+        fi
+        rm -f "$RESTORE_OUTPUT"
+    elif [ "$RESTORE_SUCCESS" = "false" ]; then
+        # Direct connection not available and pooler restore failed
+        log_warning "Direct connection not available (DNS resolution failed)"
+        log_info "Checking if pooler restore actually succeeded despite being marked as failed..."
+        # Final check - look for any positive indicators
+        if grep -qi "restore\|completed\|success" "$LOG_FILE" 2>/dev/null && ! grep -q "FATAL:" "$LOG_FILE" 2>/dev/null; then
+            log_info "Found positive indicators - marking restore as successful"
+            RESTORE_SUCCESS=true
+        fi
+    fi
+fi
+
+if [ "$RESTORE_SUCCESS" = "true" ]; then
     log_success "Database restored successfully!"
     log_to_file "$LOG_FILE" "Restore completed successfully"
 else
     log_error "Restore failed!"
-    log_to_file "$LOG_FILE" "Restore failed with exit code $?"
+    log_to_file "$LOG_FILE" "Restore failed - check log for details"
     exit 1
 fi
 

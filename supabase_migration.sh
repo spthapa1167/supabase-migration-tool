@@ -314,54 +314,118 @@ step_diff_comparison() {
         return 0
     fi
     
-    # Check if checkdiff.sh exists
-    if [ ! -f "$PROJECT_ROOT/scripts/utils/checkdiff.sh" ]; then
-        log_warning "Diff script not found: scripts/utils/checkdiff.sh"
-        log_info "Skipping diff comparison"
-        return 0
+    log_info "Comparing database schemas: $source → $target"
+    echo ""
+    
+    # Get project references
+    local source_ref=$(get_project_ref "$source")
+    local target_ref=$(get_project_ref "$target")
+    local source_password=$(get_db_password "$source")
+    local target_password=$(get_db_password "$target")
+    
+    # Create temporary files for schema comparison
+    local temp_dir=$(mktemp -d)
+    local source_schema="$temp_dir/source_schema.sql"
+    local target_schema="$temp_dir/target_schema.sql"
+    
+    log_info "Exporting source schema..."
+    local source_pooler=$(get_pooler_host "$source_ref")
+    set +e
+    PGPASSWORD="$source_password" pg_dump \
+        -h "$source_pooler" \
+        -p 6543 \
+        -U postgres.${source_ref} \
+        -d postgres \
+        --schema-only \
+        --no-owner \
+        --no-acl \
+        -f "$source_schema" \
+        2>&1 | grep -v "WARNING" || {
+        log_warning "Pooler connection failed for source, trying direct connection..."
+        PGPASSWORD="$source_password" pg_dump \
+            -h db.${source_ref}.supabase.co \
+            -p 5432 \
+            -U postgres.${source_ref} \
+            -d postgres \
+            --schema-only \
+            --no-owner \
+            --no-acl \
+            -f "$source_schema" \
+            2>&1 | grep -v "WARNING" || true
+    }
+    set -e
+    
+    log_info "Exporting target schema..."
+    local target_pooler=$(get_pooler_host "$target_ref")
+    set +e
+    PGPASSWORD="$target_password" pg_dump \
+        -h "$target_pooler" \
+        -p 6543 \
+        -U postgres.${target_ref} \
+        -d postgres \
+        --schema-only \
+        --no-owner \
+        --no-acl \
+        -f "$target_schema" \
+        2>&1 | grep -v "WARNING" || {
+        log_warning "Pooler connection failed for target, trying direct connection..."
+        PGPASSWORD="$target_password" pg_dump \
+            -h db.${target_ref}.supabase.co \
+            -p 5432 \
+            -U postgres.${target_ref} \
+            -d postgres \
+            --schema-only \
+            --no-owner \
+            --no-acl \
+            -f "$target_schema" \
+            2>&1 | grep -v "WARNING" || true
+    }
+    set -e
+    
+    # Compare schemas
+    log_info "Comparing schemas..."
+    if [ ! -f "$source_schema" ] || [ ! -s "$source_schema" ]; then
+        log_warning "Could not export source schema - skipping comparison"
+        rm -rf "$temp_dir"
+        return 0  # Continue with migration
     fi
     
-    log_info "Running diff comparison: $source → $target"
-    echo ""
-    log_info "This will compare:"
-    log_info "  - Database Schema"
-    log_info "  - Storage Buckets"
-    log_info "  - Realtime Configuration"
-    log_info "  - Cron Jobs"
-    log_info "  - Edge Functions"
-    log_info "  - Secrets"
-    echo ""
+    if [ ! -f "$target_schema" ] || [ ! -s "$target_schema" ]; then
+        log_warning "Could not export target schema - skipping comparison"
+        rm -rf "$temp_dir"
+        return 0  # Continue with migration
+    fi
     
-    # Run diff script (capture output)
-    local diff_output
-    local diff_exit_code
+    # Normalize schemas for comparison (remove comments, timestamps, etc.)
+    local source_normalized="$temp_dir/source_normalized.sql"
+    local target_normalized="$temp_dir/target_normalized.sql"
     
-    diff_output=$("$PROJECT_ROOT/scripts/utils/checkdiff.sh" "$source" "$target" --env-file "$ENV_FILE" 2>&1)
-    diff_exit_code=$?
+    # Remove comments, blank lines, and normalize whitespace
+    grep -v '^--' "$source_schema" | grep -v '^$' | sed 's/[[:space:]]\+/ /g' | sort > "$source_normalized"
+    grep -v '^--' "$target_schema" | grep -v '^$' | sed 's/[[:space:]]\+/ /g' | sort > "$target_normalized"
     
-    echo "$diff_output"
-    echo ""
-    
-    # Analyze diff output
-    if [ $diff_exit_code -eq 0 ]; then
-        log_success "✅ Projects are identical - no differences found"
+    # Compare normalized schemas
+    if diff -q "$source_normalized" "$target_normalized" >/dev/null 2>&1; then
+        log_success "✅ Database schemas are identical - no differences found"
         echo ""
-        log_warning "⚠️  Warning: Source and target are already identical!"
-        echo ""
-        if ! prompt_proceed "Diff Comparison Complete" "Projects are identical. Do you still want to proceed with migration?"; then
-            return 1
-        fi
+        rm -rf "$temp_dir"
+        return 2  # Special return code: projects are identical
     else
-        log_info "⚠️  Differences found between source and target projects"
+        log_info "⚠️  Differences found between source and target schemas"
+        local diff_lines=$(diff "$source_normalized" "$target_normalized" | wc -l)
+        log_info "   Found approximately $diff_lines lines of differences"
         echo ""
-        log_info "Summary of differences shown above."
-        echo ""
-        if ! prompt_proceed "Diff Comparison Complete" "Review the differences above. Do you want to proceed with migration?"; then
-            return 1
+        
+        # Optionally show some differences
+        if [ "$diff_lines" -lt 50 ]; then
+            log_info "Sample differences:"
+            diff "$source_normalized" "$target_normalized" | head -20
+            echo ""
         fi
+        
+        rm -rf "$temp_dir"
+        return 0  # Continue with migration
     fi
-    
-    return 0
 }
 
 
@@ -372,6 +436,186 @@ generate_result_md() {
     
     local result_file="$migration_dir/result.md"
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+    local target_ref=$(get_project_ref "$TARGET_ENV")
+    local target_password=$(get_db_password "$TARGET_ENV")
+    local pooler_host=$(get_pooler_host "$target_ref")
+    local backup_file="$migration_dir/target_backup.dump"
+    local has_backup="false"
+    
+    # Check if backup file exists
+    if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
+        has_backup="true"
+    fi
+    
+    # Generate rollback script content
+    local rollback_script_content=""
+    if [ "$has_backup" = "true" ]; then
+        rollback_script_content=$(cat << ROLLBACK_EOF
+#!/bin/bash
+# Rollback Script - Restore Target Database from Backup
+# Migration: $SOURCE_ENV → $TARGET_ENV
+# Generated: $(date)
+
+set -euo pipefail
+
+# Configuration
+MIGRATION_DIR="$migration_dir"
+TARGET_ENV="$TARGET_ENV"
+TARGET_REF="$target_ref"
+TARGET_PASSWORD="$target_password"
+POOLER_HOST="$pooler_host"
+BACKUP_FILE="$backup_file"
+PROJECT_ROOT="$(cd "$(dirname "$migration_dir")/.." && pwd)"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "\${BLUE}[INFO]\${NC} \$1"; }
+log_success() { echo -e "\${GREEN}[SUCCESS]\${NC} \$1"; }
+log_warning() { echo -e "\${YELLOW}[WARNING]\${NC} \$1"; }
+log_error() { echo -e "\${RED}[ERROR]\${NC} \$1"; }
+
+cd "\$PROJECT_ROOT"
+
+# Load environment if available
+if [ -f .env.local ]; then
+    source .env.local
+    export SUPABASE_ACCESS_TOKEN
+fi
+
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  ROLLBACK SCRIPT"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+log_info "This script will rollback the migration: $SOURCE_ENV → $TARGET_ENV"
+log_info "Target: $TARGET_ENV (\$TARGET_REF)"
+log_info "Backup file: \$BACKUP_FILE"
+echo ""
+
+# Check if backup exists
+if [ ! -f "\$BACKUP_FILE" ] || [ ! -s "\$BACKUP_FILE" ]; then
+    log_error "Backup file not found or is empty: \$BACKUP_FILE"
+    log_error "Cannot proceed with rollback."
+    exit 1
+fi
+
+# Confirmation prompt
+log_warning "⚠️  WARNING: This will replace the target database with the backup!"
+log_warning "   Target: $TARGET_ENV (\$TARGET_REF)"
+log_warning "   Backup: \$BACKUP_FILE"
+echo ""
+read -p "Do you want to proceed with rollback? [yes/NO]: " confirmation
+
+if [ "\$confirmation" != "yes" ] && [ "\$confirmation" != "YES" ] && [ "\$confirmation" != "y" ] && [ "\$confirmation" != "Y" ]; then
+    log_info "Rollback cancelled by user."
+    exit 0
+fi
+
+echo ""
+
+# Link to target project
+log_info "Linking to target project..."
+if command -v supabase >/dev/null 2>&1; then
+    if supabase link --project-ref "\$TARGET_REF" --password "\$TARGET_PASSWORD" 2>&1 | tee /tmp/supabase_link.log; then
+        log_success "Successfully linked to project"
+    else
+        log_error "Failed to link to project"
+        cat /tmp/supabase_link.log
+        exit 1
+    fi
+else
+    log_warning "Supabase CLI not found, skipping link step"
+fi
+
+# Restore from backup
+log_info "Restoring database from backup..."
+LOG_FILE="\${MIGRATION_DIR}/rollback.log"
+
+# Try pooler first, fallback to direct connection
+if PGPASSWORD="\$TARGET_PASSWORD" pg_restore \
+    -h "\$POOLER_HOST" \
+    -p 6543 \
+    -U postgres.\${TARGET_REF} \
+    -d postgres \
+    --verbose \
+    --clean \
+    --if-exists \
+    --no-owner \
+    --no-acl \
+    "\$BACKUP_FILE" \
+    2>&1 | tee "\$LOG_FILE"; then
+    # Check for FATAL errors
+    if ! grep -q "FATAL:" "\$LOG_FILE" 2>/dev/null; then
+        log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log_success "  ROLLBACK COMPLETED SUCCESSFULLY"
+        log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        log_info "Rollback log saved to: \$LOG_FILE"
+        ROLLBACK_SUCCESS=true
+    else
+        log_warning "Pooler restore had errors, trying direct connection..."
+        ROLLBACK_SUCCESS=false
+    fi
+else
+    log_warning "Pooler restore failed, trying direct connection..."
+    ROLLBACK_SUCCESS=false
+fi
+
+# Try direct connection if pooler failed
+if [ "\${ROLLBACK_SUCCESS:-false}" != "true" ]; then
+    log_info "Attempting direct connection..."
+    if PGPASSWORD="\$TARGET_PASSWORD" pg_restore \
+        -h db.\${TARGET_REF}.supabase.co \
+        -p 5432 \
+        -U postgres.\${TARGET_REF} \
+        -d postgres \
+        --verbose \
+        --clean \
+        --if-exists \
+        --no-owner \
+        --no-acl \
+        "\$BACKUP_FILE" \
+        2>&1 | tee -a "\$LOG_FILE"; then
+        if ! grep -q "FATAL:" "\$LOG_FILE" 2>/dev/null; then
+            log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_success "  ROLLBACK COMPLETED SUCCESSFULLY"
+            log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            log_info "Rollback log saved to: \$LOG_FILE"
+        else
+            log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_error "  ROLLBACK FAILED"
+            log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            log_error "Check the rollback log for details: \$LOG_FILE"
+            exit 1
+        fi
+    else
+        log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log_error "  ROLLBACK FAILED"
+        log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        log_error "Check the rollback log for details: \$LOG_FILE"
+        exit 1
+    fi
+fi
+
+# Unlink
+if command -v supabase >/dev/null 2>&1; then
+    supabase unlink --yes 2>/dev/null || true
+fi
+
+log_info "Rollback completed. Please verify the target environment."
+exit 0
+ROLLBACK_EOF
+)
+    else
+        rollback_script_content="# No backup available for rollback. Manual rollback required."
+    fi
     
     cat > "$result_file" << EOF
 # Migration Result
@@ -379,63 +623,95 @@ generate_result_md() {
 **Status**: $status  
 **Date**: $timestamp  
 **Source**: $SOURCE_ENV ($(get_project_ref "$SOURCE_ENV"))  
-**Target**: $TARGET_ENV ($(get_project_ref "$TARGET_ENV"))  
+**Target**: $TARGET_ENV ($target_ref)  
 **Mode**: $MODE
 
 ## Summary
 
-Migration from **$SOURCE_ENV** to **$TARGET_ENV** completed with status: **$status**
+$([ "$status" = "⏭️  Skipped (Projects Identical)" ] && echo "Migration from **$SOURCE_ENV** to **$TARGET_ENV** was **skipped** because projects are identical." || echo "Migration from **$SOURCE_ENV** to **$TARGET_ENV** completed with status: **$status**")
 
 ## Migration Details
 
 - **Mode**: $MODE ($([ "$MODE" = "full" ] && echo "Schema + Data" || echo "Schema Only"))
-- **Backup Created**: $([ "$BACKUP_TARGET" = "true" ] && echo "Yes" || echo "No")
+- **Backup Created**: $([ "$has_backup" = "true" ] && echo "Yes" || echo "No")
 - **Dry Run**: $([ "$DRY_RUN" = "true" ] && echo "Yes" || echo "No")
+$([ "$status" = "⏭️  Skipped (Projects Identical)" ] && echo "- **Reason**: Source and target database schemas are identical - no migration needed" || echo "")
 
 ## Rollback Instructions
 
-If you need to rollback this migration:
+### Manual Rollback via Supabase SQL Editor
 
-### Option 1: Restore from Backup
+A **`rollback_db.sql`** file has been generated in the backup folder that contains all SQL statements needed to restore the database to its pre-migration state. This file can be run directly in the Supabase SQL Editor:
 
-If a backup was created during migration, you can restore it using:
+1. Open Supabase Dashboard → SQL Editor
+2. Select the target project
+3. Open the file: `$migration_dir/rollback_db.sql`
+4. Copy the entire contents
+5. Paste into the SQL Editor
+6. Click "Run" to execute
+
+**File Location**: `$migration_dir/rollback_db.sql`
+
+⚠️ **Warning**: This will restore the database to its state before migration. Make sure you have reviewed the script before running it.
+
+### Quick Rollback (Copy & Paste)
+
+If a backup was created, you can use this complete rollback script:
 
 \`\`\`bash
-# Find the backup directory in: $BACKUP_DIR/
-# Look for a directory with timestamp matching this migration
-
-# Restore using pg_restore or the rollback script in the migration directory
+$rollback_script_content
 \`\`\`
 
-### Option 2: Use Rollback Script
+**To use:**
+1. Copy the entire script block above (from \`#!/bin/bash\` to \`exit 0\`)
+2. Save it to a file: \`rollback.sh\` in the migration directory
+3. Make it executable: \`chmod +x rollback.sh\`
+4. Run it: \`./rollback.sh\`
 
-If a rollback script was generated:
+Or execute directly:
 
 \`\`\`bash
-cd "$migration_dir"
-# Review rollback.sql and apply it to the target environment
+$rollback_script_content
 \`\`\`
 
-### Option 3: Manual Rollback
+### Manual Rollback Steps
 
-1. Review the migration files in: \`$migration_dir\`
-2. Identify what was changed
-3. Manually reverse the changes in the target environment
+1. **If backup exists** (\`target_backup.dump\`):
+   \`\`\`bash
+   cd "$migration_dir"
+   source ../../.env.local
+   export SUPABASE_ACCESS_TOKEN
+   
+   # Link to target
+   supabase link --project-ref "$target_ref" --password "$target_password"
+   
+   # Restore from backup
+   PGPASSWORD="$target_password" pg_restore \\
+       -h "$pooler_host" \\
+       -p 6543 \\
+       -U postgres.${target_ref} \\
+       -d postgres \\
+       --clean --if-exists --no-owner --no-acl \\
+       target_backup.dump
+   
+   # Unlink
+   supabase unlink --yes
+   \`\`\`
+
+2. **If no backup**, you'll need to manually reverse the changes based on the migration files.
 
 ## Migration Files
 
-- Migration directory: \`$migration_dir\`
-- Check the following files for details:
-  - \`migration.sql\` - The migration SQL
-  - \`rollback.sql\` - Rollback instructions
-  - \`metadata.json\` - Migration metadata
-  - \`*.log\` - Log files
+- **Migration directory**: \`$migration_dir\`
+- **Backup file**: $([ "$has_backup" = "true" ] && echo "\`$backup_file\`" || echo "Not available")
+- **Log file**: \`migration.log\`
+- **Source dump**: \`source_full.dump\` (or \`source_schema.dump\` for schema-only)
 
 ## Next Steps
 
-1. Verify the migration was successful
-2. Test the target environment
-3. Update any environment-specific configurations if needed
+1. ✅ Verify the migration was successful
+2. ✅ Test the target environment
+3. ✅ Update any environment-specific configurations if needed
 
 ---
 
@@ -482,9 +758,28 @@ perform_migration() {
     fi
     
     # Step 3: Run diff comparison
-    if ! step_diff_comparison "$source" "$target"; then
+    local diff_result
+    step_diff_comparison "$source" "$target"
+    diff_result=$?
+    
+    if [ $diff_result -eq 1 ]; then
         log_error "Diff comparison cancelled by user"
         return 1
+    elif [ $diff_result -eq 2 ]; then
+        # Projects are identical - skip migration
+        log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log_success "  MIGRATION SKIPPED - Projects are identical"
+        log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+        log_info "Source and target projects have identical database schemas."
+        log_info "No migration needed - generating results page..."
+        echo ""
+        
+        # Generate result.md indicating skipped migration
+        generate_result_md "$migration_dir" "⏭️  Skipped (Projects Identical)"
+        
+        log_success "Results page generated: $migration_dir/result.md"
+        return 0
     fi
     
     # Step 4: Actual migration

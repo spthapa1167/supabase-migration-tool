@@ -88,21 +88,68 @@ get_db_password() {
 get_pooler_host() {
     local project_ref=$1
     
+    # First, try to determine from project ref by checking environment-specific pooler region
+    # This is the most reliable method if configured in .env.local
+    if [ "$project_ref" = "$SUPABASE_PROD_PROJECT_REF" ] && [ -n "${SUPABASE_PROD_POOLER_REGION:-}" ]; then
+        echo "${SUPABASE_PROD_POOLER_REGION}.pooler.supabase.com"
+        return 0
+    elif [ "$project_ref" = "$SUPABASE_TEST_PROJECT_REF" ] && [ -n "${SUPABASE_TEST_POOLER_REGION:-}" ]; then
+        echo "${SUPABASE_TEST_POOLER_REGION}.pooler.supabase.com"
+        return 0
+    elif [ "$project_ref" = "$SUPABASE_DEV_PROJECT_REF" ] && [ -n "${SUPABASE_DEV_POOLER_REGION:-}" ]; then
+        echo "${SUPABASE_DEV_POOLER_REGION}.pooler.supabase.com"
+        return 0
+    fi
+    
     # Try to get pooler URL from Supabase API if available
     if [ -n "$SUPABASE_ACCESS_TOKEN" ]; then
-        local pooler_url=$(curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-            "https://api.supabase.com/v1/projects/${project_ref}/config/database/pooler" 2>/dev/null | \
-            grep -o '"pooler_url":"[^"]*"' | cut -d'"' -f4 || echo "")
+        local api_response=$(curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+            "https://api.supabase.com/v1/projects/${project_ref}/config/database/pooler" 2>/dev/null)
         
-        if [ -n "$pooler_url" ]; then
+        # Try multiple JSON parsing methods to extract pooler_url
+        local pooler_url=""
+        if command -v jq >/dev/null 2>&1; then
+            pooler_url=$(echo "$api_response" | jq -r '.pooler_url // .connectionString // empty' 2>/dev/null)
+        fi
+        
+        # Fallback to grep if jq not available
+        if [ -z "$pooler_url" ] || [ "$pooler_url" = "null" ]; then
+            pooler_url=$(echo "$api_response" | grep -o '"pooler_url":"[^"]*"' | cut -d'"' -f4 || echo "")
+        fi
+        
+        if [ -n "$pooler_url" ] && [ "$pooler_url" != "null" ] && [ "$pooler_url" != "" ]; then
             # Extract hostname from URL (e.g., aws-1-us-east-2.pooler.supabase.com)
-            echo "$pooler_url" | sed -E 's|.*://([^:]+):.*|\1|' || echo "aws-1-us-east-2.pooler.supabase.com"
-            return
+            local hostname=$(echo "$pooler_url" | sed -E 's|.*://([^:]+)(:[0-9]+)?(/.*)?|\1|' | sed 's|/$||')
+            if [ -n "$hostname" ] && [ "$hostname" != "" ]; then
+                echo "$hostname"
+                return 0
+            fi
         fi
     fi
     
     # Default to common pooler hostname (can be overridden via env var)
     echo "${SUPABASE_POOLER_HOST:-aws-1-us-east-2.pooler.supabase.com}"
+}
+
+# Check if direct connection is available (DNS resolution test)
+check_direct_connection_available() {
+    local project_ref=$1
+    local hostname="db.${project_ref}.supabase.co"
+    
+    # Try DNS resolution (quick check)
+    if command -v nslookup >/dev/null 2>&1; then
+        nslookup "$hostname" >/dev/null 2>&1
+        return $?
+    elif command -v host >/dev/null 2>&1; then
+        host "$hostname" >/dev/null 2>&1
+        return $?
+    elif command -v dig >/dev/null 2>&1; then
+        dig +short "$hostname" >/dev/null 2>&1
+        return $?
+    fi
+    
+    # If no DNS tools available, assume it might work
+    return 0
 }
 
 # Get connection string for pg_dump/pg_restore
