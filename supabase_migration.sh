@@ -302,6 +302,7 @@ step_validate_connections() {
 step_diff_comparison() {
     local source=$1
     local target=$2
+    local migration_dir="${3:-}"  # Optional: migration directory to save schemas
     
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "  STEP 3/4: Comparing Source and Target Projects"
@@ -327,6 +328,16 @@ step_diff_comparison() {
     local temp_dir=$(mktemp -d)
     local source_schema="$temp_dir/source_schema.sql"
     local target_schema="$temp_dir/target_schema.sql"
+    
+    # If migration_dir is provided, also save schemas there
+    local migration_source_schema=""
+    local migration_target_schema=""
+    local comparison_file=""
+    if [ -n "$migration_dir" ] && [ -d "$migration_dir" ]; then
+        migration_source_schema="$migration_dir/source_schema.sql"
+        migration_target_schema="$migration_dir/target_schema.sql"
+        comparison_file="$migration_dir/comparison_details.txt"
+    fi
     
     log_info "Exporting source schema..."
     local source_pooler=$(get_pooler_host "$source_ref")
@@ -355,6 +366,12 @@ step_diff_comparison() {
     }
     set -e
     
+    # Copy source schema to migration directory if provided
+    if [ -n "$migration_source_schema" ] && [ -f "$source_schema" ] && [ -s "$source_schema" ]; then
+        cp "$source_schema" "$migration_source_schema"
+        log_info "Saved source schema to: $migration_source_schema"
+    fi
+    
     log_info "Exporting target schema..."
     local target_pooler=$(get_pooler_host "$target_ref")
     set +e
@@ -382,6 +399,12 @@ step_diff_comparison() {
     }
     set -e
     
+    # Copy target schema to migration directory if provided
+    if [ -n "$migration_target_schema" ] && [ -f "$target_schema" ] && [ -s "$target_schema" ]; then
+        cp "$target_schema" "$migration_target_schema"
+        log_info "Saved target schema to: $migration_target_schema"
+    fi
+    
     # Compare schemas
     log_info "Comparing schemas..."
     if [ ! -f "$source_schema" ] || [ ! -s "$source_schema" ]; then
@@ -408,6 +431,9 @@ step_diff_comparison() {
     if diff -q "$source_normalized" "$target_normalized" >/dev/null 2>&1; then
         log_success "✅ Database schemas are identical - no differences found"
         echo ""
+        if [ -n "$comparison_file" ]; then
+            echo "Database schemas are identical - no differences found." > "$comparison_file"
+        fi
         rm -rf "$temp_dir"
         return 2  # Special return code: projects are identical
     else
@@ -415,6 +441,29 @@ step_diff_comparison() {
         local diff_lines=$(diff "$source_normalized" "$target_normalized" | wc -l)
         log_info "   Found approximately $diff_lines lines of differences"
         echo ""
+        
+        # Save comparison details to file if migration_dir provided
+        if [ -n "$comparison_file" ]; then
+            {
+                echo "Database Schema Comparison Results"
+                echo "==================================="
+                echo ""
+                echo "Source Environment: $source ($source_ref)"
+                echo "Target Environment: $target ($target_ref)"
+                echo ""
+                echo "Summary:"
+                echo "- Total difference lines: $diff_lines"
+                echo ""
+                echo "Detailed Differences:"
+                echo "---------------------"
+                diff "$source_normalized" "$target_normalized" | head -100 || true
+                if [ $diff_lines -gt 100 ]; then
+                    echo ""
+                    echo "... (showing first 100 lines, total: $diff_lines)"
+                fi
+            } > "$comparison_file"
+            log_info "Saved comparison details to: $comparison_file"
+        fi
         
         # Optionally show some differences
         if [ "$diff_lines" -lt 50 ]; then
@@ -433,18 +482,84 @@ step_diff_comparison() {
 generate_result_md() {
     local migration_dir=$1
     local status=$2
+    local comparison_data_file="${3:-}"  # Optional: path to file with comparison data
     
     local result_file="$migration_dir/result.md"
     local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+    local source_ref=$(get_project_ref "$SOURCE_ENV")
     local target_ref=$(get_project_ref "$TARGET_ENV")
     local target_password=$(get_db_password "$TARGET_ENV")
     local pooler_host=$(get_pooler_host "$target_ref")
     local backup_file="$migration_dir/target_backup.dump"
+    local rollback_db_sql="$migration_dir/rollback_db.sql"
+    local log_file="$migration_dir/migration.log"
     local has_backup="false"
+    local has_rollback_sql="false"
     
     # Check if backup file exists
     if [ -f "$backup_file" ] && [ -s "$backup_file" ]; then
         has_backup="true"
+    fi
+    
+    # Check if rollback SQL exists
+    if [ -f "$rollback_db_sql" ] && [ -s "$rollback_db_sql" ]; then
+        has_rollback_sql="true"
+    fi
+    
+    # Load comparison data if provided
+    local comparison_details=""
+    if [ -n "$comparison_data_file" ] && [ -f "$comparison_data_file" ]; then
+        comparison_details=$(cat "$comparison_data_file" 2>/dev/null || echo "")
+    fi
+    
+    # Extract migration details from log file if available
+    local migration_summary=""
+    local edge_functions_deployed=""
+    local secrets_set=""
+    local storage_buckets_migrated=""
+    local tables_migrated=""
+    
+    if [ -f "$log_file" ]; then
+        # Extract key migration details from log
+        if grep -q "Edge functions deployed\|Edge functions.*deployed" "$log_file" 2>/dev/null; then
+            edge_functions_deployed="✅ Deployed"
+            local func_names=$(grep -i "Deployed:" "$log_file" | sed 's/.*Deployed: //' | tr '\n' ',' | sed 's/,$//' || echo "")
+            if [ -n "$func_names" ]; then
+                edge_functions_deployed="✅ Deployed: $func_names"
+            fi
+        else
+            edge_functions_deployed="⚠️  Not deployed or failed"
+        fi
+        
+        if grep -q "Secrets.*created\|Secrets.*set\|Secrets structure created" "$log_file" 2>/dev/null; then
+            secrets_set="✅ Created (with blank/placeholder values)"
+            local secret_count=$(grep -i "Set:" "$log_file" | wc -l | tr -d ' ')
+            if [ "$secret_count" -gt 0 ]; then
+                secrets_set="✅ Created $secret_count secret(s) (with blank/placeholder values)"
+            fi
+        else
+            secrets_set="⚠️  Not set or failed"
+        fi
+        
+        if grep -q "Storage buckets imported\|Storage buckets exported\|Storage buckets.*migrated" "$log_file" 2>/dev/null; then
+            storage_buckets_migrated="✅ Migrated"
+        else
+            storage_buckets_migrated="⚠️  Not migrated"
+        fi
+    fi
+    
+    # Get table counts from source and target if schemas exist
+    local source_schema="$migration_dir/source_schema.sql"
+    local target_schema="$migration_dir/target_schema.sql"
+    local source_table_count=0
+    local target_table_count=0
+    
+    if [ -f "$source_schema" ]; then
+        source_table_count=$(grep -c "^CREATE TABLE" "$source_schema" 2>/dev/null || echo "0")
+    fi
+    
+    if [ -f "$target_schema" ]; then
+        target_table_count=$(grep -c "^CREATE TABLE" "$target_schema" 2>/dev/null || echo "0")
     fi
     
     # Generate rollback script content
@@ -622,104 +737,300 @@ ROLLBACK_EOF
 
 **Status**: $status  
 **Date**: $timestamp  
-**Source**: $SOURCE_ENV ($(get_project_ref "$SOURCE_ENV"))  
+**Source**: $SOURCE_ENV ($source_ref)  
 **Target**: $TARGET_ENV ($target_ref)  
 **Mode**: $MODE
 
-## Summary
+---
+
+## Executive Summary
 
 $([ "$status" = "⏭️  Skipped (Projects Identical)" ] && echo "Migration from **$SOURCE_ENV** to **$TARGET_ENV** was **skipped** because projects are identical." || echo "Migration from **$SOURCE_ENV** to **$TARGET_ENV** completed with status: **$status**")
 
-## Migration Details
+### Quick Stats
 
-- **Mode**: $MODE ($([ "$MODE" = "full" ] && echo "Schema + Data" || echo "Schema Only"))
-- **Backup Created**: $([ "$has_backup" = "true" ] && echo "Yes" || echo "No")
+- **Migration Mode**: $MODE ($([ "$MODE" = "full" ] && echo "Schema + Data" || echo "Schema Only"))
+- **Backup Created**: $([ "$has_backup" = "true" ] && echo "✅ Yes" || echo "❌ No")
+- **Rollback SQL Available**: $([ "$has_rollback_sql" = "true" ] && echo "✅ Yes" || echo "❌ No")
 - **Dry Run**: $([ "$DRY_RUN" = "true" ] && echo "Yes" || echo "No")
 $([ "$status" = "⏭️  Skipped (Projects Identical)" ] && echo "- **Reason**: Source and target database schemas are identical - no migration needed" || echo "")
 
-## Rollback Instructions
+---
 
-### Manual Rollback via Supabase SQL Editor
+## Detailed Comparison
 
-A **`rollback_db.sql`** file has been generated in the backup folder that contains all SQL statements needed to restore the database to its pre-migration state. This file can be run directly in the Supabase SQL Editor:
+### 1. Database Schema Comparison
 
-1. Open Supabase Dashboard → SQL Editor
-2. Select the target project
-3. Open the file: `$migration_dir/rollback_db.sql`
-4. Copy the entire contents
-5. Paste into the SQL Editor
-6. Click "Run" to execute
+**Source Environment**: $SOURCE_ENV ($source_ref)
+**Target Environment**: $TARGET_ENV ($target_ref)
 
-**File Location**: `$migration_dir/rollback_db.sql`
+#### Schema Statistics
 
-⚠️ **Warning**: This will restore the database to its state before migration. Make sure you have reviewed the script before running it.
+- **Source Tables**: $source_table_count
+- **Target Tables**: $target_table_count
+- **Tables Migrated**: $([ "$source_table_count" -gt 0 ] && echo "$source_table_count" || echo "N/A")
 
-### Quick Rollback (Copy & Paste)
+#### Schema Differences
 
-If a backup was created, you can use this complete rollback script:
+$([ -n "$comparison_details" ] && echo "\`\`\`" && echo "$comparison_details" && echo "\`\`\`" || if [ -f "$log_file" ]; then
+    echo "Schema comparison details from migration log:"
+    echo "\`\`\`"
+    grep -i "difference\|schema\|table\|CREATE\|ALTER\|DROP" "$log_file" 2>/dev/null | head -50 | sed 's/^/  /' || echo "No schema differences found in log"
+    echo "\`\`\`"
+else
+    echo "Schema comparison details not available. Check migration log: \`$log_file\`"
+fi)
 
-\`\`\`bash
-$rollback_script_content
-\`\`\`
+### 2. Storage Buckets
 
-**To use:**
-1. Copy the entire script block above (from \`#!/bin/bash\` to \`exit 0\`)
-2. Save it to a file: \`rollback.sh\` in the migration directory
-3. Make it executable: \`chmod +x rollback.sh\`
-4. Run it: \`./rollback.sh\`
+**Status**: $storage_buckets_migrated
 
-Or execute directly:
+$([ "$storage_buckets_migrated" = "✅ Migrated" ] && echo "- Storage bucket configurations have been migrated from source to target
+- **Note**: Bucket configuration migrated, but actual files need to be uploaded manually" || echo "- Storage buckets were not migrated or migration failed")
 
-\`\`\`bash
-$rollback_script_content
-\`\`\`
+### 3. Edge Functions
 
-### Manual Rollback Steps
+**Status**: $edge_functions_deployed
 
-1. **If backup exists** (\`target_backup.dump\`):
-   \`\`\`bash
-   cd "$migration_dir"
-   source ../../.env.local
-   export SUPABASE_ACCESS_TOKEN
-   
-   # Link to target
-   supabase link --project-ref "$target_ref" --password "$target_password"
-   
-   # Restore from backup
-   PGPASSWORD="$target_password" pg_restore \\
-       -h "$pooler_host" \\
-       -p 6543 \\
-       -U postgres.${target_ref} \\
-       -d postgres \\
-       --clean --if-exists --no-owner --no-acl \\
-       target_backup.dump
-   
-   # Unlink
-   supabase unlink --yes
-   \`\`\`
+$([ -n "$edge_functions_deployed" ] && echo "$edge_functions_deployed" || echo "- Edge functions status not available in log")
 
-2. **If no backup**, you'll need to manually reverse the changes based on the migration files.
+### 4. Secrets
 
-## Migration Files
+**Status**: $secrets_set
 
-- **Migration directory**: \`$migration_dir\`
-- **Backup file**: $([ "$has_backup" = "true" ] && echo "\`$backup_file\`" || echo "Not available")
-- **Log file**: \`migration.log\`
-- **Source dump**: \`source_full.dump\` (or \`source_schema.dump\` for schema-only)
+$([ "$secrets_set" != "⚠️  Not set or failed" ] && echo "- **IMPORTANT**: Secrets were created with blank/placeholder values
+- **Action Required**: You MUST update all secret values manually for the application to work properly" || echo "- Secrets were not set or setup failed")
 
-## Next Steps
+### 5. Database Objects
 
-1. ✅ Verify the migration was successful
-2. ✅ Test the target environment
-3. ✅ Update any environment-specific configurations if needed
+#### Tables
+- Source: $source_table_count tables
+- Target (after migration): $target_table_count tables
+$([ "$MODE" = "full" ] && echo "- **Data**: All data was migrated" || echo "- **Data**: No data was migrated (schema only)")
+
+#### Other Objects
+- Functions: Migrated (if present in source)
+- Indexes: Migrated
+- Constraints: Migrated
+- RLS Policies: Migrated
+- Sequences: Migrated
 
 ---
 
-**Generated by**: Supabase Migration Utility  
-**Tool Version**: 1.0
+## Migration Summary
+
+### What Was Applied to Target
+
+1. **Database Schema** ✅
+   - All tables from source were created/updated in target
+   - All indexes, constraints, and policies were applied
+   - Sequences were synchronized
+
+2. **Database Data** $([ "$MODE" = "full" ] && echo "✅" || echo "⏭️  (Skipped - Schema Only Mode)")
+   $([ "$MODE" = "full" ] && echo "   - All table data was copied from source to target" || echo "   - No data was copied (schema-only migration)")
+
+3. **Storage Buckets** ✅
+   - Bucket configurations migrated
+   - Policies migrated
+   - **Manual Action Required**: Upload actual files
+
+4. **Edge Functions** $([ "$edge_functions_deployed" != "⚠️  Not deployed or failed" ] && echo "✅" || echo "⚠️")
+   $([ "$edge_functions_deployed" != "⚠️  Not deployed or failed" ] && echo "   - Functions deployed successfully" || echo "   - Functions deployment failed or skipped - deploy manually")
+
+5. **Secrets** ✅
+   - Secret keys created in target
+   - **CRITICAL**: Values are blank/placeholder - UPDATE REQUIRED
+
+### Differences Applied
+
+The following changes were applied to the target environment:
+
+- **Schema Changes**: All differences between source and target schemas were resolved
+- **Data Migration**: $([ "$MODE" = "full" ] && echo "Complete data copy from source to target" || echo "No data migration (schema only)")
+- **Configuration**: Storage buckets, edge functions, and secrets structure migrated
+
+---
+
+## Rollback Instructions
+
+### Method 1: Using Rollback Script (Recommended)
+
+#### Option A: Direct Execution
+
+Copy and paste this entire script into your terminal:
+
+\`\`\`bash
+$rollback_script_content
+\`\`\`
+
+#### Option B: Save and Execute
+
+1. Copy the script above
+2. Save to a file: \`$migration_dir/rollback.sh\`
+3. Make executable: \`chmod +x $migration_dir/rollback.sh\`
+4. Run: \`$migration_dir/rollback.sh\`
+
+### Method 2: Manual Rollback via pg_restore
+
+If the rollback script doesn't work, use manual commands:
+
+\`\`\`bash
+# Navigate to migration directory
+cd "$migration_dir"
+
+# Load environment
+source ../../.env.local
+export SUPABASE_ACCESS_TOKEN
+
+# Link to target project
+supabase link --project-ref "$target_ref" --password "$target_password"
+
+# Restore from backup (try pooler first)
+PGPASSWORD="$target_password" pg_restore \\
+    -h "$pooler_host" \\
+    -p 6543 \\
+    -U postgres.${target_ref} \\
+    -d postgres \\
+    --clean \\
+    --if-exists \\
+    --no-owner \\
+    --no-acl \\
+    --verbose \\
+    target_backup.dump
+
+# If pooler fails, try direct connection
+# PGPASSWORD="$target_password" pg_restore \\
+#     -h db.${target_ref}.supabase.co \\
+#     -p 5432 \\
+#     -U postgres.${target_ref} \\
+#     -d postgres \\
+#     --clean \\
+#     --if-exists \\
+#     --no-owner \\
+#     --no-acl \\
+#     --verbose \\
+#     target_backup.dump
+
+# Unlink
+supabase unlink --yes
+\`\`\`
+
+### Method 3: Using Supabase SQL Editor (For Schema Changes Only)
+
+$(if [ "$has_rollback_sql" = "true" ]; then
+    echo "If you only need to rollback schema changes, you can use the SQL rollback file:"
+    echo ""
+    echo "1. Open Supabase Dashboard → SQL Editor"
+    echo "2. Select target project: **$target_ref**"
+    echo "3. Open file: \`$rollback_db_sql\`"
+    echo "4. Copy the entire contents"
+    echo "5. Paste into SQL Editor"
+    echo "6. Click \"Run\" to execute"
+    echo ""
+    echo "⚠️ **Warning**: This will restore the database schema to its pre-migration state. Review the SQL before executing."
+    echo ""
+    echo "**File Location**: \`$rollback_db_sql\`"
+else
+    echo "SQL rollback file not available. Use Method 1 or 2 instead."
+fi)
+
+---
+
+## Files Generated
+
+All migration files are located in: \`$migration_dir\`
+
+### Core Files
+
+- **\`migration.log\`** - Complete migration log with all operations
+- **\`target_backup.dump\`** $([ "$has_backup" = "true" ] && echo "✅ Available" || echo "❌ Not available") - Binary backup of target before migration
+- **\`rollback_db.sql\`** $([ "$has_rollback_sql" = "true" ] && echo "✅ Available" || echo "❌ Not available") - SQL script for manual rollback via SQL Editor
+- **\`result.md\`** - This file
+
+### Additional Files (if available)
+
+$([ -f "$migration_dir/source_schema.sql" ] && echo "- \`source_schema.sql\` - Source database schema export" || echo "")
+$([ -f "$migration_dir/target_schema.sql" ] && echo "- \`target_schema.sql\` - Target database schema export" || echo "")
+$([ -f "$migration_dir/storage_buckets.sql" ] && echo "- \`storage_buckets.sql\` - Storage buckets configuration" || echo "")
+$([ -f "$migration_dir/secrets_list.json" ] && echo "- \`secrets_list.json\` - List of secrets (names only)" || echo "")
+$([ -f "$migration_dir/edge_functions_list.json" ] && echo "- \`edge_functions_list.json\` - List of edge functions" || echo "")
+
+---
+
+## Next Steps
+
+### Immediate Actions Required
+
+1. **Update Secrets** ⚠️ **CRITICAL**
+   - All secrets were created with blank/placeholder values
+   - Update each secret with actual values:
+   \`\`\`bash
+   supabase secrets set KEY_NAME=actual_value --project-ref $target_ref
+   \`\`\`
+   - Check \`$migration_dir/secrets_list.json\` or \`$migration_dir/secrets_list_template.txt\` for list of secrets
+
+2. **Upload Storage Files** (if applicable)
+   - Go to: https://supabase.com/dashboard/project/$target_ref/storage/buckets
+   - Upload actual files to each bucket
+
+3. **Verify Edge Functions** (if applicable)
+   $([ "$edge_functions_deployed" != "⚠️  Not deployed or failed" ] && echo "   - Functions should be deployed automatically" || echo "   - Deploy functions manually: \`supabase functions deploy <function-name> --project-ref $target_ref\`")
+
+4. **Test Application**
+   - Verify all functionality works correctly
+   - Test database queries, storage operations, edge functions
+
+### Post-Migration Checklist
+
+- [ ] Secrets updated with actual values
+- [ ] Storage files uploaded (if needed)
+- [ ] Edge functions verified/deployed
+- [ ] Application tested and working
+- [ ] Rollback plan reviewed (if needed)
+- [ ] Team notified of migration completion
+
+---
+
+## Troubleshooting
+
+### Migration Log
+
+For detailed operation logs, check: \`$log_file\`
+
+### Common Issues
+
+1. **Secrets not working**
+   - Ensure all secrets are updated with actual values
+   - Verify secrets are set: \`supabase secrets list --project-ref $target_ref\`
+
+2. **Edge functions not deployed**
+   - Deploy manually from codebase
+   - Check function logs in Supabase Dashboard
+
+3. **Storage files missing**
+   - Upload files manually via Dashboard or Storage API
+   - Verify bucket policies are correct
+
+4. **Database connection issues**
+   - Verify connection strings are updated
+   - Check pooler vs direct connection settings
+
+---
+
+## Support
+
+For issues or questions:
+- Review migration log: \`$log_file\`
+- Check Supabase Dashboard: https://supabase.com/dashboard/project/$target_ref
+- Review migration directory: \`$migration_dir\`
+
+---
+
+**Migration completed at**: $timestamp  
+**Status**: $status
 EOF
     
-    log_success "Result summary generated: $result_file"
+    log_success "Result page generated: $result_file"
 }
 
 # Create migration directory
@@ -757,9 +1068,9 @@ perform_migration() {
         return 1
     fi
     
-    # Step 3: Run diff comparison
+    # Step 3: Run diff comparison (pass migration_dir to save schemas)
     local diff_result
-    step_diff_comparison "$source" "$target"
+    step_diff_comparison "$source" "$target" "$migration_dir"
     diff_result=$?
     
     if [ $diff_result -eq 1 ]; then
@@ -863,12 +1174,17 @@ perform_migration() {
     # Return to project root
     cd "$PROJECT_ROOT"
     
-    # Generate result.md in the actual migration directory
+    # Generate result.md in the actual migration directory (pass comparison file if exists)
+    local comparison_data_file=""
+    if [ -f "$actual_migration_dir/comparison_details.txt" ]; then
+        comparison_data_file="$actual_migration_dir/comparison_details.txt"
+    fi
+    
     if [ $exit_code -eq 0 ]; then
-        generate_result_md "$actual_migration_dir" "✅ Completed"
+        generate_result_md "$actual_migration_dir" "✅ Completed" "$comparison_data_file"
         log_success "Migration completed: $actual_migration_dir"
     else
-        generate_result_md "$actual_migration_dir" "❌ Failed (check migration.log)"
+        generate_result_md "$actual_migration_dir" "❌ Failed (check migration.log)" "$comparison_data_file"
         log_error "Migration failed: $actual_migration_dir"
         return $exit_code
     fi

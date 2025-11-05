@@ -10,6 +10,7 @@ cd "$PROJECT_ROOT"
 
 # Source utilities
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
+source "$PROJECT_ROOT/lib/migration_complete.sh" 2>/dev/null || true
 
 # Configuration
 SOURCE_ENV=${1:-}
@@ -342,12 +343,127 @@ log_to_file "$LOG_FILE" "Copying storage buckets"
 log_warning "Storage buckets need to be copied manually via Supabase Dashboard"
 log_info "Go to: https://supabase.com/dashboard/project/$TARGET_REF/storage/buckets"
 
-# Step 5: Copy edge functions (if any)
-log_info "Checking for edge functions..."
-log_to_file "$LOG_FILE" "Checking edge functions"
+# Step 5: Export and deploy edge functions
+log_info "⚡ Step 5/6: Exporting and deploying edge functions..."
+log_to_file "$LOG_FILE" "Exporting edge functions list"
 
-# Edge functions are typically in the codebase, not in the database
-log_info "Edge functions should be deployed separately via Supabase CLI"
+# Use BACKUP_DIR as the migration directory (where all files are stored)
+MIGRATION_DIR="$BACKUP_DIR"
+FUNCTIONS_FILE="$MIGRATION_DIR/edge_functions_list.json"
+FUNCTIONS_DIR="$MIGRATION_DIR/edge_functions"
+
+# Set PROJECT_ROOT for function deployment (needed to find local codebase)
+export PROJECT_ROOT="$PROJECT_ROOT"
+
+# Link to source to export functions list and download function code
+# IMPORTANT: Keep project linked during download so CLI can work
+if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD"; then
+    log_warning "Failed to link to source project for edge functions export"
+else
+    log_info "  → Exporting edge functions list and downloading function code from source..."
+    # Export list and download function code (CLI needs project to be linked)
+    # Note: We keep the project linked during download
+    export_edge_functions_list "$SOURCE_REF" "$FUNCTIONS_FILE" "$FUNCTIONS_DIR" 2>&1 | tee -a "$LOG_FILE" || {
+        log_warning "Edge functions export/download had errors, continuing..."
+    }
+    log_to_file "$LOG_FILE" "Edge functions list exported and code downloaded"
+    # Don't unlink yet - we might need it for fallback deployment
+fi
+
+# Deploy edge functions to target
+log_info "  → Deploying edge functions to target..."
+
+# Link to target project for deployment
+DEPLOYMENT_SUCCESS=false
+if ! link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
+    log_warning "Failed to link to target project for edge functions deployment"
+else
+    # Check if we have functions to deploy
+    if [ -f "$FUNCTIONS_FILE" ] || [ -d "$FUNCTIONS_DIR" ]; then
+        # First, try local directory (if functions were downloaded during export)
+        if [ -d "$FUNCTIONS_DIR" ] && [ -n "$(ls -A "$FUNCTIONS_DIR" 2>/dev/null)" ]; then
+            log_info "Deploying from local functions directory: $FUNCTIONS_DIR"
+            log_info "Found $(ls -d "$FUNCTIONS_DIR"/*/ 2>/dev/null | wc -l | tr -d ' ') function(s) to deploy"
+            
+            if deploy_edge_functions "$SOURCE_REF" "$TARGET_REF" "$FUNCTIONS_FILE" "$FUNCTIONS_DIR" 2>&1 | tee -a "$LOG_FILE"; then
+                DEPLOYMENT_SUCCESS=true
+                log_success "Edge functions deployed successfully from local directory"
+                log_to_file "$LOG_FILE" "Edge functions deployed successfully from local directory"
+            else
+                log_warning "Local deployment failed or returned error, will try API method..."
+                log_to_file "$LOG_FILE" "Edge functions deployment from local directory failed"
+            fi
+        fi
+        
+        # Try delta migration method if local deployment failed or no local directory
+        # This method downloads from both source and target, compares, and deploys delta
+        if [ "$DEPLOYMENT_SUCCESS" != "true" ]; then
+            log_info "Attempting delta migration: downloading from both source and target, comparing, and deploying delta..."
+            # deploy_edge_functions will handle linking internally
+            if deploy_edge_functions "$SOURCE_REF" "$TARGET_REF" "$FUNCTIONS_FILE" "" 2>&1 | tee -a "$LOG_FILE"; then
+                DEPLOYMENT_SUCCESS=true
+                log_success "Edge functions deployed successfully via delta migration"
+                log_to_file "$LOG_FILE" "Edge functions deployed successfully via delta migration"
+            else
+                log_warning "Edge functions deployment failed via delta migration"
+                log_to_file "$LOG_FILE" "Edge functions deployment failed via delta migration"
+            fi
+        fi
+        
+        if [ "$DEPLOYMENT_SUCCESS" != "true" ]; then
+            log_warning "Edge functions deployment failed - check logs above for details"
+            log_warning "Functions may need to be deployed manually from your codebase"
+            log_to_file "$LOG_FILE" "Edge functions deployment failed - manual deployment may be required"
+        fi
+    else
+        log_info "No edge functions found to migrate (no functions_file or functions_dir)"
+        log_to_file "$LOG_FILE" "No edge functions found"
+        # Unlink from source if we linked earlier
+        supabase unlink --yes 2>/dev/null || true
+    fi
+    
+    # Unlink from target
+    supabase unlink --yes 2>/dev/null || true
+fi
+
+# Step 6: Export and set secrets
+log_info "🔐 Step 6/6: Exporting and setting secrets..."
+log_to_file "$LOG_FILE" "Exporting secrets list"
+
+SECRETS_FILE="$MIGRATION_DIR/secrets_list.json"
+
+# Link to source to export secrets list
+if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD"; then
+    log_warning "Failed to link to source project for secrets export"
+else
+    log_info "  → Exporting secrets list from source..."
+    export_secrets_list "$SOURCE_REF" "$SECRETS_FILE" 2>&1 | tee -a "$LOG_FILE" || {
+        log_warning "Secrets export had errors, continuing..."
+    }
+    log_to_file "$LOG_FILE" "Secrets list exported"
+    supabase unlink --yes 2>/dev/null || true
+fi
+
+# Set secrets in target (with blank values)
+log_info "  → Setting secrets in target (with blank/placeholder values)..."
+if [ -f "$SECRETS_FILE" ]; then
+    # Link to target if not already linked
+    if ! link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
+        log_warning "Failed to link to target project for secrets setup"
+    else
+        if set_secrets_from_list "$TARGET_REF" "$SECRETS_FILE" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Secrets structure created (values need manual update)"
+            log_to_file "$LOG_FILE" "Secrets structure created"
+        else
+            log_warning "Secrets setup failed or skipped"
+            log_to_file "$LOG_FILE" "Secrets setup failed or skipped"
+        fi
+        supabase unlink --yes 2>/dev/null || true
+    fi
+else
+    log_info "No secrets found to migrate"
+    log_to_file "$LOG_FILE" "No secrets found"
+fi
 
 # Final summary
 log_success "Full duplication completed!"

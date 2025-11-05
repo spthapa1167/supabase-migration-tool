@@ -25,8 +25,8 @@ Usage: $0 <source_env> <target_env> [--backup]
 Complete duplication: Migrates ALL aspects of Supabase project:
   ✅ Database Schema + Data
   ✅ Storage Buckets + Policies
-  ✅ Edge Functions (list + deployment instructions)
-  ✅ Secrets (list - values must be set manually)
+  ✅ Edge Functions (automatically deployed)
+  ✅ Secrets (automatically created with blank values - update required)
   ✅ Realtime Configuration
   ✅ Cron Jobs (pg_cron)
   ⚠️  Authentication Configuration (manual via Dashboard)
@@ -44,8 +44,9 @@ Examples:
   $0 prod test --backup # Complete migration with backup
 
 ⚠️  IMPORTANT NOTES:
-  - Secrets values are NOT exported (security)
-  - Edge functions code must be deployed separately
+  - Secrets are created with blank/placeholder values - UPDATE REQUIRED after migration
+  - Edge functions are automatically deployed if available via API or local codebase
+  - If edge functions deployment fails, deploy manually from your codebase
   - Auth configuration must be set manually via Dashboard
   - Project settings must be configured manually
 
@@ -243,6 +244,26 @@ log_info "  → Importing cron jobs..."
 import_cron_jobs "$TARGET_REF" "$TARGET_PASSWORD" "$CRON_SQL"
 log_to_file "$LOG_FILE" "Cron jobs imported"
 
+# Deploy edge functions
+log_info "  → Deploying edge functions..."
+if deploy_edge_functions "$SOURCE_REF" "$TARGET_REF" "$FUNCTIONS_FILE" ""; then
+    log_success "Edge functions deployed"
+    log_to_file "$LOG_FILE" "Edge functions deployed"
+else
+    log_warning "Edge functions deployment failed or skipped (check if functions_dir is available)"
+    log_to_file "$LOG_FILE" "Edge functions deployment failed or skipped"
+fi
+
+# Set secrets (with blank values)
+log_info "  → Setting secrets (with blank/placeholder values)..."
+if set_secrets_from_list "$TARGET_REF" "$SECRETS_FILE"; then
+    log_success "Secrets structure created (values need manual update)"
+    log_to_file "$LOG_FILE" "Secrets structure created"
+else
+    log_warning "Secrets setup failed or skipped"
+    log_to_file "$LOG_FILE" "Secrets setup failed or skipped"
+fi
+
 supabase unlink --yes 2>/dev/null || true
 
 # Create migration summary
@@ -260,32 +281,40 @@ cat > "$SUMMARY_FILE" << EOF
 2. ✅ **Storage Buckets** - Configuration migrated (files need manual upload)
 3. ✅ **Realtime Configuration** - Migrated
 4. ✅ **Cron Jobs** - Migrated (if pg_cron enabled)
+5. ✅ **Edge Functions** - Deployed automatically (if available via API or local codebase)
+6. ✅ **Secrets** - Created with blank/placeholder values (UPDATE REQUIRED - see below)
 
 ## ⚠️  Manual Steps Required
 
-### 1. Edge Functions
-Edge functions code must be deployed from your codebase:
+### 1. Secrets (REQUIRED - Update Values)
+Secrets have been created with blank/placeholder values. **You MUST update them manually:**
 
 \`\`\`bash
-# List functions to deploy (check $FUNCTIONS_FILE)
+# Check $SECRETS_FILE or ${SECRETS_FILE%.*}_template.txt for list of secrets
+# Update each secret with actual value:
+supabase secrets set STRIPE_SECRET_KEY=your_actual_value --project-ref $TARGET_REF
+supabase secrets set FIRECRAWL_API_KEY=your_actual_value --project-ref $TARGET_REF
+# ... (update all secrets from the template)
+\`\`\`
+
+**⚠️ IMPORTANT**: Applications will NOT work until secret values are properly set!
+
+### 2. Edge Functions (if deployment failed)
+If edge functions were not automatically deployed, deploy from your codebase:
+
+\`\`\`bash
+# Check $FUNCTIONS_FILE for list of functions
+# Deploy each function:
 supabase functions deploy <function-name> --project-ref $TARGET_REF
 \`\`\`
 
-### 2. Secrets
-Secrets values are NOT exported for security. Set them manually:
-
+Or if you have a local functions directory:
 \`\`\`bash
-# Check $SECRETS_FILE for list of secrets
-# Set each secret:
-supabase secrets set STRIPE_SECRET_KEY=your_value --project-ref $TARGET_REF
-supabase secrets set FIRECRAWL_API_KEY=your_value --project-ref $TARGET_REF
-supabase secrets set RESEND_API_KEY=your_value --project-ref $TARGET_REF
-supabase secrets set LOVABLE_API_KEY=your_value --project-ref $TARGET_REF
-supabase secrets set SENDGRID_API_KEY=your_value --project-ref $TARGET_REF
-supabase secrets set APP_ENV=your_value --project-ref $TARGET_REF
+cd supabase/functions
+for func in */; do
+    supabase functions deploy "\${func%/}" --project-ref $TARGET_REF
+done
 \`\`\`
-
-Or via Dashboard: https://supabase.com/dashboard/project/$TARGET_REF/settings/functions
 
 ### 3. Storage Files
 Storage bucket configuration is migrated, but actual files need to be uploaded:
