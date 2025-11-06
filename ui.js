@@ -57,6 +57,12 @@ function switchTab(tabName, clickedElement) {
             loadPlans();
         }, 100);
     }
+    
+    // Load data for connection test tab
+    if (tabName === 'connection-test') {
+        // Load environments immediately (no API call, hardcoded)
+        loadEnvironmentsList();
+    }
 }
 
 // Show loading indicator
@@ -187,6 +193,745 @@ function formatDate(timestamp) {
     } catch (error) {
         return 'Unknown date';
     }
+}
+
+// Load app info (app name and environment project names)
+async function loadAppInfo() {
+    try {
+        const response = await fetch(`${API_BASE}/api/info`, {
+            headers: getAuthHeaders()
+        });
+        if (!response.ok) {
+            console.error('Failed to load app info');
+            return;
+        }
+        
+        const info = await response.json();
+        
+        // Update app name in header
+        const appNameElement = document.getElementById('appName');
+        if (appNameElement && info.appName) {
+            appNameElement.textContent = info.appName;
+        }
+        
+        // Update environment project names
+        const envInfoElement = document.getElementById('envInfo');
+        if (envInfoElement && info.environments) {
+            const envs = info.environments;
+            const envItems = [];
+            
+            // Production
+            if (envs.prod && envs.prod.projectName && envs.prod.projectName !== 'N/A') {
+                envItems.push(`
+                    <div class="flex items-center space-x-1">
+                        <span class="px-2 py-0.5 bg-error-100 text-error-700 rounded font-semibold text-xs">PROD</span>
+                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.prod.projectName)}</span>
+                    </div>
+                `);
+            }
+            
+            // Test/Staging
+            if (envs.test && envs.test.projectName && envs.test.projectName !== 'N/A') {
+                envItems.push(`
+                    <div class="flex items-center space-x-1">
+                        <span class="px-2 py-0.5 bg-warning-100 text-warning-700 rounded font-semibold text-xs">TEST</span>
+                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.test.projectName)}</span>
+                    </div>
+                `);
+            }
+            
+            // Development
+            if (envs.dev && envs.dev.projectName && envs.dev.projectName !== 'N/A') {
+                envItems.push(`
+                    <div class="flex items-center space-x-1">
+                        <span class="px-2 py-0.5 bg-success-100 text-success-700 rounded font-semibold text-xs">DEV</span>
+                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.dev.projectName)}</span>
+                    </div>
+                `);
+            }
+            
+            if (envItems.length > 0) {
+                envInfoElement.innerHTML = envItems.join('<span class="text-neutral-300 mx-2">•</span>');
+            } else {
+                envInfoElement.innerHTML = '<span class="text-neutral-500 italic">No environment projects configured</span>';
+            }
+        }
+    } catch (error) {
+        console.error('Error loading app info:', error);
+    }
+}
+
+// Load environments list for connection test (hardcoded)
+function loadEnvironmentsList() {
+    const envsList = document.getElementById('environmentsList');
+    if (!envsList) {
+        console.error('environmentsList element not found');
+        return;
+    }
+    
+    // Hardcoded environments - no API call needed
+    const environments = [
+        { key: 'dev', name: 'Development', color: 'success', icon: '🟢' },
+        { key: 'test', name: 'Test/Staging', color: 'warning', icon: '🟡' },
+        { key: 'prod', name: 'Production', color: 'error', icon: '🔴' }
+    ];
+    
+    // Use inline styles for colors to avoid Tailwind dynamic class issues
+    const colorClasses = {
+        'error': { bg: '#fee2e2', text: '#991b1b' },
+        'warning': { bg: '#fef3c7', text: '#92400e' },
+        'success': { bg: '#d1fae5', text: '#065f46' }
+    };
+    
+    // Build HTML for each environment
+    const envsHTML = environments.map(env => {
+        const colorStyle = colorClasses[env.color] || colorClasses.success;
+        
+        return `
+            <div class="bg-neutral-50 border-2 border-neutral-200 rounded-xl p-6 hover:border-primary-300 hover:shadow-md transition-all duration-200">
+                <div class="flex items-center justify-between">
+                    <div class="flex-1">
+                        <div class="flex items-center space-x-4 mb-3">
+                            <div class="flex items-center justify-center w-12 h-12 rounded-xl" style="background-color: ${colorStyle.bg};">
+                                <span class="text-2xl">${env.icon}</span>
+                            </div>
+                            <div class="flex-1">
+                                <div class="flex items-center space-x-3 mb-2">
+                                    <h4 class="text-lg font-bold text-neutral-900">${env.name}</h4>
+                                    <span class="inline-block px-2 py-1 text-xs font-semibold rounded" style="background-color: ${colorStyle.bg}; color: ${colorStyle.text};">${env.key.toUpperCase()}</span>
+                                </div>
+                                <div class="space-y-1">
+                                    <p class="text-sm text-neutral-700">
+                                        <span class="font-semibold">Environment:</span> 
+                                        <span class="text-neutral-900 ml-1">${env.name}</span>
+                                    </p>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="ml-6">
+                        <button onclick="testConnection('${env.key}')" 
+                            class="px-8 py-3 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200 flex items-center space-x-2 min-w-[140px] justify-center">
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            <span>Test Connection</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        `;
+    }).join('');
+    
+    envsList.innerHTML = envsHTML;
+}
+
+// Test connection for an environment
+async function testConnection(env) {
+    const testResults = document.getElementById('testResults');
+    const testResultsContent = document.getElementById('testResultsContent');
+    const testResultsTitle = document.getElementById('testResultsTitle');
+    
+    if (!testResults || !testResultsContent || !testResultsTitle) return;
+    
+    // Show results section
+    testResults.classList.remove('hidden');
+    
+    // Set title
+    const envNames = {
+        'prod': 'Production',
+        'test': 'Test/Staging',
+        'dev': 'Development'
+    };
+    const envName = envNames[env] || env;
+    testResultsTitle.textContent = `Test Results: ${envName}`;
+    
+    // Create results container with summary and log
+    const resultsContainer = document.createElement('div');
+    resultsContainer.className = 'space-y-4';
+    
+    // Summary card
+    const summaryCard = document.createElement('div');
+    summaryCard.className = 'bg-gradient-to-r from-primary-50 to-primary-100 border-2 border-primary-200 rounded-xl p-6';
+    summaryCard.id = `testSummary_${env}`;
+    summaryCard.innerHTML = `
+        <div class="flex items-center justify-between">
+            <div class="flex items-center space-x-4">
+                <div class="flex items-center justify-center w-16 h-16 bg-white rounded-xl shadow-md">
+                    <svg class="w-8 h-8 text-primary-500 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
+                </div>
+                <div>
+                    <h4 class="text-xl font-bold text-primary-900">${envName}</h4>
+                    <p class="text-sm text-primary-700 mt-1">Running connection tests...</p>
+                </div>
+            </div>
+            <div class="text-right">
+                <div class="flex items-center space-x-6">
+                    <div class="text-center">
+                        <div class="text-3xl font-bold text-primary-600" id="testPassed_${env}">0</div>
+                        <div class="text-xs text-primary-600 font-semibold mt-1">Passed</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-3xl font-bold text-error-600" id="testFailed_${env}">0</div>
+                        <div class="text-xs text-error-600 font-semibold mt-1">Failed</div>
+                    </div>
+                    <div class="text-center">
+                        <div class="text-3xl font-bold text-neutral-600" id="testTotal_${env}">0</div>
+                        <div class="text-xs text-neutral-600 font-semibold mt-1">Total</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    // Log container with better visibility for live logs
+    const logContainer = document.createElement('div');
+    logContainer.className = 'log-container bg-slate-900 rounded-xl p-6 max-h-[500px] overflow-y-auto custom-scrollbar font-mono text-sm';
+    logContainer.id = `connectionTestLog_${env}`;
+    logContainer.innerHTML = '<div class="text-slate-400 text-xs mb-2">Live logs will appear here...</div>';
+    
+    resultsContainer.appendChild(summaryCard);
+    resultsContainer.appendChild(logContainer);
+    testResultsContent.innerHTML = '';
+    testResultsContent.appendChild(resultsContainer);
+    
+    // Scroll to results
+    testResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    
+    let testStatus = 'running';
+    let passedCount = 0;
+    let failedCount = 0;
+    let totalCount = 0;
+    let skippedCount = 0;
+    
+    // Use the shared test function
+    await testConnectionForEnv(env, false);
+    
+    // Note: testConnectionForEnv will update the summary and log containers
+    // that were created above
+}
+
+// Update test summary during execution
+function updateTestSummary(env, passed, failed, total) {
+    const passedEl = document.getElementById(`testPassed_${env}`);
+    const failedEl = document.getElementById(`testFailed_${env}`);
+    const totalEl = document.getElementById(`testTotal_${env}`);
+    
+    if (passedEl) passedEl.textContent = passed;
+    if (failedEl) failedEl.textContent = failed;
+    if (totalEl) totalEl.textContent = total;
+}
+
+// Update test summary with final status
+function updateTestSummaryFinal(env, passed, failed, total, skipped, success) {
+    const summaryCard = document.getElementById(`testSummary_${env}`);
+    if (!summaryCard) return;
+    
+    // Update counts
+    updateTestSummary(env, passed, failed, total);
+    
+    // Update card styling based on result
+    if (success && failed === 0) {
+        summaryCard.className = 'bg-gradient-to-r from-success-50 to-success-100 border-2 border-success-200 rounded-xl p-6';
+        const iconContainer = summaryCard.querySelector('.w-16');
+        if (iconContainer) {
+            iconContainer.innerHTML = `
+                <svg class="w-8 h-8 text-success-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+            `;
+        }
+        const statusText = summaryCard.querySelector('.text-primary-700');
+        if (statusText) {
+            statusText.textContent = 'All tests passed!';
+            statusText.className = 'text-sm text-success-700 mt-1 font-semibold';
+        }
+    } else if (failed > 0) {
+        summaryCard.className = 'bg-gradient-to-r from-error-50 to-error-100 border-2 border-error-200 rounded-xl p-6';
+        const iconContainer = summaryCard.querySelector('.w-16');
+        if (iconContainer) {
+            iconContainer.innerHTML = `
+                <svg class="w-8 h-8 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+            `;
+        }
+        const statusText = summaryCard.querySelector('.text-primary-700');
+        if (statusText) {
+            statusText.textContent = `${failed} test(s) failed`;
+            statusText.className = 'text-sm text-error-700 mt-1 font-semibold';
+        }
+    }
+}
+
+// Test all connections
+async function testAllConnections() {
+    const testResults = document.getElementById('testResults');
+    const testResultsContent = document.getElementById('testResultsContent');
+    const testResultsTitle = document.getElementById('testResultsTitle');
+    
+    if (!testResults || !testResultsContent || !testResultsTitle) return;
+    
+    // Show results section
+    testResults.classList.remove('hidden');
+    testResultsTitle.textContent = 'Test Results: All Environments';
+    
+    // Create container for all environment results
+    const allResultsContainer = document.createElement('div');
+    allResultsContainer.className = 'space-y-6';
+    allResultsContainer.id = 'allTestResults';
+    
+    testResultsContent.innerHTML = '';
+    testResultsContent.appendChild(allResultsContainer);
+    
+    // Scroll to results
+    testResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    
+    // Test all environments in parallel
+    const environments = ['dev', 'test', 'prod'];
+    const envNames = {
+        'prod': 'Production',
+        'test': 'Test/Staging',
+        'dev': 'Development'
+    };
+    
+    // Create result containers for each environment
+    environments.forEach(env => {
+        const envContainer = document.createElement('div');
+        envContainer.className = 'bg-white border-2 border-neutral-200 rounded-xl p-6';
+        envContainer.id = `envResult_${env}`;
+        
+        // Summary card
+        const summaryCard = document.createElement('div');
+        summaryCard.className = 'bg-gradient-to-r from-primary-50 to-primary-100 border-2 border-primary-200 rounded-xl p-6 mb-4';
+        summaryCard.id = `testSummary_${env}`;
+        summaryCard.innerHTML = `
+            <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-4">
+                    <div class="flex items-center justify-center w-16 h-16 bg-white rounded-xl shadow-md">
+                        <svg class="w-8 h-8 text-primary-500 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                        </svg>
+                    </div>
+                    <div>
+                        <h4 class="text-xl font-bold text-primary-900">${envNames[env]}</h4>
+                        <p class="text-sm text-primary-700 mt-1">Running connection tests...</p>
+                    </div>
+                </div>
+                <div class="text-right">
+                    <div class="flex items-center space-x-6">
+                        <div class="text-center">
+                            <div class="text-3xl font-bold text-success-600" id="testPassed_${env}">0</div>
+                            <div class="text-xs text-success-600 font-semibold mt-1">Passed</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-3xl font-bold text-error-600" id="testFailed_${env}">0</div>
+                            <div class="text-xs text-error-600 font-semibold mt-1">Failed</div>
+                        </div>
+                        <div class="text-center">
+                            <div class="text-3xl font-bold text-neutral-600" id="testTotal_${env}">0</div>
+                            <div class="text-xs text-neutral-600 font-semibold mt-1">Total</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        `;
+        
+        // Log container with better visibility for live logs
+        const logContainer = document.createElement('div');
+        logContainer.className = 'log-container bg-slate-900 rounded-xl p-6 max-h-[400px] overflow-y-auto custom-scrollbar font-mono text-sm';
+        logContainer.id = `connectionTestLog_${env}`;
+        logContainer.innerHTML = '<div class="text-slate-400 text-xs mb-2">Live logs will appear here...</div>';
+        
+        envContainer.appendChild(summaryCard);
+        envContainer.appendChild(logContainer);
+        allResultsContainer.appendChild(envContainer);
+    });
+    
+    // Run tests for all environments
+    const testPromises = environments.map(env => testConnectionForEnv(env, true));
+    await Promise.all(testPromises);
+}
+
+// Test connection for a specific environment (used by both single and all tests)
+async function testConnectionForEnv(env, isAllTests = false) {
+    const envNames = {
+        'prod': 'Production',
+        'test': 'Test/Staging',
+        'dev': 'Development'
+    };
+    const envName = envNames[env] || env;
+    
+    const logContainer = document.getElementById(`connectionTestLog_${env}`);
+    if (!logContainer) return;
+    
+    let passedCount = 0;
+    let failedCount = 0;
+    let totalCount = 0;
+    let skippedCount = 0;
+    
+    try {
+        const response = await fetch(`${API_BASE}/api/connection-test`, {
+            method: 'POST',
+            headers: {
+                ...getAuthHeaders(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                env: env,
+                stream: true
+            })
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        
+                        if (data.type === 'stdout' || data.type === 'stderr') {
+                            const text = data.data;
+                            if (!text || text.trim() === '') return; // Skip empty lines
+                            
+                            const logLine = document.createElement('div');
+                            logLine.className = 'mb-1 py-0.5';
+                            
+                            // Parse test results - be more flexible with patterns
+                            const cleanText = text.replace(/\033\[[0-9;]*m/g, ''); // Remove ANSI codes
+                            
+                            if (cleanText.includes('✅') || cleanText.includes('PASS:') || cleanText.match(/PASS:/i)) {
+                                logLine.className += ' text-success-400 font-semibold';
+                                if (cleanText.includes('PASS:') || cleanText.includes('✅')) {
+                                    passedCount++;
+                                    totalCount++;
+                                    updateTestSummary(env, passedCount, failedCount, totalCount);
+                                }
+                            } else if (cleanText.includes('❌') || cleanText.includes('FAIL:') || cleanText.match(/FAIL:/i)) {
+                                logLine.className += ' text-error-400 font-semibold';
+                                if (cleanText.includes('FAIL:') || cleanText.includes('❌')) {
+                                    failedCount++;
+                                    totalCount++;
+                                    updateTestSummary(env, passedCount, failedCount, totalCount);
+                                }
+                            } else if (cleanText.includes('⚠️') || cleanText.includes('SKIP:') || cleanText.match(/SKIP:/i)) {
+                                logLine.className += ' text-warning-400';
+                                if (cleanText.includes('SKIP:') || cleanText.includes('⚠️')) {
+                                    skippedCount++;
+                                }
+                            } else if (cleanText.includes('[INFO]') || cleanText.includes('━━') || cleanText.includes('━━━')) {
+                                logLine.className += ' text-primary-400';
+                            } else if (cleanText.includes('[SUCCESS]') || cleanText.match(/SUCCESS/i)) {
+                                logLine.className += ' text-success-400';
+                            } else if (cleanText.includes('[ERROR]') || cleanText.match(/ERROR/i)) {
+                                logLine.className += ' text-error-400';
+                            } else {
+                                logLine.className += ' text-slate-300';
+                            }
+                            
+                            logLine.textContent = cleanText;
+                            
+                            // Remove placeholder text if exists
+                            const placeholder = logContainer.querySelector('.text-slate-400.text-xs');
+                            if (placeholder) {
+                                placeholder.remove();
+                            }
+                            
+                            logContainer.appendChild(logLine);
+                            
+                            // Auto-scroll to bottom for live log viewing
+                            requestAnimationFrame(() => {
+                                logContainer.scrollTop = logContainer.scrollHeight;
+                            });
+                        } else if (data.type === 'complete') {
+                            const success = data.status === 'completed' && failedCount === 0;
+                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, success);
+                            
+                            // Add final summary to log
+                            const summaryLine = document.createElement('div');
+                            summaryLine.className = `mt-4 p-4 border-2 rounded-xl ${success ? 'bg-success-50 border-success-200 text-success-800' : 'bg-error-50 border-error-200 text-error-800'}`;
+                            summaryLine.innerHTML = `
+                                <div class="flex items-center justify-between">
+                                    <div class="flex items-center space-x-2">
+                                        ${success ? `
+                                            <svg class="w-6 h-6 text-success-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                            </svg>
+                                            <span class="font-semibold">All tests passed!</span>
+                                        ` : `
+                                            <svg class="w-6 h-6 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                            </svg>
+                                            <span class="font-semibold">Some tests failed.</span>
+                                        `}
+                                    </div>
+                                    <div class="text-sm font-semibold">
+                                        ${passedCount} passed, ${failedCount} failed${skippedCount > 0 ? `, ${skippedCount} skipped` : ''}
+                                    </div>
+                                </div>
+                            `;
+                            logContainer.appendChild(summaryLine);
+                        } else if (data.type === 'error') {
+                            const errorLine = document.createElement('div');
+                            errorLine.className = 'mt-4 p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800';
+                            errorLine.innerHTML = `
+                                <div class="flex items-center space-x-2">
+                                    <svg class="w-6 h-6 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <span class="font-semibold">Error: ${escapeHtml(data.error)}</span>
+                                </div>
+                            `;
+                            logContainer.appendChild(errorLine);
+                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false);
+                        }
+                    } catch (e) {
+                        console.error('Error parsing SSE data:', e);
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error(`Error testing connection for ${env}:`, error);
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800';
+        errorDiv.innerHTML = `
+            <div class="flex items-center space-x-2">
+                <svg class="w-6 h-6 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <span class="font-semibold">Error: ${escapeHtml(error.message)}</span>
+            </div>
+        `;
+        logContainer.appendChild(errorDiv);
+        updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false);
+    }
+}
+
+// Close test results
+function closeTestResults() {
+    const testResults = document.getElementById('testResults');
+    if (testResults) {
+        testResults.classList.add('hidden');
+    }
+}
+
+// Generate snapshot for all environments
+async function generateAllEnvsSnapshot() {
+    const snapshotResults = document.getElementById('snapshotResults');
+    const snapshotLoading = document.getElementById('snapshotLoading');
+    const comparisonTable = document.getElementById('comparisonTable');
+    const snapshotTimestamp = document.getElementById('snapshotTimestamp');
+    
+    if (!snapshotResults || !snapshotLoading || !comparisonTable) return;
+    
+    // Show loading, hide results
+    snapshotLoading.classList.remove('hidden');
+    snapshotResults.classList.add('hidden');
+    comparisonTable.innerHTML = '';
+    
+    try {
+        const response = await fetch(`${API_BASE}/api/all-envs-snapshot`, {
+            method: 'POST',
+            headers: {
+                ...getAuthHeaders(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                stream: true
+            })
+        });
+        
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let snapshotData = null;
+        
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        
+                        if (data.type === 'snapshot') {
+                            snapshotData = data.data;
+                        } else if (data.type === 'complete') {
+                            // Processing complete
+                            snapshotLoading.classList.add('hidden');
+                            
+                            if (snapshotData) {
+                                displaySnapshotComparison(snapshotData);
+                                snapshotResults.classList.remove('hidden');
+                                
+                                // Scroll to results
+                                snapshotResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                            } else {
+                                comparisonTable.innerHTML = `
+                                    <div class="p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800">
+                                        <p class="font-semibold">Error: Snapshot data not received</p>
+                                    </div>
+                                `;
+                                snapshotResults.classList.remove('hidden');
+                            }
+                        } else if (data.type === 'error') {
+                            snapshotLoading.classList.add('hidden');
+                            comparisonTable.innerHTML = `
+                                <div class="p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800">
+                                    <p class="font-semibold">Error: ${escapeHtml(data.error)}</p>
+                                </div>
+                            `;
+                            snapshotResults.classList.remove('hidden');
+                        }
+                    } catch (e) {
+                        console.error('Error parsing SSE data:', e);
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Error generating snapshot:', error);
+        snapshotLoading.classList.add('hidden');
+        comparisonTable.innerHTML = `
+            <div class="p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800">
+                <p class="font-semibold">Error: ${escapeHtml(error.message)}</p>
+            </div>
+        `;
+        snapshotResults.classList.remove('hidden');
+    }
+}
+
+// Display snapshot comparison
+function displaySnapshotComparison(snapshotData) {
+    const comparisonTable = document.getElementById('comparisonTable');
+    const snapshotTimestamp = document.getElementById('snapshotTimestamp');
+    
+    if (!comparisonTable) return;
+    
+    // Set timestamp
+    if (snapshotTimestamp && snapshotData.timestamp) {
+        snapshotTimestamp.textContent = `Generated: ${new Date(snapshotData.timestamp).toLocaleString()}`;
+    }
+    
+    // Extract environment data
+    const envs = snapshotData.environments || {};
+    const dev = envs.dev || {};
+    const test = envs.test || {};
+    const prod = envs.prod || {};
+    
+    const devCounts = dev.counts || {};
+    const testCounts = test.counts || {};
+    const prodCounts = prod.counts || {};
+    
+    // Define comparison rows
+    const rows = [
+        { label: 'Tables', key: 'tables' },
+        { label: 'Views', key: 'views' },
+        { label: 'Functions', key: 'functions' },
+        { label: 'Sequences', key: 'sequences' },
+        { label: 'Indexes', key: 'indexes' },
+        { label: 'Policies', key: 'policies' },
+        { label: 'Triggers', key: 'triggers' },
+        { label: 'Types', key: 'types' },
+        { label: 'Enums', key: 'enums' },
+        { label: 'Auth Users', key: 'authUsers' },
+        { label: 'Edge Functions', key: 'edgeFunctions' },
+        { label: 'Storage Buckets', key: 'buckets' },
+        { label: 'Secrets', key: 'secrets' }
+    ];
+    
+    // Generate comparison table
+    let tableHTML = `
+        <div class="overflow-x-auto">
+            <table class="min-w-full divide-y divide-neutral-200">
+                <thead class="bg-neutral-50">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-semibold text-neutral-700 uppercase tracking-wider">Object Type</th>
+                        <th class="px-6 py-3 text-center text-xs font-semibold text-neutral-700 uppercase tracking-wider">
+                            <div class="flex items-center justify-center space-x-2">
+                                <span class="text-success-600">🟢</span>
+                                <span>${escapeHtml(dev.name || 'Dev')}</span>
+                            </div>
+                            <div class="text-xs font-normal text-neutral-500 mt-1">${escapeHtml(dev.projectName || dev.projectRef || 'N/A')}</div>
+                        </th>
+                        <th class="px-6 py-3 text-center text-xs font-semibold text-neutral-700 uppercase tracking-wider">
+                            <div class="flex items-center justify-center space-x-2">
+                                <span class="text-warning-600">🟡</span>
+                                <span>${escapeHtml(test.name || 'Test')}</span>
+                            </div>
+                            <div class="text-xs font-normal text-neutral-500 mt-1">${escapeHtml(test.projectName || test.projectRef || 'N/A')}</div>
+                        </th>
+                        <th class="px-6 py-3 text-center text-xs font-semibold text-neutral-700 uppercase tracking-wider">
+                            <div class="flex items-center justify-center space-x-2">
+                                <span class="text-error-600">🔴</span>
+                                <span>${escapeHtml(prod.name || 'Prod')}</span>
+                            </div>
+                            <div class="text-xs font-normal text-neutral-500 mt-1">${escapeHtml(prod.projectName || prod.projectRef || 'N/A')}</div>
+                        </th>
+                    </tr>
+                </thead>
+                <tbody class="bg-white divide-y divide-neutral-200">
+    `;
+    
+    rows.forEach(row => {
+        const devVal = devCounts[row.key] || 0;
+        const testVal = testCounts[row.key] || 0;
+        const prodVal = prodCounts[row.key] || 0;
+        
+        // Determine if values differ
+        const allSame = devVal === testVal && testVal === prodVal;
+        const rowClass = allSame ? '' : 'bg-warning-50';
+        
+        // Highlight differences
+        const getCellClass = (val, otherVal1, otherVal2) => {
+            if (val === otherVal1 && val === otherVal2) return '';
+            if (val === 0) return 'text-neutral-400';
+            return 'font-semibold text-primary-700';
+        };
+        
+        tableHTML += `
+            <tr class="${rowClass} hover:bg-neutral-50">
+                <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-neutral-900">${escapeHtml(row.label)}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-center ${getCellClass(devVal, testVal, prodVal)}">${devVal}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-center ${getCellClass(testVal, devVal, prodVal)}">${testVal}</td>
+                <td class="px-6 py-4 whitespace-nowrap text-sm text-center ${getCellClass(prodVal, devVal, testVal)}">${prodVal}</td>
+            </tr>
+        `;
+    });
+    
+    tableHTML += `
+                </tbody>
+            </table>
+        </div>
+    `;
+    
+    comparisonTable.innerHTML = tableHTML;
 }
 
 // Helper function to stream logs via SSE
@@ -1113,6 +1858,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initialize production confirmation modal
     initProdConfirmModal();
     
+    loadAppInfo();
     loadEnvironments();
     loadHistory();
     loadPlans();

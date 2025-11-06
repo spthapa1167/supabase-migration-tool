@@ -32,17 +32,46 @@ log_error() {
 load_env() {
     if [ ! -f .env.local ]; then
         log_error ".env.local file not found!"
-        exit 1
+        return 1
     fi
     
-    source .env.local
+    # Safely source .env.local using a more robust method
+    # This prevents errors from malformed lines or commands
+    local temp_error=0
+    set +u  # Temporarily disable unbound variable checking for sourcing
+    set +e  # Temporarily disable exit on error for sourcing
     
-    if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+    # Use source with error redirection to catch any issues
+    if ! source .env.local 2>/dev/null; then
+        # If direct sourcing fails, try parsing line by line
+        while IFS= read -r line || [ -n "$line" ]; do
+            # Skip empty lines and comments
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            # Only process lines that look like variable assignments (VAR=value format)
+            if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+                local var_name="${BASH_REMATCH[1]}"
+                local var_value="${BASH_REMATCH[2]}"
+                # Remove quotes if present
+                var_value="${var_value#\"}"
+                var_value="${var_value%\"}"
+                var_value="${var_value#\'}"
+                var_value="${var_value%\'}"
+                # Export the variable
+                export "$var_name"="$var_value" 2>/dev/null || true
+            fi
+        done < .env.local
+    fi
+    
+    set -e  # Re-enable exit on error
+    set -u  # Re-enable unbound variable checking
+    
+    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
         log_error "SUPABASE_ACCESS_TOKEN not set in .env.local"
-        exit 1
+        return 1
     fi
     
     export SUPABASE_ACCESS_TOKEN
+    return 0
 }
 
 # Get project reference by name
@@ -86,27 +115,70 @@ get_db_password() {
     esac
 }
 
-# Get pooler hostname (tries common regions, can be overridden)
-get_pooler_host() {
-    local project_ref=$1
+# Get pooler hostname for a specific environment
+# This is the preferred method - uses POOLER_REGION directly from env vars
+# Format: {POOLER_REGION}.pooler.supabase.com
+get_pooler_host_for_env() {
+    local env_name=$1
     
-    # First, try to determine from project ref by checking environment-specific pooler region
+    # Normalize environment name
+    case $env_name in
+        prod|production|main)
+            env_name="PROD"
+            ;;
+        test|staging)
+            env_name="TEST"
+            ;;
+        dev|develop)
+            env_name="DEV"
+            ;;
+        *)
+            # If it's not a recognized env name, return empty
+            return 1
+            ;;
+    esac
+    
+    # Get pooler region from environment variable
+    local pooler_region_var="SUPABASE_${env_name}_POOLER_REGION"
+    local pooler_region="${!pooler_region_var:-}"
+    
+    # If pooler region is set, construct and return the hostname
+    if [ -n "$pooler_region" ]; then
+        echo "${pooler_region}.pooler.supabase.com"
+        return 0
+    fi
+    
+    # Fallback: return empty (caller should handle)
+    return 1
+}
+
+# Get pooler hostname (tries common regions, can be overridden)
+# This function supports both project_ref and env_name for backward compatibility
+get_pooler_host() {
+    local project_ref_or_env=$1
+    
+    # First, try using environment name if it's passed
+    if get_pooler_host_for_env "$project_ref_or_env" 2>/dev/null; then
+        return 0
+    fi
+    
+    # Try to determine from project ref by checking environment-specific pooler region
     # This is the most reliable method if configured in .env.local
-    if [ "$project_ref" = "$SUPABASE_PROD_PROJECT_REF" ] && [ -n "${SUPABASE_PROD_POOLER_REGION:-}" ]; then
+    if [ "$project_ref_or_env" = "$SUPABASE_PROD_PROJECT_REF" ] && [ -n "${SUPABASE_PROD_POOLER_REGION:-}" ]; then
         echo "${SUPABASE_PROD_POOLER_REGION}.pooler.supabase.com"
         return 0
-    elif [ "$project_ref" = "$SUPABASE_TEST_PROJECT_REF" ] && [ -n "${SUPABASE_TEST_POOLER_REGION:-}" ]; then
+    elif [ "$project_ref_or_env" = "$SUPABASE_TEST_PROJECT_REF" ] && [ -n "${SUPABASE_TEST_POOLER_REGION:-}" ]; then
         echo "${SUPABASE_TEST_POOLER_REGION}.pooler.supabase.com"
         return 0
-    elif [ "$project_ref" = "$SUPABASE_DEV_PROJECT_REF" ] && [ -n "${SUPABASE_DEV_POOLER_REGION:-}" ]; then
+    elif [ "$project_ref_or_env" = "$SUPABASE_DEV_PROJECT_REF" ] && [ -n "${SUPABASE_DEV_POOLER_REGION:-}" ]; then
         echo "${SUPABASE_DEV_POOLER_REGION}.pooler.supabase.com"
         return 0
     fi
     
-    # Try to get pooler URL from Supabase API if available
-    if [ -n "$SUPABASE_ACCESS_TOKEN" ]; then
+    # Try to get pooler URL from Supabase API if available (only if it looks like a project_ref)
+    if [ -n "$SUPABASE_ACCESS_TOKEN" ] && [ ${#project_ref_or_env} -eq 20 ]; then
         local api_response=$(curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-            "https://api.supabase.com/v1/projects/${project_ref}/config/database/pooler" 2>/dev/null)
+            "https://api.supabase.com/v1/projects/${project_ref_or_env}/config/database/pooler" 2>/dev/null)
         
         # Try multiple JSON parsing methods to extract pooler_url
         local pooler_url=""

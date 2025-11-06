@@ -180,12 +180,17 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
     log_to_file "$LOG_FILE" "Creating backup of target"
     
     if link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
-        POOLER_HOST=$(get_pooler_host "$TARGET_REF")
+        # Get pooler host using environment name (more reliable)
+        POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
+        if [ -z "$POOLER_HOST" ]; then
+            POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+        fi
         log_info "Backing up target database (binary format)..."
+        # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
         PGPASSWORD="$TARGET_PASSWORD" pg_dump \
             -h "$POOLER_HOST" \
             -p 6543 \
-            -U postgres.${TARGET_REF} \
+            -U "postgres.${TARGET_REF}" \
             -d postgres \
             -Fc \
             -f "$MIGRATION_DIR/target_backup.dump" \
@@ -221,16 +226,21 @@ if [ "$INCLUDE_DATA" = "true" ]; then
         exit 1
     fi
     
-    POOLER_HOST=$(get_pooler_host "$SOURCE_REF")
+    # Get pooler host using environment name (more reliable)
+    POOLER_HOST=$(get_pooler_host_for_env "$SOURCE_ENV" 2>/dev/null || get_pooler_host "$SOURCE_REF")
+    if [ -z "$POOLER_HOST" ]; then
+        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
     
     # If --users is also specified, exclude auth schema from main dump to avoid conflicts
     # We'll dump and restore auth separately
     if [ "$INCLUDE_USERS" = "true" ]; then
         log_info "Creating full database dump (excluding auth schema - will be handled separately)..."
+        # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
         PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
             -h "$POOLER_HOST" \
             -p 6543 \
-            -U postgres.${SOURCE_REF} \
+            -U "postgres.${SOURCE_REF}" \
             -d postgres \
             -Fc \
             --verbose \
@@ -239,9 +249,9 @@ if [ "$INCLUDE_DATA" = "true" ]; then
             2>&1 | tee -a "$LOG_FILE" || {
             log_warning "Pooler connection failed, trying direct connection..."
             PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-                -h db.${SOURCE_REF}.supabase.co \
+                -h "db.${SOURCE_REF}.supabase.co" \
                 -p 5432 \
-                -U postgres.${SOURCE_REF} \
+                -U "postgres.${SOURCE_REF}" \
                 -d postgres \
                 -Fc \
                 --verbose \
@@ -254,7 +264,7 @@ if [ "$INCLUDE_DATA" = "true" ]; then
         PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
             -h "$POOLER_HOST" \
             -p 6543 \
-            -U postgres.${SOURCE_REF} \
+            -U "postgres.${SOURCE_REF}" \
             -d postgres \
             -Fc \
             --verbose \
@@ -262,9 +272,9 @@ if [ "$INCLUDE_DATA" = "true" ]; then
             2>&1 | tee -a "$LOG_FILE" || {
             log_warning "Pooler connection failed, trying direct connection..."
             PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-                -h db.${SOURCE_REF}.supabase.co \
+                -h "db.${SOURCE_REF}.supabase.co" \
                 -p 5432 \
-                -U postgres.${SOURCE_REF} \
+                -U "postgres.${SOURCE_REF}" \
                 -d postgres \
                 -Fc \
                 --verbose \
@@ -283,13 +293,18 @@ else
         exit 1
     fi
     
-    POOLER_HOST=$(get_pooler_host "$SOURCE_REF")
+    # Get pooler host using environment name (more reliable)
+    POOLER_HOST=$(get_pooler_host_for_env "$SOURCE_ENV" 2>/dev/null || get_pooler_host "$SOURCE_REF")
+    if [ -z "$POOLER_HOST" ]; then
+        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
     
     log_info "Creating schema-only dump (no data)..."
+    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
     PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${SOURCE_REF} \
+        -U "postgres.${SOURCE_REF}" \
         -d postgres \
         -Fc \
         --schema-only \
@@ -337,7 +352,11 @@ if [ "$INCLUDE_USERS" = "true" ]; then
         fi
     fi
     
-    POOLER_HOST=$(get_pooler_host "$SOURCE_REF")
+    # Get pooler host using environment name (more reliable)
+    POOLER_HOST=$(get_pooler_host_for_env "$SOURCE_ENV" 2>/dev/null || get_pooler_host "$SOURCE_REF")
+    if [ -z "$POOLER_HOST" ]; then
+        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
     
     log_info "Creating auth users dump (auth schema data)..."
     # Dump auth schema and ALL auth table data including auth.users
@@ -345,10 +364,11 @@ if [ "$INCLUDE_USERS" = "true" ]; then
     # Note: We use --data-only to get only the data, and specify auth schema
     # This will copy all authentication users and their related data
     log_info "Dumping all auth schema tables (users, identities, refresh_tokens, sessions, etc.)..."
+    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
     PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${SOURCE_REF} \
+        -U "postgres.${SOURCE_REF}" \
         -d postgres \
         -Fc \
         --schema=auth \
@@ -356,11 +376,11 @@ if [ "$INCLUDE_USERS" = "true" ]; then
         --verbose \
         -f "$AUTH_USERS_DUMP" \
         2>&1 | tee -a "$LOG_FILE" || {
-        log_warning "Pooler connection failed for auth users, trying direct connection..."
-        PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-            -h db.${SOURCE_REF}.supabase.co \
-            -p 5432 \
-            -U postgres.${SOURCE_REF} \
+            log_warning "Pooler connection failed for auth users, trying direct connection..."
+            PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
+                -h "db.${SOURCE_REF}.supabase.co" \
+                -p 5432 \
+                -U "postgres.${SOURCE_REF}" \
             -d postgres \
             -Fc \
             --schema=auth \
@@ -374,7 +394,7 @@ if [ "$INCLUDE_USERS" = "true" ]; then
         AUTH_USER_COUNT=$(PGPASSWORD="$SOURCE_PASSWORD" psql \
             -h "$POOLER_HOST" \
             -p 6543 \
-            -U postgres.${SOURCE_REF} \
+            -U "postgres.${SOURCE_REF}" \
             -d postgres \
             -t -A \
             -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null || echo "0")
@@ -423,20 +443,24 @@ BEGIN
 END $$;
 EOF
 
-    POOLER_HOST=$(get_pooler_host "$TARGET_REF")
+    # Get pooler host using environment name (more reliable)
+    POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
+    if [ -z "$POOLER_HOST" ]; then
+        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
     if ! PGPASSWORD="$TARGET_PASSWORD" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${TARGET_REF} \
+        -U "postgres.${TARGET_REF}" \
         -d postgres \
         -f "$DROP_SCRIPT" \
         2>&1 | tee -a "$LOG_FILE"; then
-        log_warning "Pooler connection failed for drop, trying direct connection..."
+            log_warning "Pooler connection failed for drop, trying direct connection..."
         if check_direct_connection_available "$TARGET_REF"; then
             PGPASSWORD="$TARGET_PASSWORD" psql \
-                -h db.${TARGET_REF}.supabase.co \
+                -h "db.${TARGET_REF}.supabase.co" \
                 -p 5432 \
-                -U postgres.${TARGET_REF} \
+                -U "postgres.${TARGET_REF}" \
                 -d postgres \
                 -f "$DROP_SCRIPT" \
                 2>&1 | tee -a "$LOG_FILE" || log_warning "Some objects may not have been dropped"
@@ -462,13 +486,18 @@ fi
 RESTORE_SUCCESS=false
 RESTORE_OUTPUT=$(mktemp)
 
-POOLER_HOST=$(get_pooler_host "$TARGET_REF")
+# Get pooler host using environment name (more reliable)
+POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
+if [ -z "$POOLER_HOST" ]; then
+    POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+fi
 
 set +e
+# Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
 PGPASSWORD="$TARGET_PASSWORD" pg_restore \
     -h "$POOLER_HOST" \
     -p 6543 \
-    -U postgres.${TARGET_REF} \
+    -U "postgres.${TARGET_REF}" \
     -d postgres \
     --verbose \
     --no-owner \
@@ -557,10 +586,10 @@ if [ "$RESTORE_SUCCESS" != "true" ] && check_direct_connection_available "$TARGE
     log_info "Attempting restore via direct connection..."
     RESTORE_OUTPUT=$(mktemp)
     set +e
-    PGPASSWORD="$TARGET_PASSWORD" pg_restore \
-        -h db.${TARGET_REF}.supabase.co \
-        -p 5432 \
-        -U postgres.${TARGET_REF} \
+        PGPASSWORD="$TARGET_PASSWORD" pg_restore \
+            -h "db.${TARGET_REF}.supabase.co" \
+            -p 5432 \
+            -U "postgres.${TARGET_REF}" \
         -d postgres \
         --verbose \
         --no-owner \
@@ -638,14 +667,21 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
         fi
     fi
     
-    POOLER_HOST=$(get_pooler_host "$TARGET_REF")
-    SOURCE_POOLER_HOST=$(get_pooler_host "$SOURCE_REF")
+    # Get pooler hosts using environment names (more reliable)
+    POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
+    SOURCE_POOLER_HOST=$(get_pooler_host_for_env "$SOURCE_ENV" 2>/dev/null || get_pooler_host "$SOURCE_REF")
+    if [ -z "$POOLER_HOST" ]; then
+        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
+    if [ -z "$SOURCE_POOLER_HOST" ]; then
+        SOURCE_POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
     
     # Get source user count
     SOURCE_USER_COUNT=$(PGPASSWORD="$SOURCE_PASSWORD" psql \
         -h "$SOURCE_POOLER_HOST" \
         -p 6543 \
-        -U postgres.${SOURCE_REF} \
+        -U "postgres.${SOURCE_REF}" \
         -d postgres \
         -t -A \
         -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null || echo "0")
@@ -659,7 +695,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
             TARGET_USER_COUNT_BEFORE=$(PGPASSWORD="$TARGET_PASSWORD" psql \
                 -h "$POOLER_HOST" \
                 -p 6543 \
-                -U postgres.${TARGET_REF} \
+                -U "postgres.${TARGET_REF}" \
                 -d postgres \
                 -t -A \
                 -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null || echo "0")
@@ -668,7 +704,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                 PGPASSWORD="$TARGET_PASSWORD" psql \
                     -h "$POOLER_HOST" \
                     -p 6543 \
-                    -U postgres.${TARGET_REF} \
+                    -U "postgres.${TARGET_REF}" \
                     -d postgres \
                     -c "
                     DELETE FROM auth.refresh_tokens;
@@ -681,7 +717,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                         PGPASSWORD="$TARGET_PASSWORD" psql \
                             -h db.${TARGET_REF}.supabase.co \
                             -p 5432 \
-                            -U postgres.${TARGET_REF} \
+                            -U "postgres.${TARGET_REF}" \
                             -d postgres \
                             -c "
                             DELETE FROM auth.refresh_tokens;
@@ -718,7 +754,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
             if PGPASSWORD="$TARGET_PASSWORD" psql \
                 -h "$POOLER_HOST" \
                 -p 6543 \
-                -U postgres.${TARGET_REF} \
+                -U "postgres.${TARGET_REF}" \
                 -d postgres \
                 -c "
                 -- Delete in order to respect foreign keys
@@ -734,7 +770,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                     if PGPASSWORD="$TARGET_PASSWORD" psql \
                         -h db.${TARGET_REF}.supabase.co \
                         -p 5432 \
-                        -U postgres.${TARGET_REF} \
+                        -U "postgres.${TARGET_REF}" \
                         -d postgres \
                         -c "
                         DELETE FROM auth.refresh_tokens;
@@ -767,7 +803,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
             PGPASSWORD="$TARGET_PASSWORD" pg_restore \
                 -h "$POOLER_HOST" \
                 -p 6543 \
-                -U postgres.${TARGET_REF} \
+                -U "postgres.${TARGET_REF}" \
                 -d postgres \
                 --no-owner \
                 --no-acl \
@@ -789,7 +825,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
             TARGET_USER_COUNT_AFTER=$(PGPASSWORD="$TARGET_PASSWORD" psql \
                 -h "$POOLER_HOST" \
                 -p 6543 \
-                -U postgres.${TARGET_REF} \
+                -U "postgres.${TARGET_REF}" \
                 -d postgres \
                 -t -A \
                 -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null || echo "0")
@@ -808,7 +844,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                         PGPASSWORD="$TARGET_PASSWORD" psql \
                             -h db.${TARGET_REF}.supabase.co \
                             -p 5432 \
-                            -U postgres.${TARGET_REF} \
+                            -U "postgres.${TARGET_REF}" \
                             -d postgres \
                             -c "
                             DELETE FROM auth.refresh_tokens;
@@ -820,10 +856,10 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                     
                     RESTORE_OUTPUT=$(mktemp)
                     set +e
-                    PGPASSWORD="$TARGET_PASSWORD" pg_restore \
-                        -h db.${TARGET_REF}.supabase.co \
-                        -p 5432 \
-                        -U postgres.${TARGET_REF} \
+        PGPASSWORD="$TARGET_PASSWORD" pg_restore \
+            -h "db.${TARGET_REF}.supabase.co" \
+            -p 5432 \
+            -U "postgres.${TARGET_REF}" \
                         -d postgres \
                         --no-owner \
                         --no-acl \
@@ -837,7 +873,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                     TARGET_USER_COUNT_AFTER=$(PGPASSWORD="$TARGET_PASSWORD" psql \
                         -h db.${TARGET_REF}.supabase.co \
                         -p 5432 \
-                        -U postgres.${TARGET_REF} \
+                        -U "postgres.${TARGET_REF}" \
                         -d postgres \
                         -t -A \
                         -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null || echo "0")
