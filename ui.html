@@ -1,0 +1,1082 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supabase Migration Tool - Web UI</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#e8f4fd',
+                            100: '#d1e9fb',
+                            200: '#a3d3f7',
+                            300: '#75bdf3',
+                            400: '#47a7ef',
+                            500: '#3498db', // Bright medium blue
+                            600: '#2a7aaf',
+                            700: '#1f5c83',
+                            800: '#153d57',
+                            900: '#1a2c4e', // Deep dark navy blue
+                        },
+                        accent: {
+                            50: '#f1f8e9',
+                            100: '#dcedc8',
+                            200: '#c5e1a5',
+                            300: '#aed581',
+                            400: '#9ccc65',
+                            500: '#8bc34a', // Vibrant light green
+                            600: '#7cb342',
+                            700: '#689f38',
+                            800: '#558b2f',
+                            900: '#33691e',
+                        },
+                        success: {
+                            50: '#f1f8e9',
+                            100: '#dcedc8',
+                            200: '#c5e1a5',
+                            300: '#aed581',
+                            400: '#9ccc65',
+                            500: '#8bc34a',
+                            600: '#7cb342',
+                            700: '#689f38',
+                            800: '#558b2f',
+                            900: '#33691e',
+                        },
+                        warning: {
+                            50: '#fff8e1',
+                            100: '#ffecb3',
+                            200: '#ffe082',
+                            300: '#ffd54f',
+                            400: '#ffca28',
+                            500: '#ffc107',
+                            600: '#ffb300',
+                            700: '#ffa000',
+                            800: '#ff8f00',
+                            900: '#ff6f00',
+                        },
+                        error: {
+                            50: '#ffebee',
+                            100: '#ffcdd2',
+                            200: '#ef9a9a',
+                            300: '#e57373',
+                            400: '#ef5350',
+                            500: '#f44336',
+                            600: '#e53935',
+                            700: '#d32f2f',
+                            800: '#c62828',
+                            900: '#b71c1c',
+                        },
+                        neutral: {
+                            50: '#fafafa',
+                            100: '#f5f5f5',
+                            200: '#eeeeee',
+                            300: '#e0e0e0',
+                            400: '#d3d3d3', // Light grey from logo
+                            500: '#bdbdbd',
+                            600: '#9e9e9e',
+                            700: '#757575',
+                            800: '#616161',
+                            900: '#424242',
+                        },
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'Fira Code', 'Monaco', 'Courier New', 'monospace'],
+                    },
+                    animation: {
+                        'pulse-slow': 'pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'fade-in': 'fadeIn 0.3s ease-in-out',
+                        'slide-up': 'slideUp 0.3s ease-out',
+                    },
+                    keyframes: {
+                        fadeIn: {
+                            '0%': { opacity: '0' },
+                            '100%': { opacity: '1' },
+                        },
+                        slideUp: {
+                            '0%': { transform: 'translateY(10px)', opacity: '0' },
+                            '100%': { transform: 'translateY(0)', opacity: '1' },
+                        },
+                    },
+                },
+            },
+        }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        /* Custom scrollbar */
+        .custom-scrollbar::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-track {
+            background: #f1f5f9;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
+        }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        /* Log container scrollbar */
+        .log-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        .log-container::-webkit-scrollbar-track {
+            background: #1e293b;
+        }
+        .log-container::-webkit-scrollbar-thumb {
+            background: #475569;
+            border-radius: 4px;
+        }
+        .log-container::-webkit-scrollbar-thumb:hover {
+            background: #64748b;
+        }
+
+        /* Smooth transitions */
+        * {
+            transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform;
+            transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+            transition-duration: 150ms;
+        }
+
+        /* Focus visible for accessibility */
+        *:focus-visible {
+            outline: 2px solid #3498db;
+            outline-offset: 2px;
+        }
+    </style>
+</head>
+<body class="bg-gradient-to-br from-primary-50 via-primary-100 to-accent-50 min-h-screen font-sans flex flex-col">
+    <!-- Header -->
+    <header class="bg-white/90 backdrop-blur-lg border-b border-primary-200/60 sticky top-0 z-50 shadow-md">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <div class="flex items-center justify-between h-24">
+                <div class="flex items-center space-x-4">
+                    <!-- XYNTRA Logo -->
+                    <div class="flex items-center space-x-3">
+                        <div class="relative w-16 h-16 flex items-center justify-center">
+                            <!-- XA Logo SVG -->
+                            <svg viewBox="0 0 120 120" class="w-16 h-16" xmlns="http://www.w3.org/2000/svg">
+                                <!-- X Shape with gradient -->
+                                <defs>
+                                    <linearGradient id="xGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                        <stop offset="0%" style="stop-color:#3498db;stop-opacity:1" />
+                                        <stop offset="100%" style="stop-color:#1a2c4e;stop-opacity:1" />
+                                    </linearGradient>
+                                    <linearGradient id="aGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                        <stop offset="0%" style="stop-color:#d3d3d3;stop-opacity:1" />
+                                        <stop offset="60%" style="stop-color:#d3d3d3;stop-opacity:1" />
+                                        <stop offset="60%" style="stop-color:#8bc34a;stop-opacity:1" />
+                                        <stop offset="100%" style="stop-color:#8bc34a;stop-opacity:1" />
+                                    </linearGradient>
+                                </defs>
+                                
+                                <!-- X Shape -->
+                                <path d="M 20 20 L 50 50 L 20 80 L 50 80 L 80 50 L 50 20 Z" fill="url(#xGradient)"/>
+                                
+                                <!-- Network nodes in X -->
+                                <circle cx="50" cy="50" r="8" fill="white" opacity="0.9"/>
+                                <circle cx="30" cy="30" r="4" fill="white" opacity="0.9"/>
+                                <circle cx="70" cy="30" r="4" fill="white" opacity="0.9"/>
+                                <circle cx="30" cy="70" r="4" fill="white" opacity="0.9"/>
+                                <circle cx="70" cy="70" r="4" fill="white" opacity="0.9"/>
+                                <line x1="50" y1="50" x2="30" y2="30" stroke="white" stroke-width="2" opacity="0.7"/>
+                                <line x1="50" y1="50" x2="70" y2="30" stroke="white" stroke-width="2" opacity="0.7"/>
+                                <line x1="50" y1="50" x2="30" y2="70" stroke="white" stroke-width="2" opacity="0.7"/>
+                                <line x1="50" y1="50" x2="70" y2="70" stroke="white" stroke-width="2" opacity="0.7"/>
+                                
+                                <!-- A Shape -->
+                                <path d="M 50 20 L 70 20 L 90 80 L 70 80 L 65 65 L 55 65 L 50 80 L 30 80 Z" fill="url(#aGradient)"/>
+                                <path d="M 55 45 L 65 45 L 60 30 Z" fill="#1a2c4e" opacity="0.3"/>
+                                
+                                <!-- Network nodes in A -->
+                                <circle cx="70" cy="50" r="5" fill="#3498db" opacity="0.8"/>
+                                <circle cx="75" cy="70" r="6" fill="#1a2c4e" opacity="0.8"/>
+                            </svg>
+                        </div>
+                        <div>
+                            <h1 class="text-xl font-bold text-primary-900 leading-tight">
+                                XYNTRA
+                            </h1>
+                            <p class="text-xs font-medium text-primary-700 uppercase tracking-wide">
+                                AI SOLUTIONS
+                            </p>
+                        </div>
+                    </div>
+                    <div class="h-12 w-px bg-neutral-300"></div>
+                    <div>
+                        <h2 class="text-xl font-bold text-primary-900">
+                            Supabase Migration Tool
+                        </h2>
+                        <p class="text-sm text-neutral-600">Web-Based Migration Management</p>
+                    </div>
+                </div>
+                <div class="flex items-center space-x-3">
+                    <!-- Active Jobs Indicator -->
+                    <div id="activeJobsIndicator" class="hidden">
+                        <button onclick="showActiveJobs()" 
+                            class="flex items-center space-x-2 px-4 py-2 bg-warning-100 text-warning-800 rounded-lg border border-warning-300 hover:bg-warning-200 transition-colors cursor-pointer">
+                            <svg class="w-5 h-5 text-warning-600 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                            <span class="text-sm font-semibold">
+                                <span id="activeJobsText">0 Job(s) Running</span>
+                            </span>
+                        </button>
+                    </div>
+                    <span class="px-3 py-1.5 bg-accent-100 text-accent-700 text-xs font-semibold rounded-full border border-accent-200">
+                        Online
+                    </span>
+                    <!-- Logout Button -->
+                    <button onclick="logout()" 
+                        class="flex items-center space-x-2 px-4 py-2 bg-error-100 text-error-700 rounded-lg border border-error-300 hover:bg-error-200 transition-colors cursor-pointer"
+                        title="Logout">
+                        <svg class="w-5 h-5 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
+                        </svg>
+                        <span class="text-sm font-semibold">Logout</span>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1">
+        <!-- Tabs Navigation -->
+        <div class="bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-primary-200/60 mb-6 overflow-hidden">
+            <div class="flex space-x-1 p-2 bg-neutral-50/50">
+                <button onclick="switchTab('migration-plan', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200 active bg-primary-600 text-white shadow-md">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                        </svg>
+                        <span>Migration Plan</span>
+                    </span>
+                </button>
+                <button onclick="switchTab('main-migration', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                        </svg>
+                        <span>Main Migration</span>
+                    </span>
+                </button>
+                <button onclick="switchTab('components', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
+                        </svg>
+                        <span>Components</span>
+                    </span>
+                </button>
+                <button onclick="switchTab('history', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span>History & Reports</span>
+                    </span>
+                </button>
+                <button onclick="switchTab('cli-manual', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                        </svg>
+                        <span>CLI Manual</span>
+                    </span>
+                </button>
+                <button onclick="switchTab('ui-manual', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
+                        </svg>
+                        <span>UI Manual</span>
+                    </span>
+                </button>
+            </div>
+        </div>
+
+        <!-- Tab Contents -->
+        <div class="space-y-6">
+            <!-- Migration Plan Tab -->
+            <div id="migration-plan" class="tab-content">
+                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
+                    <div class="flex items-center space-x-3 mb-6">
+                        <div class="flex items-center justify-center w-12 h-12 bg-primary-100 rounded-xl">
+                            <svg class="w-6 h-6 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-2xl font-bold text-primary-900">Generate Migration Plan</h2>
+                            <p class="text-neutral-600 text-sm">Compare source and target environments to see what needs to be migrated</p>
+                        </div>
+                    </div>
+                    
+                    <form id="planForm" class="space-y-6">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label for="planSource" class="block text-sm font-semibold text-primary-800 mb-2">
+                                    Source Environment
+                                </label>
+                                <select id="planSource" required
+                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-300 rounded-xl text-primary-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                    <option value="">Select source environment...</option>
+                                    <option value="dev">Development (dev)</option>
+                                    <option value="test">Test (test)</option>
+                                    <option value="prod">Production (prod)</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label for="planTarget" class="block text-sm font-semibold text-neutral-700 mb-2">
+                                    Target Environment
+                                </label>
+                                <select id="planTarget" required
+                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-200 rounded-xl text-neutral-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                    <option value="">Select target environment...</option>
+                                    <option value="dev">Development (dev)</option>
+                                    <option value="test">Test (test)</option>
+                                    <option value="prod">Production (prod)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <button type="submit" 
+                            class="w-full md:w-auto px-8 py-3.5 bg-gradient-to-r from-primary-500 to-primary-700 text-white font-semibold rounded-xl shadow-lg shadow-primary-500/25 hover:shadow-xl hover:shadow-primary-500/30 hover:from-primary-600 hover:to-primary-800 transform hover:-tranneutral-y-0.5 transition-all duration-200 flex items-center justify-center space-x-2">
+                            <span>Generate Migration Plan</span>
+                            <span id="planLoading" class="loading-spinner hidden"></span>
+                        </button>
+                    </form>
+
+                    <div id="planResult" class="mt-6"></div>
+                </div>
+            </div>
+
+            <!-- Main Migration Tab -->
+            <div id="main-migration" class="tab-content hidden">
+                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
+                    <div class="flex items-center space-x-3 mb-6">
+                        <div class="flex items-center justify-center w-12 h-12 bg-accent-100 rounded-xl">
+                            <svg class="w-6 h-6 text-accent-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-2xl font-bold text-primary-900">Complete Migration</h2>
+                            <p class="text-neutral-600 text-sm">Run complete migration with all components</p>
+                        </div>
+                    </div>
+                    
+                    <form id="mainMigrationForm" class="space-y-6">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label for="mainSource" class="block text-sm font-semibold text-neutral-700 mb-2">
+                                    Source Environment
+                                </label>
+                                <select id="mainSource" required
+                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-200 rounded-xl text-neutral-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                    <option value="">Select source environment...</option>
+                                    <option value="dev">Development (dev)</option>
+                                    <option value="test">Test (test)</option>
+                                    <option value="prod">Production (prod)</option>
+                                </select>
+                            </div>
+
+                            <div>
+                                <label for="mainTarget" class="block text-sm font-semibold text-neutral-700 mb-2">
+                                    Target Environment
+                                </label>
+                                <select id="mainTarget" required
+                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-200 rounded-xl text-neutral-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                    <option value="">Select target environment...</option>
+                                    <option value="dev">Development (dev)</option>
+                                    <option value="test">Test (test)</option>
+                                    <option value="prod">Production (prod)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div>
+                            <label class="block text-sm font-semibold text-neutral-700 mb-3">Migration Options</label>
+                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
+                                    <input type="checkbox" id="mainData" 
+                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
+                                    <div>
+                                        <span class="font-medium text-neutral-900">Include Data</span>
+                                        <p class="text-xs text-neutral-500">Migrate database rows</p>
+                                    </div>
+                                </label>
+                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
+                                    <input type="checkbox" id="mainUsers" 
+                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
+                                    <div>
+                                        <span class="font-medium text-neutral-900">Auth Users</span>
+                                        <p class="text-xs text-neutral-500">Migrate auth users</p>
+                                    </div>
+                                </label>
+                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
+                                    <input type="checkbox" id="mainFiles" 
+                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
+                                    <div>
+                                        <span class="font-medium text-neutral-900">Include Files</span>
+                                        <p class="text-xs text-neutral-500">Migrate bucket files</p>
+                                    </div>
+                                </label>
+                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
+                                    <input type="checkbox" id="mainBackup" 
+                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
+                                    <div>
+                                        <span class="font-medium text-neutral-900">Create Backup</span>
+                                        <p class="text-xs text-neutral-500">Backup before migration</p>
+                                    </div>
+                                </label>
+                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
+                                    <input type="checkbox" id="mainDryRun" 
+                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
+                                    <div>
+                                        <span class="font-medium text-neutral-900">Dry Run</span>
+                                        <p class="text-xs text-neutral-500">Preview only</p>
+                                    </div>
+                                </label>
+                            </div>
+                        </div>
+
+                        <button type="submit" 
+                            class="w-full md:w-auto px-8 py-3.5 bg-gradient-to-r from-accent-500 to-accent-600 text-white font-semibold rounded-xl shadow-lg shadow-accent-500/25 hover:shadow-xl hover:shadow-accent-500/30 hover:from-accent-600 hover:to-accent-700 transform hover:-tranneutral-y-0.5 transition-all duration-200 flex items-center justify-center space-x-2">
+                            <span>Run Complete Migration</span>
+                            <span id="mainLoading" class="loading-spinner hidden"></span>
+                        </button>
+                    </form>
+
+                    <div id="mainResult" class="mt-6"></div>
+                </div>
+            </div>
+
+            <!-- Component Migrations Tab -->
+            <div id="components" class="tab-content hidden">
+                <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+                    <!-- Database Migration Card -->
+                    <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-6 animate-fade-in">
+                        <div class="flex items-center space-x-3 mb-4">
+                            <div class="flex items-center justify-center w-10 h-10 bg-blue-100 rounded-lg">
+                                <svg class="w-5 h-5 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4"></path>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-bold text-primary-900">Database Migration</h3>
+                        </div>
+                        <form id="dbForm" class="space-y-4">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Source</label>
+                                    <select id="dbSource" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-300 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Target</label>
+                                    <select id="dbTarget" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-200 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <div class="flex flex-wrap gap-2">
+                                <label class="flex items-center space-x-2 text-sm">
+                                    <input type="checkbox" id="dbData" class="w-4 h-4 text-primary-600 border-neutral-300 rounded">
+                                    <span class="text-primary-800">--data</span>
+                                </label>
+                                <label class="flex items-center space-x-2 text-sm">
+                                    <input type="checkbox" id="dbUsers" class="w-4 h-4 text-primary-600 border-neutral-300 rounded">
+                                    <span class="text-neutral-700">--users</span>
+                                </label>
+                                <label class="flex items-center space-x-2 text-sm">
+                                    <input type="checkbox" id="dbBackup" class="w-4 h-4 text-primary-600 border-neutral-300 rounded">
+                                    <span class="text-neutral-700">--backup</span>
+                                </label>
+                            </div>
+                            <button type="submit" 
+                                class="w-full px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200">
+                                Run Migration
+                            </button>
+                        </form>
+                        <div id="dbResult" class="mt-4"></div>
+                    </div>
+
+                    <!-- Storage Migration Card -->
+                    <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-neutral-200/60 p-6 animate-fade-in">
+                        <div class="flex items-center space-x-3 mb-4">
+                            <div class="flex items-center justify-center w-10 h-10 bg-purple-100 rounded-lg">
+                                <svg class="w-5 h-5 text-purple-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4"></path>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-bold text-neutral-900">Storage Migration</h3>
+                        </div>
+                        <form id="storageForm" class="space-y-4">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Source</label>
+                                    <select id="storageSource" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-200 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Target</label>
+                                    <select id="storageTarget" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-200 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <label class="flex items-center space-x-2 text-sm">
+                                <input type="checkbox" id="storageFiles" class="w-4 h-4 text-primary-600 border-neutral-300 rounded">
+                                <span class="text-neutral-700">--file (Include files)</span>
+                            </label>
+                            <button type="submit" 
+                                class="w-full px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200">
+                                Run Migration
+                            </button>
+                        </form>
+                        <div id="storageResult" class="mt-4"></div>
+                    </div>
+
+                    <!-- Edge Functions Migration Card -->
+                    <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-neutral-200/60 p-6 animate-fade-in">
+                        <div class="flex items-center space-x-3 mb-4">
+                            <div class="flex items-center justify-center w-10 h-10 bg-yellow-100 rounded-lg">
+                                <svg class="w-5 h-5 text-yellow-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-bold text-neutral-900">Edge Functions</h3>
+                        </div>
+                        <form id="edgeForm" class="space-y-4">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Source</label>
+                                    <select id="edgeSource" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-200 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Target</label>
+                                    <select id="edgeTarget" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-200 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <button type="submit" 
+                                class="w-full px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200">
+                                Run Migration
+                            </button>
+                        </form>
+                        <div id="edgeResult" class="mt-4"></div>
+                    </div>
+
+                    <!-- Secrets Migration Card -->
+                    <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-neutral-200/60 p-6 animate-fade-in">
+                        <div class="flex items-center space-x-3 mb-4">
+                            <div class="flex items-center justify-center w-10 h-10 bg-red-100 rounded-lg">
+                                <svg class="w-5 h-5 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z"></path>
+                                </svg>
+                            </div>
+                            <h3 class="text-lg font-bold text-neutral-900">Secrets Migration</h3>
+                        </div>
+                        <form id="secretsForm" class="space-y-4">
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Source</label>
+                                    <select id="secretsSource" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-200 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-neutral-600 mb-1.5">Target</label>
+                                    <select id="secretsTarget" required
+                                        class="w-full px-3 py-2 text-sm bg-white border border-neutral-200 rounded-lg focus:border-primary-500 focus:ring-1 focus:ring-primary-500">
+                                        <option value="">Select...</option>
+                                        <option value="dev">dev</option>
+                                        <option value="test">test</option>
+                                        <option value="prod">prod</option>
+                                    </select>
+                                </div>
+                            </div>
+                            <label class="flex items-center space-x-2 text-sm">
+                                <input type="checkbox" id="secretsValues" class="w-4 h-4 text-primary-600 border-neutral-300 rounded">
+                                <span class="text-neutral-700">--values (Include values)</span>
+                            </label>
+                            <button type="submit" 
+                                class="w-full px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200">
+                                Run Migration
+                            </button>
+                        </form>
+                        <div id="secretsResult" class="mt-4"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- History & Reports Tab -->
+            <div id="history" class="tab-content hidden">
+                <div class="space-y-6">
+                    <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-neutral-200/60 p-8 animate-fade-in">
+                        <div class="flex items-center justify-between mb-6">
+                            <div class="flex items-center space-x-3">
+                                <div class="flex items-center justify-center w-12 h-12 bg-neutral-100 rounded-xl">
+                                    <svg class="w-6 h-6 text-neutral-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <h2 class="text-2xl font-bold text-neutral-900">Migration History</h2>
+                                    <p class="text-neutral-500 text-sm">View past migrations and reports</p>
+                                </div>
+                            </div>
+                            <button onclick="loadHistory()" 
+                                class="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200">
+                                Refresh
+                            </button>
+                        </div>
+                        <div id="historyList" class="space-y-3"></div>
+                    </div>
+
+                    <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-neutral-200/60 p-8 animate-fade-in">
+                        <div class="flex items-center justify-between mb-6">
+                            <div class="flex items-center space-x-3">
+                                <div class="flex items-center justify-center w-12 h-12 bg-primary-100 rounded-xl">
+                                    <svg class="w-6 h-6 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                                    </svg>
+                                </div>
+                                <div>
+                                    <h2 class="text-2xl font-bold text-neutral-900">Migration Plans</h2>
+                                    <p class="text-neutral-500 text-sm">View generated migration plans</p>
+                                </div>
+                            </div>
+                            <button onclick="loadPlans()" 
+                                class="px-4 py-2 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200">
+                                Refresh
+                            </button>
+                        </div>
+                        <div id="plansList" class="space-y-3"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- CLI Manual Tab -->
+            <div id="cli-manual" class="tab-content hidden">
+                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
+                    <div class="flex items-center space-x-3 mb-6">
+                        <div class="flex items-center justify-center w-12 h-12 bg-primary-100 rounded-xl">
+                            <svg class="w-6 h-6 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-2xl font-bold text-primary-900">Command Line Manual</h2>
+                            <p class="text-neutral-600 text-sm">Complete guide for using migration scripts from the command line</p>
+                        </div>
+                    </div>
+                    <div class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar">
+                        <iframe src="user_manual.html" class="w-full h-[800px] border-0 rounded-lg" frameborder="0" style="min-height: 800px;"></iframe>
+                    </div>
+                </div>
+            </div>
+
+            <!-- UI Manual Tab -->
+            <div id="ui-manual" class="tab-content hidden">
+                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
+                    <div class="flex items-center space-x-3 mb-6">
+                        <div class="flex items-center justify-center w-12 h-12 bg-accent-100 rounded-xl">
+                            <svg class="w-6 h-6 text-accent-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-2xl font-bold text-primary-900">Web UI Manual</h2>
+                            <p class="text-neutral-600 text-sm">Complete guide for using the web-based migration interface</p>
+                        </div>
+                    </div>
+                    <div class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar">
+                        <h3 class="text-2xl font-bold text-primary-900 mb-4">Web UI User Guide</h3>
+                        
+                        <section class="mb-8">
+                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Overview</h4>
+                            <p class="text-neutral-700 mb-4">
+                                The Supabase Migration Tool Web UI provides a user-friendly interface for managing all aspects of Supabase migrations. 
+                                You can generate migration plans, run complete or component-specific migrations, and view detailed reports and logs.
+                            </p>
+                        </section>
+
+                        <section class="mb-8">
+                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Getting Started</h4>
+                            <ol class="list-decimal list-inside space-y-2 text-neutral-700">
+                                <li>Enter your access key on the login page</li>
+                                <li>Once authenticated, you'll see the main dashboard</li>
+                                <li>Select your source and target environments</li>
+                                <li>Choose migration options and run migrations</li>
+                            </ol>
+                        </section>
+
+                        <section class="mb-8">
+                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Tabs Overview</h4>
+                            
+                            <div class="space-y-4">
+                                <div class="bg-neutral-50 p-4 rounded-lg">
+                                    <h5 class="font-semibold text-primary-900 mb-2">1. Migration Plan</h5>
+                                    <p class="text-neutral-700 text-sm">
+                                        Generate a comprehensive comparison report between source and target environments. 
+                                        This shows what needs to be migrated, what's different, and provides a detailed action plan.
+                                    </p>
+                                </div>
+
+                                <div class="bg-neutral-50 p-4 rounded-lg">
+                                    <h5 class="font-semibold text-primary-900 mb-2">2. Main Migration</h5>
+                                    <p class="text-neutral-700 text-sm">
+                                        Run a complete migration with all components. Options include:
+                                    </p>
+                                    <ul class="list-disc list-inside ml-4 mt-2 text-sm text-neutral-600">
+                                        <li><strong>Include Data:</strong> Migrate database rows (--data)</li>
+                                        <li><strong>Auth Users:</strong> Migrate authentication users (--users)</li>
+                                        <li><strong>Include Files:</strong> Migrate bucket files (--files)</li>
+                                        <li><strong>Create Backup:</strong> Backup target before migration (--backup)</li>
+                                        <li><strong>Dry Run:</strong> Preview changes without applying (--dry-run)</li>
+                                    </ul>
+                                </div>
+
+                                <div class="bg-neutral-50 p-4 rounded-lg">
+                                    <h5 class="font-semibold text-primary-900 mb-2">3. Component Migrations</h5>
+                                    <p class="text-neutral-700 text-sm">
+                                        Run individual component migrations:
+                                    </p>
+                                    <ul class="list-disc list-inside ml-4 mt-2 text-sm text-neutral-600">
+                                        <li><strong>Database Migration:</strong> Schema, data, and auth users</li>
+                                        <li><strong>Storage Migration:</strong> Buckets and files</li>
+                                        <li><strong>Edge Functions:</strong> Deploy edge functions</li>
+                                        <li><strong>Secrets Migration:</strong> Migrate project secrets</li>
+                                    </ul>
+                                </div>
+
+                                <div class="bg-neutral-50 p-4 rounded-lg">
+                                    <h5 class="font-semibold text-primary-900 mb-2">4. History & Reports</h5>
+                                    <p class="text-neutral-700 text-sm">
+                                        View past migrations and generated plans. Click "View Report" to see detailed HTML reports 
+                                        or "View Log" to see the complete migration log.
+                                    </p>
+                                </div>
+
+                                <div class="bg-neutral-50 p-4 rounded-lg">
+                                    <h5 class="font-semibold text-primary-900 mb-2">5. CLI Manual</h5>
+                                    <p class="text-neutral-700 text-sm">
+                                        Complete documentation for using migration scripts from the command line.
+                                    </p>
+                                </div>
+
+                                <div class="bg-neutral-50 p-4 rounded-lg">
+                                    <h5 class="font-semibold text-primary-900 mb-2">6. UI Manual</h5>
+                                    <p class="text-neutral-700 text-sm">
+                                        This guide - complete documentation for using the web interface.
+                                    </p>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="mb-8">
+                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Features</h4>
+                            
+                            <div class="space-y-3">
+                                <div class="flex items-start space-x-3">
+                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <div>
+                                        <strong class="text-primary-900">Real-time Log Streaming:</strong>
+                                        <p class="text-neutral-700 text-sm">Watch migrations progress in real-time with live log updates</p>
+                                    </div>
+                                </div>
+
+                                <div class="flex items-start space-x-3">
+                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <div>
+                                        <strong class="text-primary-900">Active Job Indicator:</strong>
+                                        <p class="text-neutral-700 text-sm">See running jobs in the header and navigate to them directly</p>
+                                    </div>
+                                </div>
+
+                                <div class="flex items-start space-x-3">
+                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <div>
+                                        <strong class="text-primary-900">HTML Reports:</strong>
+                                        <p class="text-neutral-700 text-sm">Detailed HTML reports for every migration with statistics and change logs</p>
+                                    </div>
+                                </div>
+
+                                <div class="flex items-start space-x-3">
+                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <div>
+                                        <strong class="text-primary-900">Color-coded Logs:</strong>
+                                        <p class="text-neutral-700 text-sm">Success (green), errors (red), and warnings (yellow) are clearly highlighted</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </section>
+
+                        <section class="mb-8">
+                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Best Practices</h4>
+                            <ul class="list-disc list-inside space-y-2 text-neutral-700">
+                                <li>Always generate a migration plan first to understand what will be migrated</li>
+                                <li>Use dry-run mode to preview changes before applying them</li>
+                                <li>Create backups before running migrations on production environments</li>
+                                <li>Review migration reports after completion to verify success</li>
+                                <li>Check logs if a migration fails to identify the issue</li>
+                            </ul>
+                        </section>
+
+                        <section class="mb-8">
+                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Troubleshooting</h4>
+                            <div class="bg-warning-50 border-2 border-warning-200 rounded-lg p-4">
+                                <p class="text-warning-800 text-sm">
+                                    <strong>If a migration fails:</strong> Check the log output for specific error messages. 
+                                    Common issues include missing environment variables, authentication problems, or network connectivity issues.
+                                </p>
+                            </div>
+                        </section>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-primary-900 text-white border-t border-primary-800 mt-auto">
+        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+            <div class="flex flex-col md:flex-row items-center justify-between space-y-4 md:space-y-0">
+                <div class="flex items-center space-x-3">
+                    <div class="w-8 h-8 flex items-center justify-center">
+                        <svg viewBox="0 0 60 60" class="w-8 h-8" xmlns="http://www.w3.org/2000/svg">
+                            <defs>
+                                <linearGradient id="footerXGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#3498db;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#1a2c4e;stop-opacity:1" />
+                                </linearGradient>
+                                <linearGradient id="footerAGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#d3d3d3;stop-opacity:1" />
+                                    <stop offset="60%" style="stop-color:#d3d3d3;stop-opacity:1" />
+                                    <stop offset="60%" style="stop-color:#8bc34a;stop-opacity:1" />
+                                    <stop offset="100%" style="stop-color:#8bc34a;stop-opacity:1" />
+                                </linearGradient>
+                            </defs>
+                            <path d="M 10 10 L 25 25 L 10 40 L 25 40 L 40 25 L 25 10 Z" fill="url(#footerXGradient)"/>
+                            <circle cx="25" cy="25" r="4" fill="white" opacity="0.9"/>
+                            <path d="M 25 10 L 35 10 L 45 40 L 35 40 L 32.5 32.5 L 27.5 32.5 L 25 40 L 15 40 Z" fill="url(#footerAGradient)"/>
+                        </svg>
+                    </div>
+                    <span class="text-sm font-medium text-white/90">XYNTRA AI SOLUTIONS</span>
+                </div>
+                <div class="text-sm text-white/70 text-center md:text-right">
+                    <p>Developed by <span class="font-semibold text-white">Xyntra AI Solutions Inc.</span></p>
+                    <p>All Rights Reserved © 2025</p>
+                </div>
+            </div>
+        </div>
+    </footer>
+
+    <!-- Production Migration Confirmation Modal -->
+    <div id="prodConfirmModal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl max-w-2xl w-full animate-slide-up">
+            <div class="p-6 border-b border-error-200 bg-error-50">
+                <div class="flex items-center space-x-3">
+                    <div class="flex items-center justify-center w-12 h-12 bg-error-100 rounded-xl">
+                        <svg class="w-6 h-6 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                        </svg>
+                    </div>
+                    <div>
+                        <h2 class="text-2xl font-bold text-error-900">⚠️ Production Migration Warning</h2>
+                        <p class="text-error-700 text-sm mt-1">You are about to migrate to PRODUCTION environment</p>
+                    </div>
+                </div>
+            </div>
+            <div class="p-6 space-y-6">
+                <div class="bg-warning-50 border-2 border-warning-200 rounded-xl p-4">
+                    <p class="text-warning-800 text-sm font-semibold mb-2">⚠️ Critical Safety Check Required</p>
+                    <p class="text-warning-700 text-sm">
+                        Migrating to production can affect live users and data. Please provide a reason for this migration 
+                        and confirm by typing <strong class="font-mono">PROCEED</strong> to continue.
+                    </p>
+                </div>
+                
+                <div>
+                    <label for="migrationReason" class="block text-sm font-semibold text-primary-800 mb-2">
+                        Reason for Production Migration <span class="text-error-600">*</span>
+                    </label>
+                    <textarea 
+                        id="migrationReason" 
+                        rows="4"
+                        required
+                        placeholder="Please provide a detailed reason for migrating to production (e.g., 'Deploying new schema changes from staging', 'Syncing production with latest features', etc.)"
+                        class="w-full px-4 py-3 bg-white border-2 border-neutral-300 rounded-xl text-primary-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200 resize-none"
+                    ></textarea>
+                </div>
+                
+                <div>
+                    <label for="proceedConfirmation" class="block text-sm font-semibold text-primary-800 mb-2">
+                        Type <span class="font-mono bg-error-100 text-error-700 px-2 py-1 rounded">PROCEED</span> to confirm <span class="text-error-600">*</span>
+                    </label>
+                    <input 
+                        type="text" 
+                        id="proceedConfirmation" 
+                        required
+                        placeholder="Type PROCEED here"
+                        class="w-full px-4 py-3 bg-white border-2 border-neutral-300 rounded-xl text-primary-900 font-mono focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200"
+                        autocomplete="off"
+                    />
+                </div>
+                
+                <div id="prodConfirmError" class="hidden p-4 bg-error-50 border-2 border-error-200 rounded-xl">
+                    <p class="text-error-800 text-sm">
+                        <strong>Error:</strong> <span id="prodConfirmErrorMessage"></span>
+                    </p>
+                </div>
+                
+                <div class="flex space-x-3">
+                    <button 
+                        type="button"
+                        onclick="closeProdConfirmModal()" 
+                        class="flex-1 px-6 py-3 bg-neutral-200 text-neutral-700 font-semibold rounded-xl hover:bg-neutral-300 transition-colors duration-200"
+                    >
+                        Cancel
+                    </button>
+                    <button 
+                        type="button"
+                        id="prodConfirmButton"
+                        onclick="confirmProdMigration()" 
+                        class="flex-1 px-6 py-3 bg-error-600 text-white font-semibold rounded-xl hover:bg-error-700 shadow-lg hover:shadow-xl transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
+                        disabled
+                    >
+                        Confirm & Proceed
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Log Viewer Modal -->
+    <div id="logModal" class="hidden fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[90vh] flex flex-col animate-slide-up">
+            <div class="flex items-center justify-between p-6 border-b border-neutral-200">
+                <h2 class="text-xl font-bold text-neutral-900">Migration Log</h2>
+                <button onclick="closeLogModal()" 
+                    class="p-2 hover:bg-neutral-100 rounded-lg transition-colors duration-200">
+                    <svg class="w-6 h-6 text-neutral-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
+                    </svg>
+                </button>
+            </div>
+            <div id="logContent" class="log-container flex-1 overflow-y-auto p-6"></div>
+        </div>
+    </div>
+
+    <script src="ui.js"></script>
+    <script>
+        // Tab switching with Tailwind classes
+        function switchTab(tabName, clickedElement) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.add('hidden');
+                tab.classList.remove('animate-fade-in');
+            });
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                    btn.classList.remove('active', 'bg-primary-600', 'text-white', 'shadow-md');
+                    btn.classList.add('text-neutral-600', 'hover:bg-neutral-100');
+            });
+
+            // Show selected tab
+            const selectedTab = document.getElementById(tabName);
+            if (selectedTab) {
+                selectedTab.classList.remove('hidden');
+                selectedTab.classList.add('animate-fade-in');
+            }
+
+            // Update button
+            if (clickedElement) {
+                clickedElement.classList.add('active', 'bg-primary-600', 'text-white', 'shadow-md');
+                clickedElement.classList.remove('text-neutral-600', 'hover:bg-neutral-100');
+            }
+
+            // Load data for history tab
+            if (tabName === 'history') {
+                setTimeout(() => {
+                    loadHistory();
+                    loadPlans();
+                }, 100);
+            }
+        }
+
+        // Loading spinner component
+        const loadingSpinnerHTML = `
+            <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+            </svg>
+        `;
+
+        // Update loading spinner
+        document.querySelectorAll('.loading-spinner').forEach(spinner => {
+            spinner.innerHTML = loadingSpinnerHTML;
+        });
+    </script>
+</body>
+</html>

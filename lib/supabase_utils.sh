@@ -262,6 +262,76 @@ create_backup_dir() {
     echo "$backup_dir"
 }
 
+# Cleanup old migration records in backups folder
+# Keeps only the last N migration directories (sorted by modification time)
+cleanup_old_migration_records() {
+    local keep_count=${1:-3}  # Default: keep last 3 records
+    local backups_dir="${PROJECT_ROOT:-.}/backups"
+    
+    if [ ! -d "$backups_dir" ]; then
+        log_warning "Backups directory not found: $backups_dir"
+        return 0
+    fi
+    
+    log_info "Cleaning up old migration records (keeping last $keep_count)..."
+    
+    # Find all migration directories (folders matching migration pattern)
+    # Use find with proper grouping for -o operator
+    local all_dirs
+    all_dirs=$(find "$backups_dir" -maxdepth 1 -type d \( -name "*_migration_*" -o -name "*migration_*" \) 2>/dev/null)
+    
+    if [ -z "$all_dirs" ]; then
+        log_info "No migration directories found to clean up"
+        return 0
+    fi
+    
+    # Count total directories
+    local total_count
+    total_count=$(echo "$all_dirs" | grep -c . || echo "0")
+    
+    if [ "$total_count" -le "$keep_count" ]; then
+        log_info "Only $total_count migration record(s) found, no cleanup needed (keeping last $keep_count)"
+        return 0
+    fi
+    
+    # Sort by modification time (newest first) and get directories to delete
+    # macOS find doesn't support -printf, so use stat or ls -td instead
+    local dirs_to_delete
+    if command -v stat >/dev/null 2>&1 && stat -f "%m %N" "$backups_dir" >/dev/null 2>&1; then
+        # macOS stat
+        dirs_to_delete=$(find "$backups_dir" -maxdepth 1 -type d \( -name "*_migration_*" -o -name "*migration_*" \) -exec stat -f "%m %N" {} \; 2>/dev/null | \
+            sort -rn | \
+            tail -n +$((keep_count + 1)) | \
+            cut -d' ' -f2-)
+    elif command -v stat >/dev/null 2>&1; then
+        # Linux stat
+        dirs_to_delete=$(find "$backups_dir" -maxdepth 1 -type d \( -name "*_migration_*" -o -name "*migration_*" \) -exec stat -c "%Y %n" {} \; 2>/dev/null | \
+            sort -rn | \
+            tail -n +$((keep_count + 1)) | \
+            cut -d' ' -f2-)
+    else
+        # Fallback: use ls -td (sorts by modification time, newest first)
+        dirs_to_delete=$(ls -1td "$backups_dir"/*_migration_* "$backups_dir"/migration_* 2>/dev/null | \
+            tail -n +$((keep_count + 1)))
+    fi
+    
+    if [ -z "$dirs_to_delete" ]; then
+        log_info "No old migration records to delete"
+        return 0
+    fi
+    
+    local deleted_count=0
+    while IFS= read -r dir; do
+        if [ -n "$dir" ] && [ -d "$dir" ]; then
+            log_info "  Deleting old migration record: $(basename "$dir")"
+            rm -rf "$dir"
+            deleted_count=$((deleted_count + 1))
+        fi
+    done <<< "$dirs_to_delete"
+    
+    log_success "Migration records cleanup complete: Kept $keep_count record(s), deleted $deleted_count record(s)"
+}
+
 # Cleanup old backup directories of the same type
 # This keeps only the current migration folder and removes older ones of the same type
 cleanup_old_backups() {
