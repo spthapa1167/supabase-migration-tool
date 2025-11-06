@@ -2,12 +2,14 @@
 # Supabase Utilities Library
 # Common functions for Supabase project duplication
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+# Colors for output (only define if not already set, e.g., by logger.sh)
+if [ -z "${RED:-}" ]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    NC='\033[0m' # No Color
+fi
 
 # Logging functions
 log_info() {
@@ -244,9 +246,69 @@ check_docker() {
 
 # Create backup directory
 create_backup_dir() {
-    local backup_dir="backups/$(date +%Y%m%d_%H%M%S)"
+    local mode=${1:-full}  # full or schema
+    local source_env=${2:-}
+    local target_env=${3:-}
+    local timestamp=$(date +%Y%m%d_%H%M%S)
+    
+    # Create descriptive folder name
+    if [ -n "$source_env" ] && [ -n "$target_env" ]; then
+        local backup_dir="backups/${mode}_migration_${source_env}_to_${target_env}_${timestamp}"
+    else
+        local backup_dir="backups/${mode}_migration_${timestamp}"
+    fi
+    
     mkdir -p "$backup_dir"
     echo "$backup_dir"
+}
+
+# Cleanup old backup directories of the same type
+# This keeps only the current migration folder and removes older ones of the same type
+cleanup_old_backups() {
+    local backup_type=$1  # e.g., "schema_db", "storage", "edge_functions", "secrets_migration"
+    local source_env=${2:-}
+    local target_env=${3:-}
+    local current_backup_dir=${4:-}
+    
+    # If no backup type specified, skip cleanup
+    [ -z "$backup_type" ] && return 0
+    
+    # Build pattern to match old backups
+    # Note: create_backup_dir creates: backups/${backup_type}_migration_${source_env}_to_${target_env}_${timestamp}
+    # So if backup_type is "storage", it creates "storage_migration_..."
+    # But we also need to handle the case where backup_type already includes "_migration"
+    local pattern="backups/${backup_type}"
+    
+    # If backup_type doesn't end with "_migration", add it (since create_backup_dir adds it)
+    if [[ ! "$backup_type" =~ _migration$ ]]; then
+        pattern="${pattern}_migration"
+    fi
+    
+    if [ -n "$source_env" ] && [ -n "$target_env" ]; then
+        pattern="${pattern}_${source_env}_to_${target_env}_*"
+    else
+        pattern="${pattern}_*"
+    fi
+    
+    # Find all matching directories except the current one
+    local old_backups=$(ls -td $pattern 2>/dev/null | grep -v "^${current_backup_dir}$" || true)
+    
+    if [ -n "$old_backups" ]; then
+        local count=$(echo "$old_backups" | wc -l | tr -d ' ')
+        log_info "Cleaning up $count old backup(s) of type: $backup_type"
+        
+        # Remove old backups
+        echo "$old_backups" | while IFS= read -r old_backup; do
+            if [ -n "$old_backup" ] && [ -d "$old_backup" ]; then
+                log_info "  Removing: $(basename "$old_backup")"
+                rm -rf "$old_backup"
+            fi
+        done
+        
+        log_success "Cleaned up $count old backup(s)"
+    else
+        log_info "No old backups to clean up for type: $backup_type"
+    fi
 }
 
 # Validate environment names

@@ -1,1 +1,0 @@
-scripts/sync/sync_test.sh

@@ -1,1 +1,0 @@
-scripts/sync/sync_all.sh
