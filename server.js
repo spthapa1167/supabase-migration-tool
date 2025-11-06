@@ -4,6 +4,7 @@
  * Minimal Node.js server to manage migrations via web interface
  */
 
+
 const express = require('express');
 const { spawn, exec } = require('child_process');
 const path = require('path');
