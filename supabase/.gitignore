@@ -6,3 +6,7 @@
 .env.keys
 .env.local
 .env.*.local
+
+#folders
+supabase/backups/
+supabase/migration_plans/

@@ -6,6 +6,8 @@
 set -eo pipefail
 # Note: Temporarily disabling 'u' flag for heredoc variable expansion
 # Variables are initialized before use, but heredoc expansion can cause false positives
+# Temporarily disable strict mode for environment loading to handle .env.local gracefully
+set +u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -62,7 +64,16 @@ if [ -z "$SOURCE_ENV" ] || [ -z "$TARGET_ENV" ]; then
 fi
 
 # Load environment
+set +e  # Temporarily disable exit on error for environment loading
 load_env
+LOAD_ENV_EXIT_CODE=$?
+set -e  # Re-enable exit on error
+if [ $LOAD_ENV_EXIT_CODE -ne 0 ]; then
+    log_error "Failed to load environment variables"
+    exit 1
+fi
+set -u  # Re-enable unbound variable checking after environment is loaded
+
 validate_environments "$SOURCE_ENV" "$TARGET_ENV"
 
 # Get project references and passwords
@@ -96,7 +107,11 @@ get_db_schema_info() {
     
     log_info "Collecting database schema information from $env..."
     
-    POOLER_HOST=$(get_pooler_host "$ref")
+    # Get pooler host using environment name (more reliable)
+    POOLER_HOST=$(get_pooler_host_for_env "$env" 2>/dev/null || get_pooler_host "$ref")
+    if [ -z "$POOLER_HOST" ]; then
+        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
     
     # Get tables
     PGPASSWORD="$password" psql \
@@ -112,7 +127,7 @@ get_db_schema_info() {
     PGPASSWORD="$password" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${ref} \
+        -U "postgres.${ref}" \
         -d postgres \
         -t -A \
         -c "SELECT schemaname||'.'||viewname FROM pg_views WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, viewname;" \
@@ -122,7 +137,7 @@ get_db_schema_info() {
     PGPASSWORD="$password" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${ref} \
+        -U "postgres.${ref}" \
         -d postgres \
         -t -A \
         -c "SELECT n.nspname||'.'||p.proname||'('||pg_get_function_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname IN ('public', 'storage', 'auth') ORDER BY n.nspname, p.proname;" \
@@ -132,7 +147,7 @@ get_db_schema_info() {
     PGPASSWORD="$password" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${ref} \
+        -U "postgres.${ref}" \
         -d postgres \
         -t -A \
         -c "SELECT tgname FROM pg_trigger WHERE tgisinternal = false ORDER BY tgname;" \
@@ -142,7 +157,7 @@ get_db_schema_info() {
     PGPASSWORD="$password" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${ref} \
+        -U "postgres.${ref}" \
         -d postgres \
         -t -A \
         -c "SELECT schemaname||'.'||sequencename FROM pg_sequences WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, sequencename;" \
@@ -188,13 +203,18 @@ get_storage_buckets_info() {
     
     log_info "Collecting storage buckets information from $env..."
     
-    POOLER_HOST=$(get_pooler_host "$ref")
+    # Get pooler host using environment name (more reliable)
+    POOLER_HOST=$(get_pooler_host_for_env "$env" 2>/dev/null || get_pooler_host "$ref")
+    if [ -z "$POOLER_HOST" ]; then
+        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
+    fi
     
     # Get buckets with file counts
+    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
     PGPASSWORD="$password" psql \
         -h "$POOLER_HOST" \
         -p 6543 \
-        -U postgres.${ref} \
+        -U "postgres.${ref}" \
         -d postgres \
         -t -A \
         -c "

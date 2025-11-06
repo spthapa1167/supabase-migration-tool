@@ -114,13 +114,18 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 log_info "Exporting source schema..."
-SOURCE_POOLER=$(get_pooler_host "$SOURCE_REF")
+# Get pooler host using environment name (more reliable)
+SOURCE_POOLER=$(get_pooler_host_for_env "$SOURCE_ENV" 2>/dev/null || get_pooler_host "$SOURCE_REF")
+if [ -z "$SOURCE_POOLER" ]; then
+    SOURCE_POOLER="aws-1-us-east-2.pooler.supabase.com"
+fi
 SOURCE_DUMP_OUTPUT=$(mktemp)
 set +e
+# Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
 PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
     -h "$SOURCE_POOLER" \
     -p 6543 \
-    -U postgres.${SOURCE_REF} \
+    -U "postgres.${SOURCE_REF}" \
     -d postgres \
     --schema-only \
     --no-owner \
@@ -136,9 +141,9 @@ if [ $SOURCE_DUMP_EXIT -ne 0 ] || grep -q "FATAL\|could not translate\|connectio
         rm -f "$SOURCE_SCHEMA" "$SOURCE_DUMP_OUTPUT"
         set +e
         PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-            -h db.${SOURCE_REF}.supabase.co \
+            -h "db.${SOURCE_REF}.supabase.co" \
             -p 5432 \
-            -U postgres.${SOURCE_REF} \
+            -U "postgres.${SOURCE_REF}" \
             -d postgres \
             --schema-only \
             --no-owner \
@@ -159,13 +164,18 @@ fi
 rm -f "$SOURCE_DUMP_OUTPUT"
 
 log_info "Exporting target schema..."
-TARGET_POOLER=$(get_pooler_host "$TARGET_REF")
+# Get pooler host using environment name (more reliable)
+TARGET_POOLER=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
+if [ -z "$TARGET_POOLER" ]; then
+    TARGET_POOLER="aws-1-us-east-2.pooler.supabase.com"
+fi
 TARGET_DUMP_OUTPUT=$(mktemp)
 set +e
+# Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
 PGPASSWORD="$TARGET_PASSWORD" pg_dump \
     -h "$TARGET_POOLER" \
     -p 6543 \
-    -U postgres.${TARGET_REF} \
+    -U "postgres.${TARGET_REF}" \
     -d postgres \
     --schema-only \
     --no-owner \
@@ -181,9 +191,9 @@ if [ $TARGET_DUMP_EXIT -ne 0 ] || grep -q "FATAL\|could not translate\|connectio
         rm -f "$TARGET_SCHEMA" "$TARGET_DUMP_OUTPUT"
         set +e
         PGPASSWORD="$TARGET_PASSWORD" pg_dump \
-            -h db.${TARGET_REF}.supabase.co \
+            -h "db.${TARGET_REF}.supabase.co" \
             -p 5432 \
-            -U postgres.${TARGET_REF} \
+            -U "postgres.${TARGET_REF}" \
             -d postgres \
             --schema-only \
             --no-owner \
@@ -252,14 +262,14 @@ set +e
 PGPASSWORD="$SOURCE_PASSWORD" psql \
     -h "$SOURCE_POOLER" \
     -p 6543 \
-    -U postgres.${SOURCE_REF} \
+    -U "postgres.${SOURCE_REF}" \
     -d postgres \
     -t -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;" \
     | tr -d ' ' | grep -v '^$' > "$SOURCE_TABLES" 2>/dev/null || {
     PGPASSWORD="$SOURCE_PASSWORD" psql \
         -h db.${SOURCE_REF}.supabase.co \
         -p 5432 \
-        -U postgres.${SOURCE_REF} \
+        -U "postgres.${SOURCE_REF}" \
         -d postgres \
         -t -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;" \
         | tr -d ' ' | grep -v '^$' > "$SOURCE_TABLES" 2>/dev/null || true
@@ -268,14 +278,14 @@ PGPASSWORD="$SOURCE_PASSWORD" psql \
 PGPASSWORD="$TARGET_PASSWORD" psql \
     -h "$TARGET_POOLER" \
     -p 6543 \
-    -U postgres.${TARGET_REF} \
+    -U "postgres.${TARGET_REF}" \
     -d postgres \
     -t -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;" \
     | tr -d ' ' | grep -v '^$' > "$TARGET_TABLES" 2>/dev/null || {
     PGPASSWORD="$TARGET_PASSWORD" psql \
         -h db.${TARGET_REF}.supabase.co \
         -p 5432 \
-        -U postgres.${TARGET_REF} \
+        -U "postgres.${TARGET_REF}" \
         -d postgres \
         -t -c "SELECT tablename FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename;" \
         | tr -d ' ' | grep -v '^$' > "$TARGET_TABLES" 2>/dev/null || true

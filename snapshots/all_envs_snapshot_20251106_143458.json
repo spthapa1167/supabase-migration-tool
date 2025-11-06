@@ -1,0 +1,72 @@
+{
+  "timestamp": "2025-11-06 14:34:58",
+  "generatedAt": 1762461322,
+  "environments": {
+    "dev": {
+      "env": "dev",
+      "name": "Development",
+      "projectRef": "",
+      "projectName": "",
+      "timestamp": "",
+      "counts": {
+        "tables": 0,
+        "views": 0,
+        "functions": 0,
+        "sequences": 0,
+        "indexes": 0,
+        "policies": 0,
+        "triggers": 0,
+        "types": 0,
+        "enums": 0,
+        "authUsers": 0,
+        "edgeFunctions": 0,
+        "buckets": 0,
+        "secrets": 0
+      }
+    },
+    "test": {
+      "env": "test",
+      "name": "Test/Staging",
+      "projectRef": "",
+      "projectName": "",
+      "timestamp": "",
+      "counts": {
+        "tables": 0,
+        "views": 0,
+        "functions": 0,
+        "sequences": 0,
+        "indexes": 0,
+        "policies": 0,
+        "triggers": 0,
+        "types": 0,
+        "enums": 0,
+        "authUsers": 0,
+        "edgeFunctions": 0,
+        "buckets": 0,
+        "secrets": 0
+      }
+    },
+    "prod": {
+      "env": "prod",
+      "name": "Production",
+      "projectRef": "",
+      "projectName": "",
+      "timestamp": "",
+      "counts": {
+        "tables": 0,
+        "views": 0,
+        "functions": 0,
+        "sequences": 0,
+        "indexes": 0,
+        "policies": 0,
+        "triggers": 0,
+        "types": 0,
+        "enums": 0,
+        "authUsers": 0,
+        "edgeFunctions": 0,
+        "buckets": 0,
+        "secrets": 0
+      }
+    }
+  }
+}

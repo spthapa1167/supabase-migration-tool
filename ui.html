@@ -215,10 +215,15 @@
                     </div>
                     <div class="h-12 w-px bg-neutral-300"></div>
                     <div>
-                        <h2 class="text-xl font-bold text-primary-900">
+                        <h2 class="text-xl font-bold text-primary-900" id="appName">
                             Supabase Migration Tool
                         </h2>
                         <p class="text-sm text-neutral-600">Web-Based Migration Management</p>
+                        <div class="mt-2 flex items-center space-x-4 text-xs">
+                            <div id="envInfo" class="flex items-center space-x-3 text-neutral-600">
+                                <!-- Environment project names will be loaded here -->
+                            </div>
+                        </div>
                     </div>
                 </div>
                 <div class="flex items-center space-x-3">
@@ -281,6 +286,24 @@
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
                         </svg>
                         <span>Components</span>
+                    </span>
+                </button>
+                <button onclick="switchTab('connection-test', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span>Connection Test</span>
+                    </span>
+                </button>
+                <button onclick="switchTab('env-comparison', this)" 
+                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
+                    <span class="flex items-center justify-center space-x-2">
+                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                        </svg>
+                        <span>Environment Comparison</span>
                     </span>
                 </button>
                 <button onclick="switchTab('history', this)" 
@@ -658,6 +681,125 @@
                             </button>
                         </form>
                         <div id="secretsResult" class="mt-4"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Environment Comparison Tab -->
+            <div id="env-comparison" class="tab-content hidden">
+                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
+                    <div class="flex items-center space-x-3 mb-6">
+                        <div class="flex items-center justify-center w-12 h-12 bg-primary-100 rounded-xl">
+                            <svg class="w-6 h-6 text-primary-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-2xl font-bold text-primary-900">Environment Comparison</h2>
+                            <p class="text-neutral-600 text-sm">Compare all objects across dev, test, and prod environments</p>
+                        </div>
+                    </div>
+                    
+                    <div class="space-y-6">
+                        <!-- Generate Snapshot Button -->
+                        <div class="bg-white border-2 border-neutral-200 rounded-xl p-6">
+                            <div class="flex items-center justify-between mb-4">
+                                <div>
+                                    <h3 class="text-lg font-semibold text-primary-900">Generate Snapshot</h3>
+                                    <p class="text-sm text-neutral-600 mt-1">Create a snapshot of all objects in dev, test, and prod environments</p>
+                                </div>
+                                <button onclick="generateAllEnvsSnapshot()" 
+                                    class="px-6 py-3 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200 flex items-center space-x-2">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                                    </svg>
+                                    <span>Generate Snapshot</span>
+                                </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Snapshot Results -->
+                        <div id="snapshotResults" class="hidden">
+                            <div class="bg-white border-2 border-neutral-200 rounded-xl p-6">
+                                <div class="flex items-center justify-between mb-4">
+                                    <h3 class="text-lg font-semibold text-primary-900">Comparison Results</h3>
+                                    <span id="snapshotTimestamp" class="text-sm text-neutral-600"></span>
+                                </div>
+                                <div id="comparisonTable" class="overflow-x-auto">
+                                    <!-- Comparison table will be generated here -->
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Loading Indicator -->
+                        <div id="snapshotLoading" class="hidden">
+                            <div class="bg-white border-2 border-neutral-200 rounded-xl p-8">
+                                <div class="flex items-center justify-center">
+                                    <div class="text-center">
+                                        <svg class="w-12 h-12 text-primary-500 animate-spin mx-auto mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                                        </svg>
+                                        <p class="text-neutral-600 font-semibold">Generating snapshot...</p>
+                                        <p class="text-sm text-neutral-500 mt-2">Collecting data from all environments</p>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Connection Test Tab -->
+            <div id="connection-test" class="tab-content hidden">
+                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
+                    <div class="flex items-center space-x-3 mb-6">
+                        <div class="flex items-center justify-center w-12 h-12 bg-success-100 rounded-xl">
+                            <svg class="w-6 h-6 text-success-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                        </div>
+                        <div>
+                            <h2 class="text-2xl font-bold text-primary-900">Connection Test</h2>
+                            <p class="text-neutral-600 text-sm">Test and validate Supabase connections for each environment</p>
+                        </div>
+                    </div>
+                    
+                    <div class="space-y-6">
+                        <!-- Environment List -->
+                        <div class="bg-white border-2 border-neutral-200 rounded-xl p-6">
+                            <div class="flex items-center justify-between mb-6">
+                                <div>
+                                    <h3 class="text-lg font-semibold text-primary-900">Environments</h3>
+                                    <p class="text-sm text-neutral-600 mt-1">Click "Test Connection" for each environment or use "Test All" to test all at once</p>
+                                </div>
+                                <button onclick="testAllConnections()" 
+                                    class="px-6 py-3 bg-gradient-to-r from-primary-500 to-primary-700 text-white text-sm font-semibold rounded-lg hover:from-primary-600 hover:to-primary-800 shadow-md hover:shadow-lg transition-all duration-200 flex items-center space-x-2">
+                                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                    </svg>
+                                    <span>Test All</span>
+                                </button>
+                            </div>
+                            <div id="environmentsList" class="space-y-4">
+                                <!-- Environments will be loaded here -->
+                            </div>
+                        </div>
+                        
+                        <!-- Test Results -->
+                        <div id="testResults" class="hidden">
+                            <div class="bg-white border-2 border-neutral-200 rounded-xl p-6">
+                                <div class="flex items-center justify-between mb-4">
+                                    <h3 class="text-lg font-semibold text-primary-900" id="testResultsTitle">Test Results</h3>
+                                    <button onclick="closeTestResults()" 
+                                        class="px-4 py-2 bg-neutral-200 text-neutral-700 text-sm font-semibold rounded-lg hover:bg-neutral-300 transition-colors">
+                                        Close
+                                    </button>
+                                </div>
+                                <div id="testResultsContent" class="space-y-4">
+                                    <!-- Test results will be displayed here -->
+                                </div>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>

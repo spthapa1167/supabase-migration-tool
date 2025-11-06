@@ -280,7 +280,10 @@ step_validate_env_file() {
     
     # Check for required variables
     local missing_vars=()
-    source "$ENV_FILE"
+    # Use load_env function instead of direct source for better error handling
+    set +e
+    load_env
+    set -e
     
     if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
         missing_vars+=("SUPABASE_ACCESS_TOKEN")
@@ -412,12 +415,17 @@ step_diff_comparison() {
     fi
     
     log_info "Exporting source schema..."
-    local source_pooler=$(get_pooler_host "$source_ref")
+    # Get pooler host using environment name (more reliable)
+    local source_pooler=$(get_pooler_host_for_env "$source" 2>/dev/null || get_pooler_host "$source_ref")
+    if [ -z "$source_pooler" ]; then
+        source_pooler="aws-1-us-east-2.pooler.supabase.com"
+    fi
     set +e
+    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
     PGPASSWORD="$source_password" pg_dump \
         -h "$source_pooler" \
         -p 6543 \
-        -U postgres.${source_ref} \
+        -U "postgres.${source_ref}" \
         -d postgres \
         --schema-only \
         --no-owner \
@@ -426,9 +434,9 @@ step_diff_comparison() {
         2>&1 | grep -v "WARNING" || {
         log_warning "Pooler connection failed for source, trying direct connection..."
         PGPASSWORD="$source_password" pg_dump \
-            -h db.${source_ref}.supabase.co \
+            -h "db.${source_ref}.supabase.co" \
             -p 5432 \
-            -U postgres.${source_ref} \
+            -U "postgres.${source_ref}" \
             -d postgres \
             --schema-only \
             --no-owner \
@@ -445,12 +453,17 @@ step_diff_comparison() {
     fi
     
     log_info "Exporting target schema..."
-    local target_pooler=$(get_pooler_host "$target_ref")
+    # Get pooler host using environment name (more reliable)
+    local target_pooler=$(get_pooler_host_for_env "$target" 2>/dev/null || get_pooler_host "$target_ref")
+    if [ -z "$target_pooler" ]; then
+        target_pooler="aws-1-us-east-2.pooler.supabase.com"
+    fi
     set +e
+    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
     PGPASSWORD="$target_password" pg_dump \
         -h "$target_pooler" \
         -p 6543 \
-        -U postgres.${target_ref} \
+        -U "postgres.${target_ref}" \
         -d postgres \
         --schema-only \
         --no-owner \
@@ -459,9 +472,9 @@ step_diff_comparison() {
         2>&1 | grep -v "WARNING" || {
         log_warning "Pooler connection failed for target, trying direct connection..."
         PGPASSWORD="$target_password" pg_dump \
-            -h db.${target_ref}.supabase.co \
+            -h "db.${target_ref}.supabase.co" \
             -p 5432 \
-            -U postgres.${target_ref} \
+            -U "postgres.${target_ref}" \
             -d postgres \
             --schema-only \
             --no-owner \
@@ -677,8 +690,10 @@ cd "\$PROJECT_ROOT"
 
 # Load environment if available
 if [ -f .env.local ]; then
-    source .env.local
-    export SUPABASE_ACCESS_TOKEN
+    # Use load_env function for safer environment loading
+    set +e
+    load_env
+    set -e
 fi
 
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -733,7 +748,7 @@ LOG_FILE="\${MIGRATION_DIR}/rollback.log"
 if PGPASSWORD="\$TARGET_PASSWORD" pg_restore \
     -h "\$POOLER_HOST" \
     -p 6543 \
-    -U postgres.\${TARGET_REF} \
+    -U "postgres.\${TARGET_REF}" \
     -d postgres \
     --verbose \
     --clean \
@@ -765,7 +780,7 @@ if [ "\${ROLLBACK_SUCCESS:-false}" != "true" ]; then
     if PGPASSWORD="\$TARGET_PASSWORD" pg_restore \
         -h db.\${TARGET_REF}.supabase.co \
         -p 5432 \
-        -U postgres.\${TARGET_REF} \
+        -U "postgres.\${TARGET_REF}" \
         -d postgres \
         --verbose \
         --clean \
@@ -973,8 +988,10 @@ If the rollback script doesn't work, use manual commands:
 cd "$migration_dir"
 
 # Load environment
-source ../../.env.local
-export SUPABASE_ACCESS_TOKEN
+# Use load_env function for safer environment loading
+set +e
+load_env
+set -e
 
 # Link to target project
 supabase link --project-ref "$target_ref" --password "$target_password"
@@ -983,7 +1000,7 @@ supabase link --project-ref "$target_ref" --password "$target_password"
 PGPASSWORD="$target_password" pg_restore \\
     -h "$pooler_host" \\
     -p 6543 \\
-    -U postgres.${target_ref} \\
+    -U "postgres.${target_ref}" \\
     -d postgres \\
     --clean \\
     --if-exists \\
@@ -996,7 +1013,7 @@ PGPASSWORD="$target_password" pg_restore \\
 # PGPASSWORD="$target_password" pg_restore \\
 #     -h db.${target_ref}.supabase.co \\
 #     -p 5432 \\
-#     -U postgres.${target_ref} \\
+#     -U "postgres.${target_ref}" \\
 #     -d postgres \\
 #     --clean \\
 #     --if-exists \\
@@ -1199,32 +1216,33 @@ capture_migration_snapshot() {
         local tables=0 views=0 functions=0 sequences=0 indexes=0 policies=0 triggers=0 types=0 enums=0
         
         if [ -n "$pooler_host" ]; then
-            tables=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            views=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            functions=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            sequences=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            indexes=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            policies=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            triggers=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "")
-            types=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            enums=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
+            tables=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            views=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            functions=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            sequences=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            indexes=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            policies=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            triggers=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "")
+            types=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "")
+            enums=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "")
         fi
         
         # Always try direct connection as well to ensure we get counts
         if [ -z "$pooler_host" ] || [ -z "$tables" ] || [ "$tables" = "" ] || [ "$tables" = "0" ]; then
             local direct_host="db.${project_ref}.supabase.co"
             log_info "Querying via direct connection for $project_ref..."
-            local direct_tables=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+            local direct_tables=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
             if [ -n "$direct_tables" ] && [ "$direct_tables" != "" ]; then
                 tables="$direct_tables"
-                views=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                functions=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                sequences=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                indexes=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                policies=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                triggers=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                types=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                enums=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                views=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                functions=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                sequences=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                indexes=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                policies=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                triggers=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                types=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+                enums=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "0")
             fi
         fi
         
@@ -1255,12 +1273,13 @@ capture_migration_snapshot() {
         local auth_users=0
         
         if [ -n "$pooler_host" ]; then
-            auth_users=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null | tr -d ' ' || echo "0")
+            # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
+            auth_users=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null | tr -d ' ' || echo "0")
         fi
         
         if [ -z "$pooler_host" ] || [ "$auth_users" = "" ] || [ "$auth_users" = "0" ]; then
             local direct_host="db.${project_ref}.supabase.co"
-            auth_users=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null | tr -d ' ' || echo "0")
+            auth_users=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null | tr -d ' ' || echo "0")
         fi
         
         echo "$auth_users"
@@ -1302,12 +1321,13 @@ capture_migration_snapshot() {
         local buckets=0
         
         if [ -n "$pooler_host" ]; then
-            buckets=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM storage.buckets;" 2>/dev/null | tr -d ' ' || echo "0")
+            # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
+            buckets=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM storage.buckets;" 2>/dev/null | tr -d ' ' || echo "0")
         fi
         
         if [ -z "$pooler_host" ] || [ "$buckets" = "" ]; then
             local direct_host="db.${project_ref}.supabase.co"
-            buckets=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM storage.buckets;" 2>/dev/null | tr -d ' ' || echo "0")
+            buckets=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM storage.buckets;" 2>/dev/null | tr -d ' ' || echo "0")
         fi
         
         echo "$buckets"
@@ -1937,14 +1957,20 @@ main() {
         exit 1
     fi
     
-    # Load environment
+    # Load environment using the robust load_env function
     if [ ! -f "$ENV_FILE" ]; then
         log_error "Environment file not found: $ENV_FILE"
         exit 1
     fi
     
-    source "$ENV_FILE"
-    export SUPABASE_ACCESS_TOKEN
+    set +e
+    load_env
+    LOAD_ENV_EXIT_CODE=$?
+    set -e
+    if [ $LOAD_ENV_EXIT_CODE -ne 0 ]; then
+        log_error "Failed to load environment variables"
+        exit 1
+    fi
     
     # Note: We don't cleanup before migration anymore
     # Cleanup happens AFTER migration completes to keep last 3 records

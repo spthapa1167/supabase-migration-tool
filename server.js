@@ -160,10 +160,31 @@ function executeScript(scriptPath, args = [], options = {}) {
 
 // Get server info
 app.get('/api/info', (req, res) => {
+    // Get app name (check both spellings for backward compatibility)
+    const appName = process.env.SUPABASE_APP_NAME || process.env.SUPABSE_APP_NAME || 'Supabase Migration Tool';
+    
     res.json({
         name: 'Supabase Migration Tool',
         version: '2.0',
         projectRoot: PROJECT_ROOT,
+        appName: appName,
+        environments: {
+            prod: {
+                name: 'Production',
+                projectName: process.env.SUPABASE_PROD_PROJECT_NAME || 'N/A',
+                projectRef: process.env.SUPABASE_PROD_PROJECT_REF || 'N/A'
+            },
+            test: {
+                name: 'Test/Staging',
+                projectName: process.env.SUPABASE_TEST_PROJECT_NAME || 'N/A',
+                projectRef: process.env.SUPABASE_TEST_PROJECT_REF || 'N/A'
+            },
+            dev: {
+                name: 'Development',
+                projectName: process.env.SUPABASE_DEV_PROJECT_NAME || 'N/A',
+                projectRef: process.env.SUPABASE_DEV_PROJECT_REF || 'N/A'
+            }
+        },
         scripts: {
             main: 'scripts/supabase_migration.sh',
             plan: 'scripts/migration_plan.sh',
@@ -988,6 +1009,210 @@ app.get('/api/migration/:processId/logs', (req, res) => {
     req.on('close', () => {
         clearInterval(interval);
     });
+});
+
+// Test connection for an environment
+// Generate snapshot for all environments
+app.post('/api/all-envs-snapshot', async (req, res) => {
+    const { stream } = req.body;
+    
+    // If streaming requested, use SSE
+    if (stream === true) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        
+        const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        
+        try {
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/all_envs_snapshot.sh');
+            await fs.access(fullPath, fs.constants.F_OK);
+            
+            const child = spawn('bash', [fullPath, 'snapshots'], {
+                cwd: PROJECT_ROOT,
+                env: process.env,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+            
+            const output = {
+                processId,
+                stdout: '',
+                stderr: '',
+                exitCode: null,
+                status: 'running'
+            };
+            
+            child.stdout.on('data', (data) => {
+                const text = data.toString();
+                output.stdout += text;
+                res.write(`data: ${JSON.stringify({ type: 'stdout', data: text })}\n\n`);
+            });
+            
+            child.stderr.on('data', (data) => {
+                const text = data.toString();
+                output.stderr += text;
+                res.write(`data: ${JSON.stringify({ type: 'stderr', data: text })}\n\n`);
+            });
+            
+            child.on('close', (code) => {
+                output.exitCode = code;
+                output.status = code === 0 ? 'completed' : 'failed';
+                
+                // Try to find the generated snapshot file
+                const snapshotsDir = path.join(PROJECT_ROOT, 'snapshots');
+                fs.readdir(snapshotsDir)
+                    .then(files => {
+                        const snapshotFiles = files.filter(f => f.startsWith('all_envs_snapshot_') && f.endsWith('.json'));
+                        snapshotFiles.sort().reverse(); // Get most recent first
+                        
+                        if (snapshotFiles.length > 0) {
+                            const latestSnapshot = path.join(snapshotsDir, snapshotFiles[0]);
+                            return fs.readFile(latestSnapshot, 'utf8');
+                        }
+                        return null;
+                    })
+                    .then(snapshotData => {
+                        if (snapshotData) {
+                            try {
+                                const snapshotJson = JSON.parse(snapshotData);
+                                res.write(`data: ${JSON.stringify({ type: 'snapshot', data: snapshotJson })}\n\n`);
+                            } catch (e) {
+                                // Ignore parse errors
+                            }
+                        }
+                        res.write(`data: ${JSON.stringify({ type: 'complete', status: output.status, exitCode: code })}\n\n`);
+                        res.end();
+                    })
+                    .catch(() => {
+                        res.write(`data: ${JSON.stringify({ type: 'complete', status: output.status, exitCode: code })}\n\n`);
+                        res.end();
+                    });
+            });
+            
+            child.on('error', (error) => {
+                res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+                res.end();
+            });
+            
+            // Store process
+            activeProcesses.set(processId, {
+                child,
+                output,
+                type: 'all-envs-snapshot',
+                startTime: new Date().toISOString(),
+            });
+        } catch (error) {
+            res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+            res.end();
+        }
+    } else {
+        // Non-streaming response - execute and return snapshot data
+        try {
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/all_envs_snapshot.sh');
+            await fs.access(fullPath, fs.constants.F_OK);
+            
+            const { exec } = require('child_process');
+            const { promisify } = require('util');
+            const execAsync = promisify(exec);
+            
+            await execAsync(`bash "${fullPath}" snapshots`, {
+                cwd: PROJECT_ROOT,
+                env: process.env
+            });
+            
+            // Read the latest snapshot file
+            const snapshotsDir = path.join(PROJECT_ROOT, 'snapshots');
+            const files = await fs.readdir(snapshotsDir);
+            const snapshotFiles = files.filter(f => f.startsWith('all_envs_snapshot_') && f.endsWith('.json'));
+            snapshotFiles.sort().reverse();
+            
+            if (snapshotFiles.length > 0) {
+                const latestSnapshot = path.join(snapshotsDir, snapshotFiles[0]);
+                const snapshotData = await fs.readFile(latestSnapshot, 'utf8');
+                const snapshotJson = JSON.parse(snapshotData);
+                res.json(snapshotJson);
+            } else {
+                res.status(500).json({ error: 'Snapshot file not found' });
+            }
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    }
+});
+
+app.post('/api/connection-test', async (req, res) => {
+    const { env, stream } = req.body;
+    
+    if (!env) {
+        return res.status(400).json({ error: 'env is required' });
+    }
+    
+    // If streaming requested, use SSE
+    if (stream === true) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        
+        const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        
+        try {
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/components/connection_test.sh');
+            await fs.access(fullPath, fs.constants.F_OK);
+            
+            const child = spawn('bash', [fullPath, env, '--verbose'], {
+                cwd: PROJECT_ROOT,
+                env: process.env,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+            
+            const output = {
+                processId,
+                stdout: '',
+                stderr: '',
+                exitCode: null,
+                status: 'running'
+            };
+            
+            child.stdout.on('data', (data) => {
+                const text = data.toString();
+                output.stdout += text;
+                res.write(`data: ${JSON.stringify({ type: 'stdout', data: text })}\n\n`);
+            });
+            
+            child.stderr.on('data', (data) => {
+                const text = data.toString();
+                output.stderr += text;
+                res.write(`data: ${JSON.stringify({ type: 'stderr', data: text })}\n\n`);
+            });
+            
+            child.on('close', (code) => {
+                output.exitCode = code;
+                output.status = code === 0 ? 'completed' : 'failed';
+                res.write(`data: ${JSON.stringify({ type: 'complete', status: output.status, exitCode: code })}\n\n`);
+                res.end();
+            });
+            
+            child.on('error', (error) => {
+                res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+                res.end();
+            });
+            
+            // Store process
+            activeProcesses.set(processId, {
+                child,
+                output,
+                type: 'connection-test',
+                env: env,
+                startTime: new Date().toISOString(),
+            });
+        } catch (error) {
+            res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+            res.end();
+        }
+    } else {
+        // Non-streaming response (not typically used for this endpoint)
+        res.status(400).json({ error: 'Streaming is required for connection tests' });
+    }
 });
 
 // Get process status
