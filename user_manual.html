@@ -1,0 +1,1126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Supabase Migration Tool - User Manual</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            background: #f5f5f5;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: white;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+        
+        header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px 20px;
+            margin: -20px -20px 40px -20px;
+            border-radius: 0 0 20px 20px;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        
+        h2 {
+            color: #667eea;
+            margin-top: 40px;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #667eea;
+            font-size: 1.8em;
+        }
+        
+        h3 {
+            color: #764ba2;
+            margin-top: 30px;
+            margin-bottom: 15px;
+            font-size: 1.4em;
+        }
+        
+        h4 {
+            color: #555;
+            margin-top: 20px;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+        
+        .toc {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 30px 0;
+            border-left: 4px solid #667eea;
+        }
+        
+        .toc ul {
+            list-style: none;
+            padding-left: 20px;
+        }
+        
+        .toc li {
+            margin: 10px 0;
+        }
+        
+        .toc a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        
+        .toc a:hover {
+            text-decoration: underline;
+        }
+        
+        .script-card {
+            background: #f8f9fa;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 25px;
+            margin: 30px 0;
+            border-left: 5px solid #667eea;
+        }
+        
+        .script-card.main {
+            border-left-color: #667eea;
+            background: linear-gradient(to right, #f8f9fa, #ffffff);
+        }
+        
+        .script-card.component {
+            border-left-color: #48bb78;
+        }
+        
+        .script-card.plan {
+            border-left-color: #ed8936;
+        }
+        
+        .script-path {
+            font-family: 'Monaco', 'Courier New', monospace;
+            background: #2d3748;
+            color: #68d391;
+            padding: 8px 12px;
+            border-radius: 5px;
+            display: inline-block;
+            margin: 10px 0;
+            font-size: 0.9em;
+        }
+        
+        .badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 600;
+            margin: 5px 5px 5px 0;
+        }
+        
+        .badge.main {
+            background: #667eea;
+            color: white;
+        }
+        
+        .badge.component {
+            background: #48bb78;
+            color: white;
+        }
+        
+        .badge.plan {
+            background: #ed8936;
+            color: white;
+        }
+        
+        .badge.success {
+            background: #48bb78;
+            color: white;
+        }
+        
+        .badge.warning {
+            background: #ed8936;
+            color: white;
+        }
+        
+        .badge.info {
+            background: #4299e1;
+            color: white;
+        }
+        
+        code {
+            background: #2d3748;
+            color: #68d391;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            font-size: 0.9em;
+        }
+        
+        pre {
+            background: #2d3748;
+            color: #e2e8f0;
+            padding: 20px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 15px 0;
+            border-left: 4px solid #667eea;
+        }
+        
+        pre code {
+            background: none;
+            color: inherit;
+            padding: 0;
+        }
+        
+        .migration-coverage {
+            background: #e6fffa;
+            border: 2px solid #38b2ac;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        .migration-coverage h4 {
+            color: #2c7a7b;
+            margin-top: 0;
+        }
+        
+        .migration-coverage ul {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .migration-coverage li {
+            padding: 8px 0;
+            padding-left: 25px;
+            position: relative;
+        }
+        
+        .migration-coverage li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #38b2ac;
+            font-weight: bold;
+        }
+        
+        .not-covered {
+            background: #fff5f5;
+            border: 2px solid #fc8181;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        .not-covered h4 {
+            color: #c53030;
+            margin-top: 0;
+        }
+        
+        .not-covered ul {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .not-covered li {
+            padding: 8px 0;
+            padding-left: 25px;
+            position: relative;
+        }
+        
+        .not-covered li:before {
+            content: "✗";
+            position: absolute;
+            left: 0;
+            color: #fc8181;
+            font-weight: bold;
+        }
+        
+        .usage-example {
+            background: #f7fafc;
+            border: 1px solid #cbd5e0;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        
+        .usage-example h4 {
+            color: #4a5568;
+            margin-top: 0;
+            margin-bottom: 10px;
+        }
+        
+        .dependencies {
+            background: #fffaf0;
+            border: 2px solid #f6ad55;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+        }
+        
+        .dependencies h4 {
+            color: #c05621;
+            margin-top: 0;
+        }
+        
+        .dependencies ul {
+            margin-left: 20px;
+        }
+        
+        .info-box {
+            background: #ebf8ff;
+            border: 2px solid #4299e1;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        
+        .info-box strong {
+            color: #2b6cb0;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+        }
+        
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        
+        th {
+            background: #667eea;
+            color: white;
+            font-weight: 600;
+        }
+        
+        tr:hover {
+            background: #f7fafc;
+        }
+        
+        .footer {
+            margin-top: 60px;
+            padding-top: 30px;
+            border-top: 2px solid #e2e8f0;
+            text-align: center;
+            color: #718096;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚀 Supabase Migration Tool</h1>
+            <p class="subtitle">Complete User Manual - 6 Core Scripts</p>
+        </header>
+
+        <div class="toc">
+            <h3>Table of Contents</h3>
+            <ul>
+                <li><a href="#overview">Overview</a></li>
+                <li><a href="#script-1">1. supabase_migration.sh - Main Orchestration</a></li>
+                <li><a href="#script-2">2. migration_plan.sh - Migration Plan Generator</a></li>
+                <li><a href="#script-3">3. database_migration.sh - Database Migration</a></li>
+                <li><a href="#script-4">4. storage_buckets_migration.sh - Storage Migration</a></li>
+                <li><a href="#script-5">5. edge_functions_migration.sh - Edge Functions</a></li>
+                <li><a href="#script-6">6. secrets_migration.sh - Secrets Migration</a></li>
+                <li><a href="#comparison">Script Comparison Table</a></li>
+                <li><a href="#best-practices">Best Practices</a></li>
+            </ul>
+        </div>
+
+        <section id="overview">
+            <h2>📋 Overview</h2>
+            <p>The Supabase Migration Tool consists of <strong>6 core scripts</strong> that work together to migrate your Supabase projects between environments (dev, test, prod). Each script handles a specific aspect of the migration process.</p>
+            
+            <div class="info-box">
+                <strong>💡 Tip:</strong> For complete migrations, use the main orchestration script (<code>supabase_migration.sh</code>). For targeted migrations, use individual component scripts.
+            </div>
+
+            <h3>Migration Components</h3>
+            <ul>
+                <li><strong>Database:</strong> Schema, data, and authentication users</li>
+                <li><strong>Storage:</strong> Bucket configurations and files</li>
+                <li><strong>Edge Functions:</strong> Function code and deployment</li>
+                <li><strong>Secrets:</strong> Environment variables and secrets</li>
+            </ul>
+        </section>
+
+        <!-- Script 1: Main Orchestration -->
+        <section id="script-1">
+            <div class="script-card main">
+                <h2>1. supabase_migration.sh - Main Orchestration Script</h2>
+                <span class="badge main">MAIN SCRIPT</span>
+                <span class="badge success">ORCHESTRATES ALL</span>
+                
+                <p class="script-path">scripts/supabase_migration.sh</p>
+
+                <h3>Purpose</h3>
+                <p>The main orchestration script that coordinates all migration components. It validates environments, runs comparisons, and executes all 4 component migrations in sequence.</p>
+
+                <h3>What It Migrates</h3>
+                <div class="migration-coverage">
+                    <h4>✅ Complete Migration Coverage</h4>
+                    <ul>
+                        <li><strong>Database Schema:</strong> Tables, views, functions, indexes, constraints, RLS policies, sequences</li>
+                        <li><strong>Database Data:</strong> All table rows (when <code>--data</code> flag is used)</li>
+                        <li><strong>Auth Users:</strong> Authentication users, identities, sessions, refresh tokens (when <code>--users</code> flag is used)</li>
+                        <li><strong>Storage Buckets:</strong> Bucket configurations, policies, and files (when <code>--files</code> flag is used)</li>
+                        <li><strong>Edge Functions:</strong> Function code and deployment</li>
+                        <li><strong>Secrets:</strong> Secret keys (values need manual update)</li>
+                    </ul>
+                </div>
+
+                <h3>Usage</h3>
+                <div class="usage-example">
+                    <h4>Basic Syntax</h4>
+                    <pre><code>./scripts/supabase_migration.sh &lt;source_env&gt; &lt;target_env&gt; [OPTIONS]</code></pre>
+                </div>
+
+                <h4>Flags</h4>
+                <table>
+                    <tr>
+                        <th>Flag</th>
+                        <th>Description</th>
+                        <th>Default</th>
+                    </tr>
+                    <tr>
+                        <td><code>--data</code></td>
+                        <td>Include database data migration</td>
+                        <td>Schema only</td>
+                    </tr>
+                    <tr>
+                        <td><code>--users</code></td>
+                        <td>Include authentication users migration</td>
+                        <td>No users</td>
+                    </tr>
+                    <tr>
+                        <td><code>--files</code></td>
+                        <td>Include storage bucket files migration</td>
+                        <td>Config only</td>
+                    </tr>
+                    <tr>
+                        <td><code>--backup</code></td>
+                        <td>Create backup of target before migration</td>
+                        <td>No backup</td>
+                    </tr>
+                    <tr>
+                        <td><code>--dry-run</code></td>
+                        <td>Preview migration without executing</td>
+                        <td>Execute</td>
+                    </tr>
+                    <tr>
+                        <td><code>--interactive</code></td>
+                        <td>Interactive mode with guided prompts</td>
+                        <td>Non-interactive</td>
+                    </tr>
+                </table>
+
+                <h4>Examples</h4>
+                <pre><code># Schema-only migration (default)
+./scripts/supabase_migration.sh dev test
+
+# Schema + data migration
+./scripts/supabase_migration.sh dev test --data
+
+# Complete migration (schema + data + users + files)
+./scripts/supabase_migration.sh dev test --data --users --files
+
+# With backup
+./scripts/supabase_migration.sh dev test --data --users --files --backup
+
+# Dry run (preview only)
+./scripts/supabase_migration.sh dev test --data --files --dry-run
+
+# Interactive mode
+./scripts/supabase_migration.sh --interactive</code></pre>
+
+                <h3>Dependencies</h3>
+                <div class="dependencies">
+                    <h4>Required</h4>
+                    <ul>
+                        <li>PostgreSQL client (<code>psql</code>, <code>pg_dump</code>, <code>pg_restore</code>)</li>
+                        <li>Supabase CLI (<code>supabase</code>)</li>
+                        <li>Node.js (for storage and edge functions migration)</li>
+                        <li>Docker (for edge functions download/deploy)</li>
+                        <li>Environment file (<code>.env.local</code>) with all required variables</li>
+                    </ul>
+                </div>
+
+                <h3>Output</h3>
+                <ul>
+                    <li>Migration directory in <code>backups/</code> with timestamp</li>
+                    <li>Comprehensive HTML report (<code>result.html</code>)</li>
+                    <li>Markdown report (<code>result.md</code>)</li>
+                    <li>Detailed migration log (<code>migration.log</code>)</li>
+                    <li>Database backups (if <code>--backup</code> used)</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Script 2: Migration Plan -->
+        <section id="script-2">
+            <div class="script-card plan">
+                <h2>2. migration_plan.sh - Migration Plan Generator</h2>
+                <span class="badge plan">PLAN GENERATOR</span>
+                <span class="badge info">READ-ONLY</span>
+                
+                <p class="script-path">scripts/migration_plan.sh</p>
+
+                <h3>Purpose</h3>
+                <p>Generates a comprehensive HTML report comparing source and target environments. This is a <strong>read-only</strong> script that doesn't perform any migrations - it only analyzes and reports differences.</p>
+
+                <h3>What It Analyzes</h3>
+                <div class="migration-coverage">
+                    <h4>✅ Comparison Coverage</h4>
+                    <ul>
+                        <li><strong>Database Schema:</strong> Tables, views, functions, indexes, RLS policies, sequences, triggers, types, enums</li>
+                        <li><strong>Database Data:</strong> Row counts per table</li>
+                        <li><strong>Storage Buckets:</strong> Bucket names, configurations, file counts, file sizes</li>
+                        <li><strong>Edge Functions:</strong> Function names, versions, deployment status</li>
+                        <li><strong>Secrets:</strong> Secret names (values not accessible)</li>
+                        <li><strong>Auth Users:</strong> User count (when accessible)</li>
+                    </ul>
+                </div>
+
+                <h3>Usage</h3>
+                <div class="usage-example">
+                    <h4>Basic Syntax</h4>
+                    <pre><code>./scripts/migration_plan.sh &lt;source_env&gt; &lt;target_env&gt; [output_dir]</code></pre>
+                </div>
+
+                <h4>Arguments</h4>
+                <table>
+                    <tr>
+                        <th>Argument</th>
+                        <th>Description</th>
+                        <th>Required</th>
+                    </tr>
+                    <tr>
+                        <td><code>source_env</code></td>
+                        <td>Source environment (dev, test, prod)</td>
+                        <td>Yes</td>
+                    </tr>
+                    <tr>
+                        <td><code>target_env</code></td>
+                        <td>Target environment (dev, test, prod)</td>
+                        <td>Yes</td>
+                    </tr>
+                    <tr>
+                        <td><code>output_dir</code></td>
+                        <td>Directory to save HTML report (default: ./migration_plans)</td>
+                        <td>No</td>
+                    </tr>
+                </table>
+
+                <h4>Examples</h4>
+                <pre><code># Generate migration plan
+./scripts/migration_plan.sh dev test
+
+# Custom output directory
+./scripts/migration_plan.sh dev test ./reports
+
+# Compare production to test
+./scripts/migration_plan.sh prod test</code></pre>
+
+                <h3>Output</h3>
+                <ul>
+                    <li>HTML report file: <code>migration_plan_&lt;source&gt;_to_&lt;target&gt;_&lt;timestamp&gt;.html</code></li>
+                    <li>Comprehensive comparison tables</li>
+                    <li>Migration action plan (what needs to be migrated)</li>
+                    <li>Detailed object lists (tables, buckets, functions, secrets)</li>
+                </ul>
+
+                <div class="info-box">
+                    <strong>💡 Tip:</strong> Run this script before migration to understand what will be changed.
+                </div>
+            </div>
+        </section>
+
+        <!-- Script 3: Database Migration -->
+        <section id="script-3">
+            <div class="script-card component">
+                <h2>3. database_migration.sh - Database Migration Component</h2>
+                <span class="badge component">COMPONENT</span>
+                <span class="badge success">DATABASE</span>
+                
+                <p class="script-path">scripts/components/database_migration.sh</p>
+
+                <h3>Purpose</h3>
+                <p>Migrates database schema, data, and authentication users from source to target. Can be used independently or as part of the main orchestration script.</p>
+
+                <h3>What It Migrates</h3>
+                <div class="migration-coverage">
+                    <h4>✅ Database Coverage</h4>
+                    <ul>
+                        <li><strong>Schema (Always):</strong> Tables, views, functions, indexes, constraints, RLS policies, sequences, triggers, types, enums</li>
+                        <li><strong>Data (with <code>--data</code>):</strong> All table rows from <code>public</code> schema</li>
+                        <li><strong>Auth Users (with <code>--users</code>):</strong> Authentication users, identities, sessions, refresh tokens</li>
+                    </ul>
+                </div>
+
+                <div class="not-covered">
+                    <h4>✗ Not Covered</h4>
+                    <ul>
+                        <li>Storage buckets</li>
+                        <li>Edge functions</li>
+                        <li>Secrets</li>
+                        <li>Realtime configuration</li>
+                        <li>Cron jobs</li>
+                    </ul>
+                </div>
+
+                <h3>Usage</h3>
+                <div class="usage-example">
+                    <h4>Basic Syntax</h4>
+                    <pre><code>./scripts/components/database_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir] [OPTIONS]</code></pre>
+                </div>
+
+                <h4>Flags</h4>
+                <table>
+                    <tr>
+                        <th>Flag</th>
+                        <th>Description</th>
+                        <th>Default</th>
+                    </tr>
+                    <tr>
+                        <td><code>--data</code></td>
+                        <td>Include data migration (table rows)</td>
+                        <td>Schema only</td>
+                    </tr>
+                    <tr>
+                        <td><code>--users</code></td>
+                        <td>Include authentication users migration</td>
+                        <td>No users</td>
+                    </tr>
+                    <tr>
+                        <td><code>--backup</code></td>
+                        <td>Create backup of target before migration</td>
+                        <td>No backup</td>
+                    </tr>
+                </table>
+
+                <h4>Examples</h4>
+                <pre><code># Schema-only migration (default)
+./scripts/components/database_migration.sh dev test
+
+# Schema + data migration
+./scripts/components/database_migration.sh dev test --data
+
+# Schema + data + users migration
+./scripts/components/database_migration.sh dev test --data --users
+
+# With backup
+./scripts/components/database_migration.sh dev test --data --users --backup
+
+# Custom migration directory
+./scripts/components/database_migration.sh dev test /path/to/backup --data</code></pre>
+
+                <h3>Migration Behavior</h3>
+                <ul>
+                    <li><strong>Schema Migration:</strong> Always performed - dumps and restores database schema</li>
+                    <li><strong>Data Migration:</strong> Only with <code>--data</code> flag - copies all table rows</li>
+                    <li><strong>Auth Users Migration:</strong> Only with <code>--users</code> flag
+                        <ul>
+                            <li>If <code>--data</code> is also used: Full sync (replaces all users in target)</li>
+                            <li>If only <code>--users</code>: Incremental copy (adds missing users only)</li>
+                        </ul>
+                    </li>
+                </ul>
+
+                <h3>Dependencies</h3>
+                <div class="dependencies">
+                    <h4>Required</h4>
+                    <ul>
+                        <li>PostgreSQL client (<code>psql</code>, <code>pg_dump</code>, <code>pg_restore</code>)</li>
+                        <li>Supabase CLI (<code>supabase</code>)</li>
+                        <li>Database passwords in environment file</li>
+                    </ul>
+                </div>
+
+                <h3>Output</h3>
+                <ul>
+                    <li>Database dump files (<code>source_full.dump</code> or <code>source_schema.dump</code>)</li>
+                    <li>Auth users dump (<code>auth_users.dump</code> if <code>--users</code> used)</li>
+                    <li>Target backup (<code>target_backup.dump</code> if <code>--backup</code> used)</li>
+                    <li>HTML report (<code>result.html</code>)</li>
+                    <li>Migration log (<code>migration.log</code>)</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Script 4: Storage Migration -->
+        <section id="script-4">
+            <div class="script-card component">
+                <h2>4. storage_buckets_migration.sh - Storage Migration Component</h2>
+                <span class="badge component">COMPONENT</span>
+                <span class="badge success">STORAGE</span>
+                
+                <p class="script-path">scripts/components/storage_buckets_migration.sh</p>
+
+                <h3>Purpose</h3>
+                <p>Migrates storage bucket configurations and optionally bucket files from source to target. Uses smart delta comparison to only migrate what's needed.</p>
+
+                <h3>What It Migrates</h3>
+                <div class="migration-coverage">
+                    <h4>✅ Storage Coverage</h4>
+                    <ul>
+                        <li><strong>Bucket Configuration (Always):</strong> Bucket names, public/private settings, file size limits, allowed MIME types</li>
+                        <li><strong>Bucket Files (with <code>--file</code>):</strong> All files in all buckets, preserving folder structure</li>
+                        <li><strong>Bucket Policies:</strong> Storage policies and RLS policies for buckets</li>
+                    </ul>
+                </div>
+
+                <div class="not-covered">
+                    <h4>✗ Not Covered</h4>
+                    <ul>
+                        <li>Database schema or data</li>
+                        <li>Edge functions</li>
+                        <li>Secrets</li>
+                        <li>Auth users</li>
+                    </ul>
+                </div>
+
+                <h3>Usage</h3>
+                <div class="usage-example">
+                    <h4>Basic Syntax</h4>
+                    <pre><code>./scripts/components/storage_buckets_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir] [OPTIONS]</code></pre>
+                </div>
+
+                <h4>Flags</h4>
+                <table>
+                    <tr>
+                        <th>Flag</th>
+                        <th>Description</th>
+                        <th>Default</th>
+                    </tr>
+                    <tr>
+                        <td><code>--file</code> or <code>--files</code></td>
+                        <td>Include file migration (migrates buckets + files)</td>
+                        <td>Config only</td>
+                    </tr>
+                    <tr>
+                        <td><code>--include-files</code></td>
+                        <td>Same as <code>--file</code></td>
+                        <td>Config only</td>
+                    </tr>
+                    <tr>
+                        <td><code>--exclude-files</code></td>
+                        <td>Exclude file migration (migrates bucket config only)</td>
+                        <td>Default behavior</td>
+                    </tr>
+                </table>
+
+                <h4>Examples</h4>
+                <pre><code># Bucket configuration only (default)
+./scripts/components/storage_buckets_migration.sh dev test
+
+# Buckets + files migration
+./scripts/components/storage_buckets_migration.sh dev test --file
+
+# Same as above
+./scripts/components/storage_buckets_migration.sh dev test --files
+
+# Custom migration directory
+./scripts/components/storage_buckets_migration.sh dev test /path/to/backup --file</code></pre>
+
+                <h3>Smart Migration Behavior</h3>
+                <ul>
+                    <li><strong>Delta Comparison:</strong> Compares source and target buckets</li>
+                    <li><strong>Bucket Creation:</strong> Only creates buckets that don't exist in target</li>
+                    <li><strong>File Comparison:</strong> Compares file counts and ETags (when <code>--file</code> used)</li>
+                    <li><strong>Skip Identical:</strong> Skips buckets that are identical in source and target</li>
+                    <li><strong>File Backup:</strong> All files are downloaded to backup folder for manual upload if needed</li>
+                </ul>
+
+                <h3>Dependencies</h3>
+                <div class="dependencies">
+                    <h4>Required</h4>
+                    <ul>
+                        <li>Node.js (for storage migration utility)</li>
+                        <li><code>SUPABASE_ACCESS_TOKEN</code> environment variable</li>
+                        <li>Service role keys for source and target environments</li>
+                        <li><code>@supabase/supabase-js</code> npm package</li>
+                    </ul>
+                </div>
+
+                <h3>Output</h3>
+                <ul>
+                    <li>Backup folders for each bucket with all files</li>
+                    <li>HTML report (<code>result.html</code>)</li>
+                    <li>Migration log (<code>migration.log</code>)</li>
+                    <li>README files in backup folders with manual upload instructions</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Script 5: Edge Functions -->
+        <section id="script-5">
+            <div class="script-card component">
+                <h2>5. edge_functions_migration.sh - Edge Functions Migration Component</h2>
+                <span class="badge component">COMPONENT</span>
+                <span class="badge success">EDGE FUNCTIONS</span>
+                
+                <p class="script-path">scripts/components/edge_functions_migration.sh</p>
+
+                <h3>Purpose</h3>
+                <p>Migrates edge functions from source to target. Downloads functions from source and deploys them to target. Uses smart delta comparison.</p>
+
+                <h3>What It Migrates</h3>
+                <div class="migration-coverage">
+                    <h4>✅ Edge Functions Coverage</h4>
+                    <ul>
+                        <li><strong>Function Code:</strong> Downloads function code from source</li>
+                        <li><strong>Function Deployment:</strong> Deploys functions to target</li>
+                        <li><strong>Function Configuration:</strong> Function settings and environment variables</li>
+                    </ul>
+                </div>
+
+                <div class="not-covered">
+                    <h4>✗ Not Covered</h4>
+                    <ul>
+                        <li>Database schema or data</li>
+                        <li>Storage buckets or files</li>
+                        <li>Secrets (values need manual update)</li>
+                        <li>Auth users</li>
+                    </ul>
+                </div>
+
+                <h3>Usage</h3>
+                <div class="usage-example">
+                    <h4>Basic Syntax</h4>
+                    <pre><code>./scripts/components/edge_functions_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir]</code></pre>
+                </div>
+
+                <h4>Arguments</h4>
+                <table>
+                    <tr>
+                        <th>Argument</th>
+                        <th>Description</th>
+                        <th>Required</th>
+                    </tr>
+                    <tr>
+                        <td><code>source_env</code></td>
+                        <td>Source environment (dev, test, prod)</td>
+                        <td>Yes</td>
+                    </tr>
+                    <tr>
+                        <td><code>target_env</code></td>
+                        <td>Target environment (dev, test, prod)</td>
+                        <td>Yes</td>
+                    </tr>
+                    <tr>
+                        <td><code>migration_dir</code></td>
+                        <td>Directory to store migration files (optional)</td>
+                        <td>No</td>
+                    </tr>
+                </table>
+
+                <h4>Examples</h4>
+                <pre><code># Migrate edge functions
+./scripts/components/edge_functions_migration.sh dev test
+
+# Custom migration directory
+./scripts/components/edge_functions_migration.sh dev test /path/to/backup</code></pre>
+
+                <h3>Smart Migration Behavior</h3>
+                <ul>
+                    <li><strong>Delta Comparison:</strong> Compares source and target functions</li>
+                    <li><strong>Skip Identical:</strong> Only deploys new or updated functions</li>
+                    <li><strong>Function Download:</strong> Downloads function code from source</li>
+                    <li><strong>Function Deployment:</strong> Deploys to target using Supabase CLI</li>
+                    <li><strong>Backup:</strong> Function code is saved to backup folder</li>
+                </ul>
+
+                <h3>Dependencies</h3>
+                <div class="dependencies">
+                    <h4>Required</h4>
+                    <ul>
+                        <li>Node.js (for edge functions migration utility)</li>
+                        <li>Supabase CLI (<code>supabase</code>)</li>
+                        <li>Docker (required for function download/deploy)</li>
+                        <li><code>SUPABASE_ACCESS_TOKEN</code> environment variable</li>
+                        <li>Database passwords for linking projects</li>
+                    </ul>
+                </div>
+
+                <div class="info-box">
+                    <strong>⚠️ Important:</strong> Docker Desktop must be running for edge functions migration to work.
+                </div>
+
+                <h3>Output</h3>
+                <ul>
+                    <li>Function code backups in <code>edge_functions/</code> directory</li>
+                    <li>HTML report (<code>result.html</code>)</li>
+                    <li>Migration log (<code>migration.log</code>)</li>
+                    <li>README file with deployment instructions</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Script 6: Secrets Migration -->
+        <section id="script-6">
+            <div class="script-card component">
+                <h2>6. secrets_migration.sh - Secrets Migration Component</h2>
+                <span class="badge component">COMPONENT</span>
+                <span class="badge success">SECRETS</span>
+                
+                <p class="script-path">scripts/components/secrets_migration.sh</p>
+
+                <h3>Purpose</h3>
+                <p>Migrates secrets (environment variables) from source to target. Creates secret keys in target with blank values (values must be updated manually for security reasons).</p>
+
+                <h3>What It Migrates</h3>
+                <div class="migration-coverage">
+                    <h4>✅ Secrets Coverage</h4>
+                    <ul>
+                        <li><strong>Secret Keys:</strong> All secret names from source</li>
+                        <li><strong>Secret Structure:</strong> Creates secrets in target with blank/placeholder values</li>
+                        <li><strong>Delta Migration:</strong> Only creates secrets that don't exist in target</li>
+                        <li><strong>Cleanup:</strong> Removes secrets from target that don't exist in source</li>
+                    </ul>
+                </div>
+
+                <div class="not-covered">
+                    <h4>✗ Not Covered</h4>
+                    <ul>
+                        <li><strong>Secret Values:</strong> Values cannot be migrated (security restriction)</li>
+                        <li>Database schema or data</li>
+                        <li>Storage buckets or files</li>
+                        <li>Edge functions</li>
+                        <li>Auth users</li>
+                    </ul>
+                </div>
+
+                <h3>Usage</h3>
+                <div class="usage-example">
+                    <h4>Basic Syntax</h4>
+                    <pre><code>./scripts/components/secrets_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir] [OPTIONS]</code></pre>
+                </div>
+
+                <h4>Flags</h4>
+                <table>
+                    <tr>
+                        <th>Flag</th>
+                        <th>Description</th>
+                        <th>Default</th>
+                    </tr>
+                    <tr>
+                        <td><code>--values</code></td>
+                        <td>Attempt to migrate values (typically not accessible due to security)</td>
+                        <td>Keys only (blank values)</td>
+                    </tr>
+                </table>
+
+                <h4>Examples</h4>
+                <pre><code># Migrate secret keys (default - blank values)
+./scripts/components/secrets_migration.sh dev test
+
+# Attempt to migrate values (may not work due to security)
+./scripts/components/secrets_migration.sh dev test --values
+
+# Custom migration directory
+./scripts/components/secrets_migration.sh dev test /path/to/backup</code></pre>
+
+                <h3>Important Notes</h3>
+                <div class="info-box">
+                    <strong>🔒 Security:</strong> Secret values cannot be retrieved via API/CLI for security reasons. After migration, you must manually update all secret values in the target environment.
+                </div>
+
+                <div class="info-box">
+                    <strong>📝 Manual Update Required:</strong> After migration, use the Supabase Dashboard or CLI to set secret values:
+                    <pre><code>supabase secrets set KEY_NAME=actual_value --project-ref &lt;target_ref&gt;</code></pre>
+                </div>
+
+                <h3>Migration Behavior</h3>
+                <ul>
+                    <li><strong>Delta Comparison:</strong> Compares source and target secrets</li>
+                    <li><strong>Create Missing:</strong> Creates secrets in target that exist in source</li>
+                    <li><strong>Remove Extra:</strong> Removes secrets from target that don't exist in source</li>
+                    <li><strong>Blank Values:</strong> All secrets are created with blank/placeholder values</li>
+                </ul>
+
+                <h3>Dependencies</h3>
+                <div class="dependencies">
+                    <h4>Required</h4>
+                    <ul>
+                        <li>Supabase CLI (<code>supabase</code>)</li>
+                        <li><code>SUPABASE_ACCESS_TOKEN</code> environment variable</li>
+                    </ul>
+                </div>
+
+                <h3>Output</h3>
+                <ul>
+                    <li>Source secrets list (<code>source_secrets.json</code>)</li>
+                    <li>Target secrets list (<code>target_secrets.json</code>)</li>
+                    <li>Secrets template file (<code>secrets_template.txt</code>) with list of secrets to update</li>
+                    <li>HTML report (<code>result.html</code>)</li>
+                    <li>Migration log (<code>migration.log</code>)</li>
+                </ul>
+            </div>
+        </section>
+
+        <!-- Comparison Table -->
+        <section id="comparison">
+            <h2>📊 Script Comparison Table</h2>
+            <table>
+                <tr>
+                    <th>Script</th>
+                    <th>Type</th>
+                    <th>Database</th>
+                    <th>Storage</th>
+                    <th>Edge Functions</th>
+                    <th>Secrets</th>
+                    <th>Auth Users</th>
+                </tr>
+                <tr>
+                    <td><code>supabase_migration.sh</code></td>
+                    <td>Main</td>
+                    <td>✅</td>
+                    <td>✅</td>
+                    <td>✅</td>
+                    <td>✅</td>
+                    <td>✅*</td>
+                </tr>
+                <tr>
+                    <td><code>migration_plan.sh</code></td>
+                    <td>Plan</td>
+                    <td>📊</td>
+                    <td>📊</td>
+                    <td>📊</td>
+                    <td>📊</td>
+                    <td>📊</td>
+                </tr>
+                <tr>
+                    <td><code>database_migration.sh</code></td>
+                    <td>Component</td>
+                    <td>✅</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                    <td>✅*</td>
+                </tr>
+                <tr>
+                    <td><code>storage_buckets_migration.sh</code></td>
+                    <td>Component</td>
+                    <td>❌</td>
+                    <td>✅</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                </tr>
+                <tr>
+                    <td><code>edge_functions_migration.sh</code></td>
+                    <td>Component</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                    <td>✅</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                </tr>
+                <tr>
+                    <td><code>secrets_migration.sh</code></td>
+                    <td>Component</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                    <td>❌</td>
+                    <td>✅</td>
+                    <td>❌</td>
+                </tr>
+            </table>
+            <p><small>Legend: ✅ = Migrates, 📊 = Analyzes/Compares, ❌ = Not covered, * = With <code>--users</code> flag</small></p>
+        </section>
+
+        <!-- Best Practices -->
+        <section id="best-practices">
+            <h2>💡 Best Practices</h2>
+            
+            <h3>Before Migration</h3>
+            <ol>
+                <li><strong>Generate Migration Plan:</strong> Always run <code>migration_plan.sh</code> first to understand what will be migrated</li>
+                <li><strong>Backup Target:</strong> Use <code>--backup</code> flag when migrating to production</li>
+                <li><strong>Test First:</strong> Test migrations on dev/test environments before production</li>
+                <li><strong>Verify Environment:</strong> Ensure all required environment variables are set</li>
+            </ol>
+
+            <h3>During Migration</h3>
+            <ol>
+                <li><strong>Use Dry Run:</strong> Use <code>--dry-run</code> to preview changes before executing</li>
+                <li><strong>Monitor Logs:</strong> Watch the migration log for errors or warnings</li>
+                <li><strong>Don't Interrupt:</strong> Let migrations complete - don't interrupt running processes</li>
+            </ol>
+
+            <h3>After Migration</h3>
+            <ol>
+                <li><strong>Review Reports:</strong> Check HTML reports for migration summary</li>
+                <li><strong>Update Secrets:</strong> Manually update all secret values in target</li>
+                <li><strong>Test Application:</strong> Verify all functionality works correctly</li>
+                <li><strong>Verify Data:</strong> Spot-check data to ensure migration was successful</li>
+            </ol>
+
+            <h3>Recommended Migration Flow</h3>
+            <pre><code># 1. Generate migration plan
+./scripts/migration_plan.sh dev test
+
+# 2. Review the HTML report
+
+# 3. Run complete migration with backup
+./scripts/supabase_migration.sh dev test --data --users --files --backup
+
+# 4. Review migration results
+# Check: backups/&lt;timestamp&gt;/result.html
+
+# 5. Update secrets manually
+# Use Supabase Dashboard or CLI
+
+# 6. Test application functionality</code></pre>
+
+            <h3>Common Scenarios</h3>
+            <h4>Scenario 1: Schema-Only Migration</h4>
+            <pre><code>./scripts/supabase_migration.sh dev test</code></pre>
+            <p>Use this when you only want to sync database structure without data.</p>
+
+            <h4>Scenario 2: Complete Migration (Development)</h4>
+            <pre><code>./scripts/supabase_migration.sh dev test --data --users --files</code></pre>
+            <p>Use this for complete migration between dev and test environments.</p>
+
+            <h4>Scenario 3: Production Migration</h4>
+            <pre><code>./scripts/supabase_migration.sh prod test --data --users --files --backup</code></pre>
+            <p>Always use <code>--backup</code> when migrating from production.</p>
+
+            <h4>Scenario 4: Targeted Migration (Storage Only)</h4>
+            <pre><code>./scripts/components/storage_buckets_migration.sh dev test --file</code></pre>
+            <p>Use component scripts for targeted migrations.</p>
+        </section>
+
+        <div class="footer">
+            <p><strong>Supabase Migration Tool</strong> - Version 2.0</p>
+            <p>For issues or questions, check the migration logs and HTML reports.</p>
+            <p><small>Last updated: 2025</small></p>
+        </div>
+    </div>
+</body>
+</html>
+

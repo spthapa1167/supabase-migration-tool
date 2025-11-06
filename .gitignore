@@ -1,0 +1,28 @@
+# Environment files
+.env.local
+.env*.local
+
+# Backup directories
+backups/
+*.dump
+*.sql.backup
+
+# Supabase
+supabase/.temp/
+supabase/.branches/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+diff_results/
