@@ -167,26 +167,41 @@ log_info "  Files: $INCLUDE_FILES_FLAG"
 log_info ""
 
 # Run Node.js utility and capture output
+# Use PIPESTATUS to properly capture exit code when using pipes
+set +o pipefail  # Temporarily disable pipefail to check exit code manually
 if node "$STORAGE_UTIL" \
     "$SOURCE_REF" \
     "$TARGET_REF" \
     "$MIGRATION_DIR" \
     "$INCLUDE_FILES_FLAG" \
     2>&1 | tee -a "$LOG_FILE"; then
-    MIGRATION_SUCCESS=true
-    if [ "$INCLUDE_FILES" = "true" ]; then
-        COMPONENT_NAME="Storage Migration (Buckets + Files)"
-        log_success "✅ Storage buckets migrated successfully (buckets + files)"
+    NODE_EXIT_CODE=${PIPESTATUS[0]}
+    if [ "$NODE_EXIT_CODE" -eq 0 ]; then
+        MIGRATION_SUCCESS=true
+        if [ "$INCLUDE_FILES" = "true" ]; then
+            COMPONENT_NAME="Storage Migration (Buckets + Files)"
+            log_success "✅ Storage buckets migrated successfully (buckets + files)"
+        else
+            COMPONENT_NAME="Storage Migration (Buckets Only)"
+            log_success "✅ Storage buckets migrated successfully (bucket config only)"
+        fi
+        log_to_file "$LOG_FILE" "Storage buckets migrated successfully"
     else
-        COMPONENT_NAME="Storage Migration (Buckets Only)"
-        log_success "✅ Storage buckets migrated successfully (bucket config only)"
+        MIGRATION_SUCCESS=false
+        COMPONENT_NAME="Storage Migration"
+        log_error "❌ Storage buckets migration failed - Node.js utility exited with code $NODE_EXIT_CODE"
+        log_error "Check the logs above for details"
+        log_to_file "$LOG_FILE" "Storage buckets migration failed (exit code: $NODE_EXIT_CODE)"
     fi
-    log_to_file "$LOG_FILE" "Storage buckets migrated successfully"
 else
+    NODE_EXIT_CODE=${PIPESTATUS[0]}
+    MIGRATION_SUCCESS=false
     COMPONENT_NAME="Storage Migration"
-    log_error "❌ Storage buckets migration failed - check logs for details"
-    log_to_file "$LOG_FILE" "Storage buckets migration failed"
+    log_error "❌ Storage buckets migration failed - Node.js utility exited with code $NODE_EXIT_CODE"
+    log_error "Check the logs above for details"
+    log_to_file "$LOG_FILE" "Storage buckets migration failed (exit code: $NODE_EXIT_CODE)"
 fi
+set -o pipefail  # Re-enable pipefail
 
 # Generate HTML report
 if [ "$MIGRATION_SUCCESS" = "true" ]; then

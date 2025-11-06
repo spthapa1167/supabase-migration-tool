@@ -243,20 +243,51 @@ for secret_name in $source_secret_names; do
     # Try to set secret with blank value first
     log_info "    Setting secret..."
     
+    # Use PIPESTATUS to properly capture exit code when using pipes
+    set +o pipefail  # Temporarily disable pipefail to check exit code manually
     if supabase secrets set "${secret_name}=" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "    ✓ Migrated: $secret_name (blank value - UPDATE REQUIRED)"
-        migrated_count=$((migrated_count + 1))
+        SECRET_EXIT_CODE=${PIPESTATUS[0]}
+        if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
+            log_success "    ✓ Migrated: $secret_name (blank value - UPDATE REQUIRED)"
+            migrated_count=$((migrated_count + 1))
+        else
+            # Try with placeholder if blank doesn't work
+            log_info "    Blank value failed, trying placeholder..."
+            if supabase secrets set "${secret_name}=PLACEHOLDER_UPDATE_REQUIRED" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
+                SECRET_EXIT_CODE=${PIPESTATUS[0]}
+                if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
+                    log_success "    ✓ Migrated: $secret_name (placeholder - UPDATE REQUIRED)"
+                    migrated_count=$((migrated_count + 1))
+                else
+                    log_error "    ✗ Failed: $secret_name (exit code: $SECRET_EXIT_CODE)"
+                    failed_count=$((failed_count + 1))
+                fi
+            else
+                SECRET_EXIT_CODE=${PIPESTATUS[0]}
+                log_error "    ✗ Failed: $secret_name (exit code: $SECRET_EXIT_CODE)"
+                failed_count=$((failed_count + 1))
+            fi
+        fi
     else
+        SECRET_EXIT_CODE=${PIPESTATUS[0]}
         # Try with placeholder if blank doesn't work
         log_info "    Blank value failed, trying placeholder..."
         if supabase secrets set "${secret_name}=PLACEHOLDER_UPDATE_REQUIRED" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
-            log_success "    ✓ Migrated: $secret_name (placeholder - UPDATE REQUIRED)"
-            migrated_count=$((migrated_count + 1))
+            SECRET_EXIT_CODE=${PIPESTATUS[0]}
+            if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
+                log_success "    ✓ Migrated: $secret_name (placeholder - UPDATE REQUIRED)"
+                migrated_count=$((migrated_count + 1))
+            else
+                log_error "    ✗ Failed: $secret_name (exit code: $SECRET_EXIT_CODE)"
+                failed_count=$((failed_count + 1))
+            fi
         else
-            log_error "    ✗ Failed: $secret_name"
+            SECRET_EXIT_CODE=${PIPESTATUS[0]}
+            log_error "    ✗ Failed: $secret_name (exit code: $SECRET_EXIT_CODE)"
             failed_count=$((failed_count + 1))
         fi
     fi
+    set -o pipefail  # Re-enable pipefail
     
     echo ""
 done
@@ -290,13 +321,23 @@ for target_secret_name in $target_secret_names; do
         log_info "    Removing from target (not in source)..."
         
         # Use supabase secrets unset to remove the secret
+        # Use PIPESTATUS to properly capture exit code when using pipes
+        set +o pipefail  # Temporarily disable pipefail to check exit code manually
         if supabase secrets unset "$target_secret_name" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
-            log_success "    ✓ Removed: $target_secret_name"
-            removed_count=$((removed_count + 1))
+            SECRET_EXIT_CODE=${PIPESTATUS[0]}
+            if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
+                log_success "    ✓ Removed: $target_secret_name"
+                removed_count=$((removed_count + 1))
+            else
+                log_error "    ✗ Failed to remove: $target_secret_name (exit code: $SECRET_EXIT_CODE)"
+                removed_failed_count=$((removed_failed_count + 1))
+            fi
         else
-            log_error "    ✗ Failed to remove: $target_secret_name"
+            SECRET_EXIT_CODE=${PIPESTATUS[0]}
+            log_error "    ✗ Failed to remove: $target_secret_name (exit code: $SECRET_EXIT_CODE)"
             removed_failed_count=$((removed_failed_count + 1))
         fi
+        set -o pipefail  # Re-enable pipefail
         
         echo ""
     fi

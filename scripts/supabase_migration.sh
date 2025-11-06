@@ -1830,12 +1830,13 @@ perform_migration() {
         log_success "Migration completed: $actual_migration_dir"
         log_success "Result files: $actual_migration_dir/result.md and $actual_migration_dir/result.html"
         
-        # Cleanup old backups (keep only the most recent)
-        if [ -f "$PROJECT_ROOT/scripts/utils/cleanup_backups.sh" ]; then
-            log_info "Cleaning up old backup folders (keeping only the most recent)..."
-            source "$PROJECT_ROOT/scripts/utils/cleanup_backups.sh"
-            cleanup_backups 1
-            cleanup_diff_results
+        # Cleanup old migration records (keep only the last 3)
+        log_info "Cleaning up old migration records (keeping last 3)..."
+        # The function is already sourced from lib/supabase_utils.sh at the top of the script
+        if type cleanup_old_migration_records >/dev/null 2>&1; then
+            cleanup_old_migration_records 3
+        else
+            log_warning "cleanup_old_migration_records function not available, skipping cleanup"
         fi
     else
         # Generate result files for failure case
@@ -1945,16 +1946,8 @@ main() {
     source "$ENV_FILE"
     export SUPABASE_ACCESS_TOKEN
     
-    # Cleanup old backup/migration folders BEFORE creating new one
-    log_info "Cleaning up old backup and migration folders..."
-    if [ -f "$PROJECT_ROOT/scripts/utils/cleanup_backups.sh" ]; then
-        source "$PROJECT_ROOT/scripts/utils/cleanup_backups.sh"
-        cleanup_backups 0  # Keep 0 old folders - delete all before migration
-        cleanup_diff_results
-        log_success "Old backup folders cleaned up"
-    else
-        log_warning "cleanup_backups.sh not found, skipping cleanup"
-    fi
+    # Note: We don't cleanup before migration anymore
+    # Cleanup happens AFTER migration completes to keep last 3 records
     
     # Create backup directory
     mkdir -p "$BACKUP_DIR"

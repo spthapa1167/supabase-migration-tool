@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Supabase Migration Tool</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        primary: {
+                            50: '#e8f4fd',
+                            100: '#d1e9fb',
+                            200: '#a3d3f7',
+                            300: '#75bdf3',
+                            400: '#47a7ef',
+                            500: '#3498db',
+                            600: '#2a7aaf',
+                            700: '#1f5c83',
+                            800: '#153d57',
+                            900: '#1a2c4e',
+                        },
+                        accent: {
+                            50: '#f1f8e9',
+                            100: '#dcedc8',
+                            200: '#c5e1a5',
+                            300: '#aed581',
+                            400: '#9ccc65',
+                            500: '#8bc34a',
+                            600: '#7cb342',
+                            700: '#689f38',
+                            800: '#558b2f',
+                            900: '#33691e',
+                        },
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'Roboto', 'sans-serif'],
+                    },
+                },
+            },
+        }
+    </script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body class="bg-gradient-to-br from-primary-50 via-primary-100 to-accent-50 min-h-screen font-sans flex items-center justify-center p-4">
+    <div class="w-full max-w-2xl">
+        <!-- Logo and Header -->
+        <div class="text-center mb-8">
+            <div class="flex items-center justify-center mb-6">
+                <div class="relative w-24 h-24 flex items-center justify-center">
+                    <!-- XYNTRA Logo SVG -->
+                    <svg viewBox="0 0 120 120" class="w-24 h-24" xmlns="http://www.w3.org/2000/svg">
+                        <defs>
+                            <linearGradient id="loginXGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                <stop offset="0%" style="stop-color:#3498db;stop-opacity:1" />
+                                <stop offset="100%" style="stop-color:#1a2c4e;stop-opacity:1" />
+                            </linearGradient>
+                            <linearGradient id="loginAGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                                <stop offset="0%" style="stop-color:#d3d3d3;stop-opacity:1" />
+                                <stop offset="60%" style="stop-color:#d3d3d3;stop-opacity:1" />
+                                <stop offset="60%" style="stop-color:#8bc34a;stop-opacity:1" />
+                                <stop offset="100%" style="stop-color:#8bc34a;stop-opacity:1" />
+                            </linearGradient>
+                        </defs>
+                        <path d="M 20 20 L 50 50 L 20 80 L 50 80 L 80 50 L 50 20 Z" fill="url(#loginXGradient)"/>
+                        <circle cx="50" cy="50" r="8" fill="white" opacity="0.9"/>
+                        <circle cx="30" cy="30" r="4" fill="white" opacity="0.9"/>
+                        <circle cx="70" cy="30" r="4" fill="white" opacity="0.9"/>
+                        <circle cx="30" cy="70" r="4" fill="white" opacity="0.9"/>
+                        <circle cx="70" cy="70" r="4" fill="white" opacity="0.9"/>
+                        <line x1="50" y1="50" x2="30" y2="30" stroke="white" stroke-width="2" opacity="0.7"/>
+                        <line x1="50" y1="50" x2="70" y2="30" stroke="white" stroke-width="2" opacity="0.7"/>
+                        <line x1="50" y1="50" x2="30" y2="70" stroke="white" stroke-width="2" opacity="0.7"/>
+                        <line x1="50" y1="50" x2="70" y2="70" stroke="white" stroke-width="2" opacity="0.7"/>
+                        <path d="M 50 20 L 70 20 L 90 80 L 70 80 L 65 65 L 55 65 L 50 80 L 30 80 Z" fill="url(#loginAGradient)"/>
+                        <path d="M 55 45 L 65 45 L 60 30 Z" fill="#1a2c4e" opacity="0.3"/>
+                        <circle cx="70" cy="50" r="5" fill="#3498db" opacity="0.8"/>
+                        <circle cx="75" cy="70" r="6" fill="#1a2c4e" opacity="0.8"/>
+                    </svg>
+                </div>
+            </div>
+            <h1 class="text-4xl font-bold text-primary-900 mb-2">XYNTRA AI SOLUTIONS</h1>
+            <h2 class="text-2xl font-semibold text-primary-700 mb-4">Supabase Migration Tool</h2>
+        </div>
+
+        <!-- Login Card -->
+        <div class="bg-white/90 backdrop-blur-sm rounded-2xl shadow-2xl border border-primary-200/60 p-8 md:p-12">
+            <!-- About Section -->
+            <div class="mb-8">
+                <h3 class="text-xl font-bold text-primary-900 mb-4">About the Tool</h3>
+                <div class="space-y-3 text-neutral-700">
+                    <p class="flex items-start space-x-2">
+                        <svg class="w-5 h-5 text-primary-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span>Complete Supabase migration management system for database, storage, edge functions, and secrets</span>
+                    </p>
+                    <p class="flex items-start space-x-2">
+                        <svg class="w-5 h-5 text-primary-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span>Web-based interface with real-time log streaming and comprehensive reporting</span>
+                    </p>
+                    <p class="flex items-start space-x-2">
+                        <svg class="w-5 h-5 text-primary-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span>Generate migration plans, run complete or component-specific migrations</span>
+                    </p>
+                    <p class="flex items-start space-x-2">
+                        <svg class="w-5 h-5 text-primary-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                        </svg>
+                        <span>View migration history, reports, and logs all in one place</span>
+                    </p>
+                </div>
+            </div>
+
+            <div class="border-t border-neutral-200 pt-8">
+                <h3 class="text-xl font-bold text-primary-900 mb-6">Access Required</h3>
+                <form id="loginForm" class="space-y-6">
+                    <div>
+                        <label for="accessKey" class="block text-sm font-semibold text-primary-800 mb-2">
+                            Access Key
+                        </label>
+                        <input 
+                            type="password" 
+                            id="accessKey" 
+                            required
+                            autocomplete="off"
+                            placeholder="Enter your access key"
+                            class="w-full px-4 py-3 bg-white border-2 border-neutral-300 rounded-xl text-primary-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200 font-mono text-sm"
+                        />
+                        <p class="mt-2 text-xs text-neutral-600">
+                            Enter the access key configured in <code class="bg-neutral-100 px-1.5 py-0.5 rounded">TOOL_UI_ACCESS_KEY</code>
+                        </p>
+                    </div>
+
+                    <div id="loginError" class="hidden p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800">
+                        <div class="flex items-center space-x-2">
+                            <svg class="w-5 h-5 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                            </svg>
+                            <span id="errorMessage"></span>
+                        </div>
+                    </div>
+
+                    <button 
+                        type="submit" 
+                        id="loginButton"
+                        class="w-full px-8 py-3.5 bg-gradient-to-r from-primary-500 to-primary-700 text-white font-semibold rounded-xl shadow-lg shadow-primary-500/25 hover:shadow-xl hover:shadow-primary-500/30 hover:from-primary-600 hover:to-primary-800 transform hover:-translate-y-0.5 transition-all duration-200 flex items-center justify-center space-x-2"
+                    >
+                        <span>Login to Migration Tool</span>
+                        <span id="loginLoading" class="hidden">
+                            <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                            </svg>
+                        </span>
+                    </button>
+                </form>
+            </div>
+        </div>
+
+        <!-- Footer -->
+        <div class="text-center mt-6 text-sm text-neutral-600">
+            <p>Developed by <span class="font-semibold text-primary-900">Xyntra AI Solutions Inc.</span></p>
+            <p>All Rights Reserved © 2025</p>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '';
+        let authToken = null;
+
+        // Check if already authenticated
+        const storedToken = localStorage.getItem('migrationToolToken');
+        if (storedToken) {
+            // Verify token is still valid by trying to access the app
+            window.location.href = '/app?token=' + encodeURIComponent(storedToken);
+        }
+
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const accessKey = document.getElementById('accessKey').value;
+            const loginButton = document.getElementById('loginButton');
+            const loginLoading = document.getElementById('loginLoading');
+            const loginError = document.getElementById('loginError');
+            const errorMessage = document.getElementById('errorMessage');
+            
+            // Show loading
+            loginButton.disabled = true;
+            loginLoading.classList.remove('hidden');
+            loginError.classList.add('hidden');
+            
+            try {
+                const response = await fetch(`${API_BASE}/api/auth/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ accessKey })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok && data.success) {
+                    // Store token
+                    authToken = data.token;
+                    localStorage.setItem('migrationToolToken', authToken);
+                    
+                    // Redirect to app
+                    window.location.href = '/app?token=' + encodeURIComponent(authToken);
+                } else {
+                    // Show error
+                    errorMessage.textContent = data.error || 'Invalid access key';
+                    loginError.classList.remove('hidden');
+                    loginButton.disabled = false;
+                    loginLoading.classList.add('hidden');
+                }
+            } catch (error) {
+                errorMessage.textContent = `Error: ${error.message}`;
+                loginError.classList.remove('hidden');
+                loginButton.disabled = false;
+                loginLoading.classList.add('hidden');
+            }
+        });
+    </script>
+</body>
+</html>
+

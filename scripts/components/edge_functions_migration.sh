@@ -124,21 +124,33 @@ log_info ""
 # Pass: source_ref, target_ref, migration_dir
 # Environment variables are loaded from .env.local by the Node.js script
 MIGRATION_SUCCESS=false
+# Use PIPESTATUS to properly capture exit code when using pipes
+set +o pipefail  # Temporarily disable pipefail to check exit code manually
 if node "$EDGE_FUNCTIONS_UTIL" \
     "$SOURCE_REF" \
     "$TARGET_REF" \
     "$MIGRATION_DIR" \
     2>&1 | tee -a "${LOG_FILE:-$MIGRATION_DIR/migration.log}"; then
-    MIGRATION_SUCCESS=true
-    COMPONENT_NAME="Edge Functions Migration"
-    log_success "Edge functions migration completed successfully using Node.js utility"
-    log_to_file "$LOG_FILE" "Edge functions migrated successfully"
+    NODE_EXIT_CODE=${PIPESTATUS[0]}
+    if [ "$NODE_EXIT_CODE" -eq 0 ]; then
+        MIGRATION_SUCCESS=true
+        COMPONENT_NAME="Edge Functions Migration"
+        log_success "Edge functions migration completed successfully using Node.js utility"
+        log_to_file "$LOG_FILE" "Edge functions migrated successfully"
+    else
+        COMPONENT_NAME="Edge Functions Migration"
+        log_error "Node.js utility failed with exit code $NODE_EXIT_CODE"
+        log_error "Check the logs above for details"
+        log_to_file "$LOG_FILE" "Edge functions migration had errors (exit code: $NODE_EXIT_CODE)"
+    fi
 else
+    NODE_EXIT_CODE=${PIPESTATUS[0]}
     COMPONENT_NAME="Edge Functions Migration"
-    log_error "Node.js utility failed with errors"
+    log_error "Node.js utility failed with exit code $NODE_EXIT_CODE"
     log_error "Check the logs above for details"
-    log_to_file "$LOG_FILE" "Edge functions migration had errors"
+    log_to_file "$LOG_FILE" "Edge functions migration had errors (exit code: $NODE_EXIT_CODE)"
 fi
+set -o pipefail  # Re-enable pipefail
 
 # Generate HTML report
 if [ "$MIGRATION_SUCCESS" = "true" ]; then
