@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+<meta charset='UTF-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1.0'>
+<title>Migration Plan: dev → test</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: #f1f5f9;
+    color: #0f172a;
+    line-height: 1.6;
+    padding: 32px;
+}
+.page-wrapper {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+.hero {
+    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+    color: white;
+    padding: 48px;
+    border-radius: 24px;
+    box-shadow: 0 24px 60px rgba(15, 23, 42, 0.18);
+    margin-bottom: 36px;
+}
+.hero h1 {
+    font-size: 2.6rem;
+    margin-bottom: 12px;
+    letter-spacing: -0.5px;
+}
+.hero p {
+    font-size: 1.1rem;
+    opacity: 0.92;
+}
+.hero-meta {
+    margin-top: 18px;
+    font-size: 0.95rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+.env-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+}
+.env-chip span {
+    opacity: 0.85;
+    font-weight: 500;
+}
+.section-block {
+    background: white;
+    border-radius: 24px;
+    border: 1px solid rgba(99, 102, 241, 0.16);
+    box-shadow: 0 24px 48px rgba(15, 23, 42, 0.12);
+    padding: 32px 36px;
+    margin-bottom: 32px;
+}
+.section-block h2 {
+    font-size: 1.7rem;
+    margin-bottom: 20px;
+    color: #312e81;
+}
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+}
+.summary-card {
+    border-radius: 16px;
+    border: 1px solid rgba(99, 102, 241, 0.18);
+    padding: 20px;
+    background: linear-gradient(135deg, rgba(79,70,229,0.08) 0%, rgba(124,58,237,0.05) 100%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
+}
+.summary-card h3 {
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #4338ca;
+    margin-bottom: 8px;
+}
+.summary-card p {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #1e1b4b;
+}
+.timeline {
+    display: grid;
+    gap: 12px;
+}
+.timeline-item {
+    position: relative;
+    padding-left: 20px;
+    color: #1f2937;
+}
+.timeline-item::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 4px;
+    width: 8px;
+    height: 8px;
+    background: #4f46e5;
+    border-radius: 999px;
+}
+.timeline-item::after {
+    content: '';
+    position: absolute;
+    left: 9px;
+    top: 16px;
+    bottom: -12px;
+    width: 2px;
+    background: rgba(79, 70, 229, 0.25);
+}
+.timeline-item:last-child::after {
+    display: none;
+}
+.data-card {
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: 18px;
+    padding: 24px;
+    margin-bottom: 20px;
+    background: linear-gradient(180deg, rgba(248, 250, 252, 0.95) 0%, rgba(241, 245, 249, 0.9) 100%);
+}
+.data-card h3 {
+    font-size: 1.15rem;
+    margin-bottom: 12px;
+    color: #312e81;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.status-new,
+.status-review,
+.status-update {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.status-new { background: rgba(16, 185, 129, 0.18); color: #047857; }
+.status-review { background: rgba(248, 113, 113, 0.18); color: #b91c1c; }
+.status-update { background: rgba(255, 186, 8, 0.2); color: #a16207; }
+.item-list { margin-left: 18px; margin-top: 8px; }
+.item-list li { margin-bottom: 6px; }
+.diff-box {
+    margin-top: 12px;
+    background: #0f172a;
+    color: #e2e8f0;
+    border-radius: 12px;
+    padding: 16px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    overflow-x: auto;
+}
+.footer-note {
+    margin-top: 32px;
+    text-align: right;
+    font-size: 0.88rem;
+    color: #475569;
+}
+@media (max-width: 768px) {
+    body { padding: 24px; }
+    .hero { padding: 32px; }
+    .section-block { padding: 26px; }
+}
+</style>
+</head>
+<body>
+<div class='page-wrapper'>
+
+<section class='hero'>
+    <div class='hero-head'>
+        <h1>Migration Plan</h1>
+        <p>Synchronize <strong>dev</strong> → <strong>test</strong></p>
+    </div>
+    <div class='hero-meta'>
+        <span>Project refs</span>
+        <span class='env-chip'>Source<span>rkiovortqlqaqksllzqz</span></span>
+        <span class='env-chip'>Target<span>tkaapbxrheffccvfdben</span></span>
+        <span class='env-chip'>Generated<span>2025-11-07 21:46:29 UTC</span></span>
+        <span class='env-chip'>Actions<span>0</span></span>
+    </div>
+</section>
+
+<section class='section-block'><h2>Executive Summary</h2><div class='summary-grid'>
+<div class='summary-card'><h3>New Tables</h3><p>0</p></div>
+<div class='summary-card'><h3>Tables to Review</h3><p>0</p></div>
+<div class='summary-card'><h3>Tables with Updates</h3><p>0</p></div>
+<div class='summary-card'><h3>Columns Added</h3><p>0</p></div>
+<div class='summary-card'><h3>Columns Removed</h3><p>0</p></div>
+<div class='summary-card'><h3>Columns Modified</h3><p>0</p></div>
+<div class='summary-card'><h3>RLS Policies (add/update/remove)</h3><p>0/0/0</p></div>
+<div class='summary-card'><h3>Functions (add/update/remove)</h3><p>0/0/0</p></div>
+<div class='summary-card'><h3>Views (add/update/remove)</h3><p>0/0/0</p></div>
+<div class='summary-card'><h3>Buckets to Review</h3><p>0</p></div>
+<div class='summary-card'><h3>Edge Functions (add/update/remove)</h3><p>0/0/0</p></div>
+<div class='summary-card'><h3>Secrets (add/remove)</h3><p>0/0</p></div>
+<div class='summary-card'><h3>Recommended Actions</h3><p>0</p></div>
+</div></section>
+<section class='section-block'><h2>Action Plan</h2>
+<p>✅ Target environment already matches source. No actions required.</p>
+</section>
+<section class='section-block'><h2>Database Schema Details</h2>
+<div class='data-card'><h3>auth.audit_log_entries </h3>
+</div>
+<div class='data-card'><h3>auth.flow_state </h3>
+</div>
+<div class='data-card'><h3>auth.identities </h3>
+</div>
+<div class='data-card'><h3>auth.instances </h3>
+</div>
+<div class='data-card'><h3>auth.mfa_amr_claims </h3>
+</div>
+<div class='data-card'><h3>auth.mfa_challenges </h3>
+</div>
+<div class='data-card'><h3>auth.mfa_factors </h3>
+</div>
+<div class='data-card'><h3>auth.oauth_authorizations </h3>
+</div>
+<div class='data-card'><h3>auth.oauth_clients </h3>
+</div>
+<div class='data-card'><h3>auth.oauth_consents </h3>
+</div>
+<div class='data-card'><h3>auth.one_time_tokens </h3>
+</div>
+<div class='data-card'><h3>auth.refresh_tokens </h3>
+</div>
+<div class='data-card'><h3>auth.saml_providers </h3>
+</div>
+<div class='data-card'><h3>auth.saml_relay_states </h3>
+</div>
+<div class='data-card'><h3>auth.schema_migrations </h3>
+</div>
+<div class='data-card'><h3>auth.sessions </h3>
+</div>
+<div class='data-card'><h3>auth.sso_domains </h3>
+</div>
+<div class='data-card'><h3>auth.sso_providers </h3>
+</div>
+<div class='data-card'><h3>auth.users </h3>
+</div>
+<div class='data-card'><h3>public.Hello2 </h3>
+</div>
+<div class='data-card'><h3>public.My_Test </h3>
+</div>
+<div class='data-card'><h3>public.new_table </h3>
+</div>
+<div class='data-card'><h3>storage.buckets </h3>
+</div>
+<div class='data-card'><h3>storage.buckets_analytics </h3>
+</div>
+<div class='data-card'><h3>storage.migrations </h3>
+</div>
+<div class='data-card'><h3>storage.objects </h3>
+</div>
+<div class='data-card'><h3>storage.prefixes </h3>
+</div>
+<div class='data-card'><h3>storage.s3_multipart_uploads </h3>
+</div>
+<div class='data-card'><h3>storage.s3_multipart_uploads_parts </h3>
+</div>
+</section>
+<section class='section-block'><h2>RLS Policies</h2>
+<p>No RLS differences.</p>
+</section>
+<section class='section-block'><h2>Database Functions</h2>
+<p>No function differences.</p>
+</section>
+<section class='section-block'><h2>Views</h2>
+<p>No view differences.</p>
+</section>
+<section class='section-block'><h2>Storage Buckets</h2>
+<p>No storage differences.</p>
+</section>
+<section class='section-block'><h2>Edge Functions</h2>
+<p>No edge function differences detected or code comparison unavailable.</p>
+</section>
+<section class='section-block'><h2>Secrets</h2>
+<p>No secret key differences.</p>
+</section>
+<div class='footer-note'>Report generated on 2025-11-07 21:46:29 UTC</div>
+</div></body></html>

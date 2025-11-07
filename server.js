@@ -10,11 +10,14 @@ const path = require('path');
 const fs = require('fs').promises;
 const cors = require('cors');
 const dotenv = require('dotenv');
-const open = require('open');
+const openBrowser = (...args) => import('open').then(mod => mod.default(...args));
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const PROJECT_ROOT = process.cwd();
+
+const stripAnsi = (input = '') =>
+    typeof input === 'string' ? input.replace(/\u001B\[[0-9;]*m/g, '') : '';
 
 // Load environment variables from .env.local
 dotenv.config({ path: path.join(PROJECT_ROOT, '.env.local') });
@@ -154,6 +157,121 @@ function executeScript(scriptPath, args = [], options = {}) {
                 reject({ error: `Script not found: ${scriptPath}` });
             });
     });
+}
+
+function normalizePathForClient(filePath) {
+    return `/${path.relative(PROJECT_ROOT, filePath).split(path.sep).join('/')}`;
+}
+
+async function buildEdgeComparisonPayload(cleanOutput) {
+    const diffMatch = cleanOutput.match(/EDGE_DIFF_JSON=([^\n]+)/);
+    const reportMatch = cleanOutput.match(/EDGE_REPORT_HTML=([^\n]+)/);
+    const sourceListMatch = cleanOutput.match(/EDGE_SOURCE_LIST=([^\n]+)/);
+    const targetListMatch = cleanOutput.match(/EDGE_TARGET_LIST=([^\n]+)/);
+
+    let diffPath = diffMatch ? diffMatch[1].trim() : null;
+    let reportPath = reportMatch ? reportMatch[1].trim() : null;
+
+    if (!diffPath && reportPath) {
+        diffPath = reportPath.replace(/\.html?$/, '.json');
+    }
+
+    if (!diffPath) {
+        throw new Error('Unable to determine diff JSON path from planner output');
+    }
+
+    const diffAbsolute = path.isAbsolute(diffPath)
+        ? diffPath
+        : path.join(PROJECT_ROOT, diffPath);
+
+    const diffContent = await fs.readFile(diffAbsolute, 'utf-8');
+    const plannerData = JSON.parse(diffContent);
+
+    if (!reportPath && diffPath.endsWith('.json')) {
+        reportPath = diffPath.replace(/\.json$/, '.html');
+    }
+
+    const reportAbsolute = reportPath
+        ? (path.isAbsolute(reportPath) ? reportPath : path.join(PROJECT_ROOT, reportPath))
+        : null;
+
+    const plannerInventory = plannerData.edge_functions_snapshot || plannerData.edge_function_inventory || {};
+
+    const defaultSourceSnapshot = Array.isArray(plannerInventory.source)
+        ? plannerInventory.source
+        : Array.isArray(plannerInventory.source_functions)
+            ? plannerInventory.source_functions
+            : [];
+
+    const defaultTargetSnapshot = Array.isArray(plannerInventory.target)
+        ? plannerInventory.target
+        : Array.isArray(plannerInventory.target_functions)
+            ? plannerInventory.target_functions
+            : [];
+
+    const deriveSnapshot = (types) => {
+        const set = new Set();
+        if (Array.isArray(plannerData.edge_functions)) {
+            plannerData.edge_functions.forEach((item) => {
+                const action = item.action || item.type;
+                const name = item.function || item.name;
+                if (name && types.includes(action)) {
+                    set.add(name);
+                }
+            });
+        }
+        return Array.from(set).sort();
+    };
+
+    const parseSnapshotMatch = (match, fallbackList, deriveTypes) => {
+        if (match) {
+            try {
+                const parsed = JSON.parse(match[1].trim());
+                if (Array.isArray(parsed)) {
+                    return parsed;
+                }
+            } catch (error) {
+                console.warn('Unable to parse EDGE_*_LIST output', error);
+            }
+        }
+        if (Array.isArray(fallbackList) && fallbackList.length > 0) {
+            return fallbackList;
+        }
+        const derived = deriveSnapshot(deriveTypes);
+        return derived.length ? derived : [];
+    };
+
+    const sourceSnapshot = parseSnapshotMatch(sourceListMatch, defaultSourceSnapshot, ['add', 'create', 'modify', 'update']);
+    const targetSnapshot = parseSnapshotMatch(targetListMatch, defaultTargetSnapshot, ['modify', 'update', 'remove', 'delete']);
+
+    const edgeFunctions = Array.isArray(plannerData.edge_functions)
+        ? plannerData.edge_functions.map((item) => ({
+              name: item.function,
+              action: item.type,
+              diff: Array.isArray(item.diff) ? item.diff : [],
+              diffPreview: Array.isArray(item.diff) ? item.diff.slice(0, 120) : []
+          }))
+        : [];
+
+    const summary = {
+        add: plannerData.summary?.edge_add ?? 0,
+        remove: plannerData.summary?.edge_remove ?? 0,
+        modify: plannerData.summary?.edge_modify ?? 0,
+        total: edgeFunctions.length
+    };
+
+    return {
+        summary,
+        edgeFunctions,
+        reportUrl: reportAbsolute ? normalizePathForClient(reportAbsolute) : null,
+        diffJsonUrl: normalizePathForClient(diffAbsolute),
+        generatedAt: plannerData.generated_at,
+        sourceEnv: plannerData.source_env,
+        targetEnv: plannerData.target_env,
+        sourceSnapshot,
+        targetSnapshot,
+        logs: cleanOutput
+    };
 }
 
 // API Routes
@@ -1221,6 +1339,105 @@ app.post('/api/connection-test', async (req, res) => {
     }
 });
 
+app.post('/api/edge-comparison', async (req, res) => {
+    try {
+        const { sourceEnv, targetEnv, stream } = req.body || {};
+
+        if (!sourceEnv || !targetEnv) {
+            return res.status(400).json({ error: 'sourceEnv and targetEnv are required' });
+        }
+
+        if (sourceEnv === targetEnv) {
+            return res.status(400).json({ error: 'sourceEnv and targetEnv must be different' });
+        }
+
+        const args = [sourceEnv, targetEnv];
+        const scriptPath = path.join(PROJECT_ROOT, 'scripts/components/compare_edge_functions.sh');
+
+        if (stream === true) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.setHeader('Connection', 'keep-alive');
+
+            try {
+                await fs.access(scriptPath, fs.constants.F_OK);
+            } catch (error) {
+                res.write(`data: ${JSON.stringify({ type: 'error', error: 'compare_edge_functions.sh not found' })}\n\n`);
+                res.write(`data: ${JSON.stringify({ type: 'complete', status: 'error' })}\n\n`);
+                res.end();
+                return;
+            }
+
+            const child = spawn('bash', [scriptPath, ...args], {
+                cwd: PROJECT_ROOT,
+                env: { ...process.env }
+            });
+
+            let stdoutBuffer = '';
+            let stderrBuffer = '';
+
+            child.stdout.on('data', (chunk) => {
+                const text = chunk.toString();
+                stdoutBuffer += text;
+                res.write(`data: ${JSON.stringify({ type: 'stdout', data: text })}\n\n`);
+            });
+
+            child.stderr.on('data', (chunk) => {
+                const text = chunk.toString();
+                stderrBuffer += text;
+                res.write(`data: ${JSON.stringify({ type: 'stderr', data: text })}\n\n`);
+            });
+
+            child.on('close', async (code) => {
+                const combinedOutput = `${stdoutBuffer}\n${stderrBuffer}`;
+                const cleanOutput = stripAnsi(combinedOutput);
+
+                if (code === 0) {
+                    try {
+                        const payload = await buildEdgeComparisonPayload(cleanOutput);
+                        payload.status = 'completed';
+                        res.write(`data: ${JSON.stringify({ type: 'result', data: payload })}\n\n`);
+                    } catch (error) {
+                        res.write(`data: ${JSON.stringify({ type: 'error', error: error.message, logs: cleanOutput })}\n\n`);
+                    }
+                } else {
+                    res.write(`data: ${JSON.stringify({ type: 'error', error: `Edge comparison failed with exit code ${code}`, exitCode: code, logs: cleanOutput })}\n\n`);
+                }
+
+                res.write(`data: ${JSON.stringify({ type: 'complete', status: code === 0 ? 'completed' : 'failed', exitCode: code })}\n\n`);
+                res.end();
+            });
+
+            child.on('error', (error) => {
+                res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+                res.write(`data: ${JSON.stringify({ type: 'complete', status: 'error' })}\n\n`);
+                res.end();
+            });
+
+            req.on('close', () => {
+                if (!child.killed) {
+                    child.kill();
+                }
+            });
+
+            return;
+        }
+
+        const result = await executeScript('scripts/components/compare_edge_functions.sh', args);
+        const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`;
+        const cleanOutput = stripAnsi(combinedOutput);
+        const payload = await buildEdgeComparisonPayload(cleanOutput);
+
+        res.json({
+            status: result.status,
+            ...payload
+        });
+    } catch (error) {
+        console.error('Edge comparison error:', error);
+        res.status(500).json({ error: error.message || 'Failed to generate edge comparison' });
+    }
+});
+
 // Get process status
 app.get('/api/process/:processId', (req, res) => {
     const { processId } = req.params;
@@ -1272,7 +1489,7 @@ app.listen(PORT, () => {
     
     // Small delay to ensure server is fully ready
     setTimeout(() => {
-        open(url).then(() => {
+        openBrowser(url).then(() => {
             console.log(`   ✅ Opened login page in default browser`);
         }).catch((err) => {
             console.log(`   ⚠️  Could not open browser automatically: ${err.message}`);

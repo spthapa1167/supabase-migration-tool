@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Edge Function Comparison: dev → test</title>
+<style>
+body { font-family: 'Inter', sans-serif; background: #f8fafc; color: #0f172a; margin: 0; padding: 32px; }
+.container { max-width: 960px; margin: 0 auto; background: white; border-radius: 24px; box-shadow: 0 24px 48px rgba(15, 23, 42, 0.12); padding: 32px; }
+.metrics { display: flex; flex-wrap: wrap; gap: 16px; margin-bottom: 32px; }
+.metric-card { flex: 1 1 180px; background: linear-gradient(135deg, rgba(99,102,241,.1), rgba(129,140,248,.06)); border: 1px solid rgba(99,102,241,.2); border-radius: 16px; padding: 16px; }
+.metric-card h3 { font-size: .85rem; letter-spacing: .04em; color: #4338ca; margin-bottom: 6px; text-transform: uppercase; }
+.metric-card p { font-size: 1.6rem; font-weight: 700; color: #1e1b4b; }
+.snapshots { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; margin-bottom: 32px; }
+.snapshot-card { border: 1px solid rgba(148,163,184,.3); border-radius: 20px; padding: 20px; background: rgba(248,250,252,.9); }
+.snapshot-card h3 { font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: #1e1b4b; }
+.snapshot-card ul { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow-y: auto; }
+.snapshot-card li { padding: 6px 10px; border-radius: 10px; background: rgba(148,163,184,.12); margin-bottom: 6px; color: #334155; font-size: .9rem; }
+.edge-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+.edge-table th, .edge-table td { border: 1px solid rgba(148,163,184,.35); padding: 12px; text-align: left; vertical-align: top; }
+.edge-table thead { background: rgba(99,102,241,.08); color: #312e81; }
+.badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: .75rem; font-weight: 600; }
+.badge-add { background: rgba(34,197,94,.15); color: #166534; }
+.badge-remove { background: rgba(248,113,113,.15); color: #991b1b; }
+.badge-modify { background: rgba(251,191,36,.15); color: #92400e; }
+pre { font-family: 'JetBrains Mono', monospace; font-size: .85rem; background: #0f172a; color: #e2e8f0; padding: 12px; border-radius: 12px; max-height: 240px; overflow-y: auto; white-space: pre-wrap; }
+.no-diff { font-size: 1rem; color: #475569; margin-top: 8px; }
+</style>
+</head>
+<body>
+    <div class="container">
+        <h1>Edge Function Comparison</h1>
+        <p class="meta">Synchronize <strong>dev</strong> → <strong>test</strong></p>
+        <div class="metrics">
+            <div class="metric-card"><h3>Source Functions</h3><p>3</p></div>
+            <div class="metric-card"><h3>Target Functions</h3><p>3</p></div>
+            <div class="metric-card"><h3>To Deploy</h3><p>0</p></div>
+            <div class="metric-card"><h3>To Redeploy</h3><p>1</p></div>
+            <div class="metric-card"><h3>Review Target-Only</h3><p>0</p></div>
+        </div>
+        <div class="snapshots">
+            <div class="snapshot-card">
+                <h3>Source (dev)</h3>
+                <ul><li>ascii-value</li><li>circle-area</li><li>sign-jwt</li></ul>
+            </div>
+            <div class="snapshot-card">
+                <h3>Target (test)</h3>
+                <ul><li>ascii-value</li><li>circle-area</li><li>sign-jwt</li></ul>
+            </div>
+        </div>
+        
+        <table class="edge-table">
+            <thead>
+                <tr>
+                    <th>Function</th>
+                    <th>Action</th>
+                    <th>Summary</th>
+                    <th>Diff</th>
+                </tr>
+            </thead>
+            <tbody>
+                
+                <tr>
+                    <td>circle-area</td>
+                    <td><span class="badge badge-modify">Redeploy</span></td>
+                    <td>Code differs</td>
+                    <td><pre>--- /var/folders/mw/zbyc_w_13bvgzfdsckg2sqn40000gn/T/edge-compare-9pdJ66/dev/code/circle-area/index.ts	2025-11-07 13:09:19
++++ /var/folders/mw/zbyc_w_13bvgzfdsckg2sqn40000gn/T/edge-compare-9pdJ66/test/code/circle-area/index.ts	2025-11-07 13:09:13
+@@ -34,7 +34,7 @@
+       }
+     });
+   }
+-  const area = Math.PI * r * r + 2;
++  const area = Math.PI * r * r;
+   return new Response(JSON.stringify({
+     radius: r,
+     area</pre></td>
+                </tr>
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>

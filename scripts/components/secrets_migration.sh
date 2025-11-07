@@ -33,6 +33,11 @@ for arg in "$@"; do
     esac
 done
 
+# If the optional migration directory argument is actually a flag, ignore it
+if [[ -n "$MIGRATION_DIR" && "$MIGRATION_DIR" == --* ]]; then
+    MIGRATION_DIR=""
+fi
+
 # Usage
 usage() {
     cat << EOF

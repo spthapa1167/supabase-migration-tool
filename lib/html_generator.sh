@@ -750,32 +750,40 @@ generate_result_html() {
         fi
         
         # Find added objects (in target but not in source)
-        for target_obj in "${target_array[@]}"; do
-            local found=false
-            for source_obj in "${source_array[@]}"; do
-                if [ "$target_obj" = "$source_obj" ]; then
-                    found=true
-                    break
+        if [ ${#target_array[@]} -gt 0 ]; then
+            for target_obj in "${target_array[@]}"; do
+                local found=false
+                if [ ${#source_array[@]} -gt 0 ]; then
+                    for source_obj in "${source_array[@]}"; do
+                        if [ "$target_obj" = "$source_obj" ]; then
+                            found=true
+                            break
+                        fi
+                    done
+                fi
+                if ! $found; then
+                    added_items+="$target_obj\n"
                 fi
             done
-            if [ "$found" = "false" ]; then
-                added_items="${added_items}${target_obj}\n"
-            fi
-        done
+        fi
         
         # Find removed objects (in source but not in target)
-        for source_obj in "${source_array[@]}"; do
-            local found=false
-            for target_obj in "${target_array[@]}"; do
-                if [ "$source_obj" = "$target_obj" ]; then
-                    found=true
-                    break
+        if [ ${#source_array[@]} -gt 0 ]; then
+            for source_obj in "${source_array[@]}"; do
+                local found=false
+                if [ ${#target_array[@]} -gt 0 ]; then
+                    for target_obj in "${target_array[@]}"; do
+                        if [ "$source_obj" = "$target_obj" ]; then
+                            found=true
+                            break
+                        fi
+                    done
+                fi
+                if ! $found; then
+                    removed_items+="$source_obj\n"
                 fi
             done
-            if [ "$found" = "false" ]; then
-                removed_items="${removed_items}${source_obj}\n"
-            fi
-        done
+        fi
         
         if [ -n "$added_items" ]; then
             changes_html+="<div class=\"change-item change-added\"><strong>✅ Added:</strong><ul>"

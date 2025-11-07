@@ -1,0 +1,25 @@
+{
+  "source_env": "dev",
+  "target_env": "test",
+  "source_ref": "rkiovortqlqaqksllzqz",
+  "target_ref": "tkaapbxrheffccvfdben",
+  "generated_at": "2025-11-07T21:42:52.042Z",
+  "summary": {
+    "source_count": 3,
+    "target_count": 3,
+    "adds": 0,
+    "removes": 0,
+    "modifies": 0
+  },
+  "edge_functions": [],
+  "source_functions": [
+    "ascii-value",
+    "circle-area",
+    "sign-jwt"
+  ],
+  "target_functions": [
+    "ascii-value",
+    "circle-area",
+    "sign-jwt"
+  ]
+}
