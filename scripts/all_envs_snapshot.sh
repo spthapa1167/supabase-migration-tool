@@ -99,51 +99,50 @@ query_database_counts() {
         return 0
     fi
     
-    local tables=0 views=0 functions=0 sequences=0 indexes=0 policies=0 triggers=0 types=0 enums=0
-    
-    if [ -n "$pooler_host" ]; then
-        # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-        tables=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        views=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        functions=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        sequences=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        indexes=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        policies=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        triggers=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        types=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        enums=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-    fi
-    
-    # Try direct connection if pooler failed or returned 0
-    if [ -z "$pooler_host" ] || [ -z "$tables" ] || [ "$tables" = "" ] || [ "$tables" = "0" ]; then
-        local direct_host="db.${project_ref}.supabase.co"
-        log_info "  Querying $env via direct connection..."
-        local direct_tables=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-        if [ -n "$direct_tables" ] && [ "$direct_tables" != "" ] && [ "$direct_tables" != "0" ]; then
-            tables="$direct_tables"
-            views=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            functions=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            sequences=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            indexes=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            policies=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            triggers=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            types=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            enums=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "0")
+    local direct_host="db.${project_ref}.supabase.co"
+    local tables views functions sequences indexes policies triggers types enums
+
+    run_count_with_fallback() {
+        local query=$1
+        local label=$2
+        local result=""
+
+        if [ -n "$pooler_host" ]; then
+            if result=$(PGPASSWORD="$password" PGSSLMODE=require psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "$query" 2>/dev/null); then
+                result=$(echo "$result" | tr -d ' \n\r')
+            else
+                result=""
+            fi
         fi
-    fi
-    
-    # Ensure all values are set
-    tables=${tables:-0}
-    views=${views:-0}
-    functions=${functions:-0}
-    sequences=${sequences:-0}
-    indexes=${indexes:-0}
-    policies=${policies:-0}
-    triggers=${triggers:-0}
-    types=${types:-0}
-    enums=${enums:-0}
-    
-    echo "{\"tables\":$tables,\"views\":$views,\"functions\":$functions,\"sequences\":$sequences,\"indexes\":$indexes,\"policies\":$policies,\"triggers\":$triggers,\"types\":$types,\"enums\":$enums}"
+
+        if [ -z "$result" ]; then
+            log_warning "Primary pooler query for $label in $env returned no data; retrying direct connection..."
+            if result=$(PGPASSWORD="$password" PGSSLMODE=require psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "$query" 2>/dev/null); then
+                result=$(echo "$result" | tr -d ' \n\r')
+            else
+                result=""
+            fi
+        fi
+
+        if [ -z "$result" ]; then
+            log_error "Unable to retrieve $label count for $env; defaulting to 0"
+            result="0"
+        fi
+
+        echo "$result"
+    }
+
+    tables=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_tables WHERE schemaname IN ('public','storage','auth');" "tables")
+    views=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_views WHERE schemaname IN ('public','storage','auth');" "views")
+    functions=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname IN ('public','storage','auth');" "functions")
+    sequences=$(run_count_with_fallback "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema IN ('public','storage','auth');" "sequences")
+    indexes=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_indexes WHERE schemaname IN ('public','storage','auth');" "indexes")
+    policies=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_policies WHERE schemaname IN ('public','storage');" "policies")
+    triggers=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname IN ('public','storage','auth') AND NOT t.tgisinternal;" "triggers")
+    types=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname IN ('public','storage','auth') AND t.typtype = 'c';" "types")
+    enums=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname IN ('public','storage','auth') AND t.typtype = 'e';" "enums")
+
+    echo "{\"tables\":${tables:-0},\"views\":${views:-0},\"functions\":${functions:-0},\"sequences\":${sequences:-0},\"indexes\":${indexes:-0},\"policies\":${policies:-0},\"triggers\":${triggers:-0},\"types\":${types:-0},\"enums\":${enums:-0}}"
 }
 
 query_auth_users_count() {

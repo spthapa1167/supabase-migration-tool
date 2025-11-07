@@ -1,0 +1,44 @@
+{
+  "source_env": "dev",
+  "target_env": "test",
+  "source_ref": "rkiovortqlqaqksllzqz",
+  "target_ref": "tkaapbxrheffccvfdben",
+  "generated_at": "2025-11-07T17:14:58.790044+00:00",
+  "summary": {
+    "tables_new": 0,
+    "tables_removed": 0,
+    "tables_modified": 0,
+    "cols_added": 0,
+    "cols_removed": 0,
+    "cols_modified": 0,
+    "policies_add": 0,
+    "policies_remove": 0,
+    "policies_modify": 0,
+    "functions_add": 0,
+    "functions_remove": 0,
+    "functions_modify": 0,
+    "views_add": 0,
+    "views_remove": 0,
+    "views_modify": 0,
+    "buckets_changed": 0,
+    "edge_add": 0,
+    "edge_remove": 0,
+    "edge_modify": 0,
+    "secrets_add": 0,
+    "secrets_remove": 0,
+    "actions": 0
+  },
+  "database": {
+    "tables": {},
+    "policies": [],
+    "functions": [],
+    "views": []
+  },
+  "storage": [],
+  "edge_functions": [],
+  "secrets": {
+    "to_create": [],
+    "only_in_target": []
+  },
+  "actions": []
+}

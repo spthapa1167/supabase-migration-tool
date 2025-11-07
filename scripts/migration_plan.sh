@@ -81,11 +81,16 @@ SOURCE_REF=$(get_project_ref "$SOURCE_ENV")
 TARGET_REF=$(get_project_ref "$TARGET_ENV")
 SOURCE_PASSWORD=$(get_db_password "$SOURCE_ENV")
 TARGET_PASSWORD=$(get_db_password "$TARGET_ENV")
+SOURCE_POOLER_REGION=$(get_pooler_region_for_env "$SOURCE_ENV")
+TARGET_POOLER_REGION=$(get_pooler_region_for_env "$TARGET_ENV")
+SOURCE_POOLER_PORT=$(get_pooler_port_for_env "$SOURCE_ENV")
+TARGET_POOLER_PORT=$(get_pooler_port_for_env "$TARGET_ENV")
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 HTML_FILE="$OUTPUT_DIR/migration_plan_${SOURCE_ENV}_to_${TARGET_ENV}_${TIMESTAMP}.html"
+DIFF_JSON_FILE="$OUTPUT_DIR/migration_plan_${SOURCE_ENV}_to_${TARGET_ENV}_${TIMESTAMP}.json"
 TEMP_DIR=$(mktemp -d)
 trap "rm -rf $TEMP_DIR" EXIT
 
@@ -98,98 +103,162 @@ log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Output: $HTML_FILE"
 log_info ""
 
+# Helper function to count lines in file (excluding empty lines)
+count_items() {
+    local file=$1
+    if [ -f "$file" ]; then
+        grep -v '^[[:space:]]*$' "$file" | wc -l | tr -d ' '
+    else
+        echo "0"
+    fi
+}
+
+# Helper function to get file contents as array
+get_file_contents() {
+    local file=$1
+    if [ -f "$file" ] && [ -s "$file" ]; then
+        cat "$file"
+    else
+        echo ""
+    fi
+}
+
+# Helper to run a psql query with automatic fallback to direct connection
+run_psql_with_fallback() {
+    local output_path=$1
+    local description=$2
+    local ref=$3
+    local password=$4
+    local pooler_region=$5
+    local pooler_port=$6
+    local query=$7
+    shift 7
+    local psql_extra_flags=()
+    if [ $# -gt 0 ]; then
+        psql_extra_flags=("$@")
+    fi
+
+    local tmp_file="${output_path}.tmp"
+    local tmp_err="${output_path}.err"
+    rm -f "$tmp_file"
+    rm -f "$tmp_err"
+
+    local success=false
+    local attempt_label=""
+
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            ${psql_extra_flags[@]+"${psql_extra_flags[@]}"} \
+            -c "$query" \
+            >"$tmp_file" 2>"$tmp_err"; then
+            success=true
+            attempt_label="$label"
+            break
+        else
+            status=$?
+            if [ -s "$tmp_err" ]; then
+                log_warning "$description for $ref failed via $label: $(head -1 "$tmp_err")"
+            else
+                log_warning "$description for $ref failed via $label (psql exited with status $status)"
+            fi
+            log_warning "Trying next endpoint..."
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    if $success; then
+        mv "$tmp_file" "$output_path"
+        rm -f "$tmp_err"
+        if [ -s "$output_path" ]; then
+            log_info "Retrieved $description for $ref via $attempt_label"
+        else
+            log_info "$description for $ref via $attempt_label returned no rows"
+        fi
+    else
+        : > "$output_path"
+        log_warning "Unable to retrieve $description for $ref after all connection attempts"
+        rm -f "$tmp_file" "$tmp_err"
+    fi
+}
+
 # Function to get database schema information
 get_db_schema_info() {
     local env=$1
     local ref=$2
     local password=$3
-    local output_file=$4
+    local pooler_region=$4
+    local pooler_port=$5
+    local output_file=$6
     
     log_info "Collecting database schema information from $env..."
     
-    # Get pooler host using environment name (more reliable)
-    POOLER_HOST=$(get_pooler_host_for_env "$env" 2>/dev/null || get_pooler_host "$ref")
-    if [ -z "$POOLER_HOST" ]; then
-        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
-    fi
+    # Tables (simple list for backwards compatibility)
+    local tables_query="SELECT schemaname||'.'||tablename FROM pg_tables WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, tablename;"
+    run_psql_with_fallback "$output_file.tables" "table list" "$ref" "$password" "$pooler_region" "$pooler_port" "$tables_query"
     
-    # Get tables
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U postgres.${ref} \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||tablename FROM pg_tables WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, tablename;" \
-        > "$output_file.tables" 2>/dev/null || echo "" > "$output_file.tables"
+    # Views (list)
+    local views_query="SELECT schemaname||'.'||viewname FROM pg_views WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, viewname;"
+    run_psql_with_fallback "$output_file.views" "view list" "$ref" "$password" "$pooler_region" "$pooler_port" "$views_query"
     
-    # Get views
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||viewname FROM pg_views WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, viewname;" \
-        > "$output_file.views" 2>/dev/null || echo "" > "$output_file.views"
+    # Functions (list)
+    local functions_query="SELECT n.nspname||'.'||p.proname||'('||pg_get_function_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname IN ('public', 'storage', 'auth') ORDER BY n.nspname, p.proname;"
+    run_psql_with_fallback "$output_file.db_functions" "database functions list" "$ref" "$password" "$pooler_region" "$pooler_port" "$functions_query"
     
-    # Get database functions (stored in .db_functions to avoid conflict with edge functions)
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT n.nspname||'.'||p.proname||'('||pg_get_function_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname IN ('public', 'storage', 'auth') ORDER BY n.nspname, p.proname;" \
-        > "$output_file.db_functions" 2>/dev/null || echo "" > "$output_file.db_functions"
+    # Triggers (list)
+    local triggers_query="SELECT n.nspname||'.'||c.relname||'.'||t.tgname FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname IN ('public', 'storage', 'auth') AND t.tgisinternal = false ORDER BY n.nspname, c.relname, t.tgname;"
+    run_psql_with_fallback "$output_file.triggers" "trigger list" "$ref" "$password" "$pooler_region" "$pooler_port" "$triggers_query"
     
-    # Get triggers
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT tgname FROM pg_trigger WHERE tgisinternal = false ORDER BY tgname;" \
-        > "$output_file.triggers" 2>/dev/null || echo "" > "$output_file.triggers"
+    # Sequences (list)
+    local sequences_query="SELECT schemaname||'.'||sequencename FROM pg_sequences WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, sequencename;"
+    run_psql_with_fallback "$output_file.sequences" "sequence list" "$ref" "$password" "$pooler_region" "$pooler_port" "$sequences_query"
     
-    # Get sequences
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||sequencename FROM pg_sequences WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, sequencename;" \
-        > "$output_file.sequences" 2>/dev/null || echo "" > "$output_file.sequences"
-    
-    # Get table row counts (using approximate statistics - faster than exact COUNT)
-    # Note: n_live_tup is approximate but much faster than COUNT(*) for large tables
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U postgres.${ref} \
-        -d postgres \
-        -t -A \
-        -c "
+    # Row counts (list)
+    local row_counts_query="
         SELECT 
             schemaname||'.'||relname as table_name,
             COALESCE(n_live_tup::text, '0') as row_count
         FROM pg_stat_user_tables 
         WHERE schemaname IN ('public', 'storage', 'auth')
         ORDER BY schemaname, relname;
-        " \
-        > "$output_file.row_counts" 2>/dev/null || echo "" > "$output_file.row_counts"
+    "
+    run_psql_with_fallback "$output_file.row_counts" "table row counts" "$ref" "$password" "$pooler_region" "$pooler_port" "$row_counts_query"
     
-    # Get RLS policies
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U postgres.${ref} \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname IN ('public', 'storage') ORDER BY schemaname, tablename, policyname;" \
-        > "$output_file.policies" 2>/dev/null || echo "" > "$output_file.policies"
+    # RLS policies (list)
+    local policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname IN ('public', 'storage') ORDER BY schemaname, tablename, policyname;"
+    run_psql_with_fallback "$output_file.policies" "RLS policy list" "$ref" "$password" "$pooler_region" "$pooler_port" "$policies_query"
+    
+    # Detailed JSON metadata
+    local columns_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY table_schema, table_name, ordinal_position), '[]'::json) FROM ( SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default, ordinal_position, character_maximum_length, numeric_precision, numeric_scale, is_identity, identity_generation, generation_expression FROM information_schema.columns WHERE table_schema IN ('public','storage','auth') ) t;"
+    run_psql_with_fallback "$output_file.columns.json" "column metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$columns_json_query"
+
+    local indexes_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY schemaname, tablename, indexname), '[]'::json) FROM ( SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes WHERE schemaname IN ('public','storage','auth') ) t;"
+    run_psql_with_fallback "$output_file.indexes.json" "index metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$indexes_json_query"
+
+    local functions_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY schema, name), '[]'::json) FROM ( SELECT n.nspname AS schema, p.proname AS name, pg_get_function_arguments(p.oid) AS arguments, pg_get_function_result(p.oid) AS result_type, pg_get_functiondef(p.oid) AS definition FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname IN ('public','storage','auth') ) t;"
+    run_psql_with_fallback "$output_file.functions.json" "function definitions" "$ref" "$password" "$pooler_region" "$pooler_port" "$functions_json_query"
+
+    local views_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY table_schema, table_name), '[]'::json) FROM ( SELECT table_schema AS schema, table_name, view_definition FROM information_schema.views WHERE table_schema IN ('public','storage','auth') ) t;"
+    run_psql_with_fallback "$output_file.views.json" "view definitions" "$ref" "$password" "$pooler_region" "$pooler_port" "$views_json_query"
+
+    local triggers_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY schema, table_name, trigger_name), '[]'::json) FROM ( SELECT n.nspname AS schema, c.relname AS table_name, t.tgname AS trigger_name, pg_get_triggerdef(t.oid) AS definition FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname IN ('public','storage','auth') AND t.tgisinternal = false ) t;"
+    run_psql_with_fallback "$output_file.triggers.json" "trigger definitions" "$ref" "$password" "$pooler_region" "$pooler_port" "$triggers_json_query"
+
+    local sequences_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY sequence_schema, sequencename), '[]'::json) FROM ( SELECT schemaname AS sequence_schema, sequencename, last_value, increment_by FROM pg_sequences WHERE schemaname IN ('public','storage','auth') ) t;"
+    run_psql_with_fallback "$output_file.sequences.json" "sequence metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$sequences_json_query"
+
+    local policies_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY schemaname, tablename, policyname), '[]'::json) FROM ( SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check FROM pg_policies WHERE schemaname IN ('public','storage') ) t;"
+    run_psql_with_fallback "$output_file.policies.json" "policy metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$policies_json_query"
+
+    local row_counts_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY schemaname, relname), '[]'::json) FROM ( SELECT schemaname, relname AS table_name, COALESCE(n_live_tup,0) AS row_count FROM pg_stat_user_tables WHERE schemaname IN ('public','storage','auth') ) t;"
+    run_psql_with_fallback "$output_file.row_counts.json" "row count metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$row_counts_json_query"
+
+    rm -f "$output_file.triggers.tmp" "$output_file.sequences.tmp" "$output_file.tables.tmp" "$output_file.views.tmp" "$output_file.db_functions.tmp" "$output_file.row_counts.tmp" "$output_file.policies.tmp"
+    rm -f "$output_file.columns.json.tmp" "$output_file.indexes.json.tmp" "$output_file.functions.json.tmp" "$output_file.views.json.tmp" "$output_file.triggers.json.tmp" "$output_file.sequences.json.tmp" "$output_file.policies.json.tmp" "$output_file.row_counts.json.tmp"
     
     log_success "Database schema information collected from $env"
 }
@@ -199,25 +268,14 @@ get_storage_buckets_info() {
     local env=$1
     local ref=$2
     local password=$3
-    local output_file=$4
+    local pooler_region=$4
+    local pooler_port=$5
+    local output_file=$6
     
     log_info "Collecting storage buckets information from $env..."
     
-    # Get pooler host using environment name (more reliable)
-    POOLER_HOST=$(get_pooler_host_for_env "$env" 2>/dev/null || get_pooler_host "$ref")
-    if [ -z "$POOLER_HOST" ]; then
-        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
-    fi
-    
-    # Get buckets with file counts
-    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "
+    # Get buckets with file counts (legacy text output)
+    local buckets_query="
         SELECT 
             b.name,
             b.public::text,
@@ -230,8 +288,18 @@ get_storage_buckets_info() {
             ), '0') as file_count
         FROM storage.buckets b
         ORDER BY b.name;
-        " \
-        > "$output_file.buckets" 2>/dev/null || echo "" > "$output_file.buckets"
+    "
+    run_psql_with_fallback "$output_file.buckets" "storage buckets list" "$ref" "$password" "$pooler_region" "$pooler_port" "$buckets_query"
+
+    # Bucket metadata as JSON
+    local buckets_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY name), '[]'::json) FROM ( SELECT b.id, b.name, b.public, b.file_size_limit, b.allowed_mime_types, COALESCE(( SELECT COUNT(*) FROM storage.objects o WHERE o.bucket_id = b.id ), 0) AS file_count FROM storage.buckets b ) t;"
+    run_psql_with_fallback "$output_file.buckets.json" "storage buckets metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$buckets_json_query"
+
+    # Bucket objects (files) as JSON
+    local bucket_objects_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY bucket_name, object_name), '[]'::json) FROM ( SELECT b.name AS bucket_name, o.name AS object_name, CASE WHEN (o.metadata ->> 'size') ~ '^[0-9]+$' THEN (o.metadata ->> 'size')::bigint ELSE NULL END AS size_bytes, o.updated_at, o.metadata FROM storage.objects o JOIN storage.buckets b ON o.bucket_id = b.id ) t;"
+    run_psql_with_fallback "$output_file.bucket_objects.json" "storage bucket objects" "$ref" "$password" "$pooler_region" "$pooler_port" "$bucket_objects_query"
+
+    rm -f "$output_file.buckets.tmp" "$output_file.buckets.json.tmp" "$output_file.bucket_objects.json.tmp"
     
     log_success "Storage buckets information collected from $env"
 }
@@ -245,29 +313,84 @@ get_edge_functions_info() {
     log_info "Collecting edge functions information from $env..."
     
     if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-        log_warning "SUPABASE_ACCESS_TOKEN not set - skipping edge functions"
-        echo "" > "$output_file.functions"
-        return
+        log_error "SUPABASE_ACCESS_TOKEN not set - cannot collect edge functions for $env"
+        return 1
     fi
     
-    # Get edge functions using Management API
-    if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    if ! command -v jq >/dev/null 2>&1; then
+        log_error "jq not found - required to parse edge functions for $env"
+        return 1
+    fi
+    
+    local raw_file="$output_file.functions_raw"
+    local list_file="$output_file.functions"
+    local tmp_file="$raw_file.tmp"
+    local http_status
+    
+    http_status=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
         "https://api.supabase.com/v1/projects/${ref}/functions" \
-        -o "$output_file.functions_raw" 2>/dev/null; then
-        
-        # Extract function names
-        if command -v jq >/dev/null 2>&1; then
-            jq -r '.[].name' "$output_file.functions_raw" 2>/dev/null | sort > "$output_file.functions" || echo "" > "$output_file.functions"
-        else
-            log_warning "jq not found - cannot parse edge functions"
-            echo "" > "$output_file.functions"
-        fi
-    else
-        log_warning "Failed to fetch edge functions from $env"
-        echo "" > "$output_file.functions"
+        -o "$tmp_file" 2>/dev/null || echo "000")
+    
+    if [ "$http_status" != "200" ]; then
+        log_error "Failed to fetch edge functions from $env (HTTP $http_status)"
+        rm -f "$tmp_file" "$list_file"
+        return 1
+    fi
+    
+    mv "$tmp_file" "$raw_file"
+    
+    if ! jq -e 'type == "array"' "$raw_file" >/dev/null 2>&1; then
+        log_error "Unexpected response while retrieving edge functions from $env"
+        rm -f "$list_file"
+        return 1
+    fi
+    
+    local function_count
+    function_count=$(jq 'length' "$raw_file" 2>/dev/null || echo 0)
+    if [ "$function_count" -eq 0 ] && [ "${ALLOW_EMPTY_EDGE_FUNCTIONS:-false}" != "true" ]; then
+        log_error "Edge function API returned zero functions for $env. Ensure the access token has appropriate permissions."
+        rm -f "$list_file"
+        return 1
+    fi
+    
+    if ! jq -r '.[].name' "$raw_file" 2>/dev/null | sort > "$list_file"; then
+        log_error "Unable to parse edge functions response from $env"
+        rm -f "$list_file"
+        return 1
     fi
     
     log_success "Edge functions information collected from $env"
+    return 0
+}
+
+# Download edge function code for comparison
+download_edge_functions_code() {
+    local env=$1
+    local ref=$2
+    local password=$3
+    local functions_list_file=$4
+    local destination_dir=$5
+
+    if [ ! -f "$functions_list_file" ] || [ ! -s "$functions_list_file" ]; then
+        log_warning "No edge function names available for $env; skipping code download"
+        return 1
+    fi
+
+    local functions_list
+    functions_list=$(get_file_contents "$functions_list_file")
+    if [ -z "$functions_list" ]; then
+        log_error "Edge function list for $env is empty"
+        return 1
+    fi
+
+    mkdir -p "$destination_dir"
+
+    if ! node "$SCRIPT_DIR/../utils/download-edge-functions.js" "$ref" "$functions_list_file" "$destination_dir" "$env" "${password:-}"; then
+        log_error "Failed to download edge function code from $env"
+        return 1
+    fi
+
+    return 0
 }
 
 # Function to get secrets information
@@ -311,9 +434,12 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 log_info ""
 
 SOURCE_INFO="$TEMP_DIR/source"
-get_db_schema_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_INFO"
-get_storage_buckets_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_INFO"
-get_edge_functions_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_INFO"
+get_db_schema_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$SOURCE_INFO"
+get_storage_buckets_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$SOURCE_INFO"
+if ! get_edge_functions_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_INFO"; then
+    log_error "Unable to retrieve edge function metadata from $SOURCE_ENV"
+    exit 1
+fi
 get_secrets_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_INFO"
 
 log_info ""
@@ -323,1513 +449,1242 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 log_info ""
 
 TARGET_INFO="$TEMP_DIR/target"
-get_db_schema_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_INFO"
-get_storage_buckets_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_INFO"
-get_edge_functions_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_INFO"
+get_db_schema_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$TARGET_INFO"
+get_storage_buckets_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$TARGET_INFO"
+if ! get_edge_functions_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_INFO"; then
+    log_error "Unable to retrieve edge function metadata from $TARGET_ENV"
+    exit 1
+fi
 get_secrets_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_INFO"
 
 log_info ""
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log_info "  Generating HTML Report"
+log_info "  Generating Detailed Migration Plan"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
 
-# Helper function to count lines in file (excluding empty lines)
-count_items() {
-    local file=$1
-    if [ -f "$file" ]; then
-        grep -v '^[[:space:]]*$' "$file" | wc -l | tr -d ' '
-    else
-        echo "0"
-    fi
+EDGE_SOURCE_DIR="$TEMP_DIR/edge_functions_source"
+EDGE_TARGET_DIR="$TEMP_DIR/edge_functions_target"
+rm -rf "$EDGE_SOURCE_DIR" "$EDGE_TARGET_DIR"
+mkdir -p "$EDGE_SOURCE_DIR" "$EDGE_TARGET_DIR"
+
+if ! download_edge_functions_code "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_INFO.functions" "$EDGE_SOURCE_DIR"; then
+    log_error "Failed to download edge function code from $SOURCE_ENV"
+    exit 1
+fi
+if ! download_edge_functions_code "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_INFO.functions" "$EDGE_TARGET_DIR"; then
+    log_error "Failed to download edge function code from $TARGET_ENV"
+    exit 1
+fi
+
+log_info "Building detailed migration planner report..."
+
+export MP_HTML_FILE="$HTML_FILE"
+export MP_SOURCE_ENV="$SOURCE_ENV"
+export MP_TARGET_ENV="$TARGET_ENV"
+export MP_SOURCE_REF="$SOURCE_REF"
+export MP_TARGET_REF="$TARGET_REF"
+export MP_DIFF_JSON="$DIFF_JSON_FILE"
+export MP_SOURCE_COLUMNS_JSON="$SOURCE_INFO.columns.json"
+export MP_TARGET_COLUMNS_JSON="$TARGET_INFO.columns.json"
+export MP_SOURCE_INDEXES_JSON="$SOURCE_INFO.indexes.json"
+export MP_TARGET_INDEXES_JSON="$TARGET_INFO.indexes.json"
+export MP_SOURCE_TRIGGERS_JSON="$SOURCE_INFO.triggers.json"
+export MP_TARGET_TRIGGERS_JSON="$TARGET_INFO.triggers.json"
+export MP_SOURCE_POLICIES_JSON="$SOURCE_INFO.policies.json"
+export MP_TARGET_POLICIES_JSON="$TARGET_INFO.policies.json"
+export MP_SOURCE_FUNCTIONS_JSON="$SOURCE_INFO.functions.json"
+export MP_TARGET_FUNCTIONS_JSON="$TARGET_INFO.functions.json"
+export MP_SOURCE_VIEWS_JSON="$SOURCE_INFO.views.json"
+export MP_TARGET_VIEWS_JSON="$TARGET_INFO.views.json"
+export MP_SOURCE_SEQUENCES_JSON="$SOURCE_INFO.sequences.json"
+export MP_TARGET_SEQUENCES_JSON="$TARGET_INFO.sequences.json"
+export MP_SOURCE_ROWCOUNTS_JSON="$SOURCE_INFO.row_counts.json"
+export MP_TARGET_ROWCOUNTS_JSON="$TARGET_INFO.row_counts.json"
+export MP_SOURCE_BUCKETS_JSON="$SOURCE_INFO.buckets.json"
+export MP_TARGET_BUCKETS_JSON="$TARGET_INFO.buckets.json"
+export MP_SOURCE_BUCKET_OBJECTS_JSON="$SOURCE_INFO.bucket_objects.json"
+export MP_TARGET_BUCKET_OBJECTS_JSON="$TARGET_INFO.bucket_objects.json"
+export MP_SOURCE_FUNCTIONS_RAW="$SOURCE_INFO.functions_raw"
+export MP_TARGET_FUNCTIONS_RAW="$TARGET_INFO.functions_raw"
+export MP_SOURCE_SECRETS_RAW="$SOURCE_INFO.secrets_raw"
+export MP_TARGET_SECRETS_RAW="$TARGET_INFO.secrets_raw"
+export MP_SOURCE_SECRETS_LIST="$SOURCE_INFO.secrets"
+export MP_TARGET_SECRETS_LIST="$TARGET_INFO.secrets"
+export MP_SOURCE_FUNCTION_LIST="$SOURCE_INFO.functions"
+export MP_TARGET_FUNCTION_LIST="$TARGET_INFO.functions"
+export MP_EDGE_SOURCE_DIR="$EDGE_SOURCE_DIR"
+export MP_EDGE_TARGET_DIR="$EDGE_TARGET_DIR"
+
+python3 <<'PY'
+import os
+import json
+import html
+import difflib
+from pathlib import Path
+from collections import defaultdict
+from datetime import datetime, timezone
+
+def env(name, default=''):
+    return os.environ.get(name, default)
+
+def load_json(path):
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        text = p.read_text(encoding='utf-8').strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            return json.loads(text.replace('\n', ''))
+        except json.JSONDecodeError:
+            return None
+
+def load_json_list(path):
+    data = load_json(path)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return [data]
+    return []
+
+def load_text_list(path):
+    if not path:
+        return []
+    p = Path(path)
+    if not p.exists():
+        return []
+    return [line.strip() for line in p.read_text(encoding='utf-8').splitlines() if line.strip()]
+
+def parse_int(value):
+    if value is None:
+        return 0
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        try:
+            return int(float(value))
+        except (ValueError, TypeError):
+            return 0
+
+def describe_column(col):
+    data_type = col.get('data_type') or ''
+    length = col.get('character_maximum_length')
+    if length and str(length).lower() not in ('', 'none'):
+        data_type = f"{data_type}({length})"
+    precision = col.get('numeric_precision')
+    scale = col.get('numeric_scale')
+    if precision and str(precision).lower() not in ('', 'none'):
+        if scale and str(scale).lower() not in ('', 'none'):
+            data_type = f"{data_type}({precision},{scale})"
+        else:
+            data_type = f"{data_type}({precision})"
+    parts = [data_type.strip()]
+    if (col.get('is_nullable') or '').upper() == 'NO':
+        parts.append('NOT NULL')
+    default = col.get('column_default')
+    if default:
+        parts.append(f"DEFAULT {default}")
+    if (col.get('is_identity') or '').upper() == 'YES':
+        parts.append('IDENTITY')
+    gen = col.get('generation_expression')
+    if gen:
+        parts.append(f"GENERATED ({gen})")
+    return ' '.join(part for part in parts if part)
+
+def build_columns_map(rows):
+    tables = defaultdict(dict)
+    for row in rows:
+        schema = row.get('table_schema') or row.get('schema')
+        table = row.get('table_name')
+        column = row.get('column_name')
+        if not schema or not table or not column:
+            continue
+        key = f"{schema}.{table}"
+        tables[key][column] = row
+    return tables
+
+def build_index_map(rows):
+    tables = defaultdict(dict)
+    for row in rows:
+        schema = row.get('schemaname') or row.get('schema')
+        table = row.get('tablename') or row.get('table_name')
+        indexname = row.get('indexname')
+        indexdef = row.get('indexdef')
+        if schema and table and indexname:
+            key = f"{schema}.{table}"
+            tables[key][indexname] = indexdef
+    return tables
+
+def build_trigger_map(rows):
+    tables = defaultdict(dict)
+    for row in rows:
+        schema = row.get('schema')
+        table = row.get('table_name')
+        trigger = row.get('trigger_name')
+        definition = row.get('definition')
+        if schema and table and trigger:
+            key = f"{schema}.{table}"
+            tables[key][trigger] = definition or ''
+    return tables
+
+def build_policy_map(rows):
+    policies = {}
+    for row in rows:
+        schema = row.get('schemaname') or row.get('schema')
+        table = row.get('tablename') or row.get('table_name')
+        policy = row.get('policyname') or row.get('name')
+        if schema and table and policy:
+            key = f"{schema}.{table}.{policy}"
+            policies[key] = row
+    return policies
+
+def build_function_map(rows):
+    functions = {}
+    for row in rows:
+        schema = row.get('schema')
+        name = row.get('name')
+        args = row.get('arguments') or ''
+        if schema and name is not None:
+            key = f"{schema}.{name}({args})"
+            functions[key] = row
+    return functions
+
+def build_view_map(rows):
+    views = {}
+    for row in rows:
+        schema = row.get('schema') or row.get('table_schema')
+        name = row.get('table_name') or row.get('name')
+        if schema and name:
+            key = f"{schema}.{name}"
+            views[key] = row
+    return views
+
+def build_rowcount_map(rows):
+    counts = {}
+    for row in rows:
+        schema = row.get('schemaname') or row.get('schema')
+        table = row.get('table_name') or row.get('relname')
+        if schema and table:
+            key = f"{schema}.{table}"
+            counts[key] = parse_int(row.get('row_count'))
+    return counts
+
+def build_bucket_map(rows):
+    buckets = {}
+    for row in rows:
+        name = row.get('name')
+        if name:
+            buckets[name] = row
+    return buckets
+
+def build_bucket_objects(rows):
+    objs = defaultdict(dict)
+    for row in rows:
+        bucket = row.get('bucket_name')
+        name = row.get('object_name')
+        if bucket and name:
+            objs[bucket][name] = row
+    return objs
+
+def load_function_files(base_dir):
+    files = {}
+    if not base_dir:
+        return files
+    base = Path(base_dir)
+    if not base.exists():
+        return files
+    for path in base.rglob('*'):
+        if path.is_file():
+            rel = str(path.relative_to(base)).replace('\\', '/')
+            try:
+                content = path.read_text(encoding='utf-8')
+            except UnicodeDecodeError:
+                content = path.read_text(encoding='utf-8', errors='replace')
+            files[rel] = content.replace('\r\n', '\n')
+    return files
+
+source_env = env('MP_SOURCE_ENV', 'source')
+target_env = env('MP_TARGET_ENV', 'target')
+source_ref = env('MP_SOURCE_REF', '')
+target_ref = env('MP_TARGET_REF', '')
+html_file = env('MP_HTML_FILE')
+diff_json_file = env('MP_DIFF_JSON')
+
+source_columns = load_json_list(env('MP_SOURCE_COLUMNS_JSON'))
+target_columns = load_json_list(env('MP_TARGET_COLUMNS_JSON'))
+source_indexes = load_json_list(env('MP_SOURCE_INDEXES_JSON'))
+target_indexes = load_json_list(env('MP_TARGET_INDEXES_JSON'))
+source_triggers = load_json_list(env('MP_SOURCE_TRIGGERS_JSON'))
+target_triggers = load_json_list(env('MP_TARGET_TRIGGERS_JSON'))
+source_policies = load_json_list(env('MP_SOURCE_POLICIES_JSON'))
+target_policies = load_json_list(env('MP_TARGET_POLICIES_JSON'))
+source_functions = load_json_list(env('MP_SOURCE_FUNCTIONS_JSON'))
+target_functions = load_json_list(env('MP_TARGET_FUNCTIONS_JSON'))
+source_views = load_json_list(env('MP_SOURCE_VIEWS_JSON'))
+target_views = load_json_list(env('MP_TARGET_VIEWS_JSON'))
+source_rowcounts = load_json_list(env('MP_SOURCE_ROWCOUNTS_JSON'))
+target_rowcounts = load_json_list(env('MP_TARGET_ROWCOUNTS_JSON'))
+source_buckets = load_json_list(env('MP_SOURCE_BUCKETS_JSON'))
+target_buckets = load_json_list(env('MP_TARGET_BUCKETS_JSON'))
+source_bucket_objects = load_json_list(env('MP_SOURCE_BUCKET_OBJECTS_JSON'))
+target_bucket_objects = load_json_list(env('MP_TARGET_BUCKET_OBJECTS_JSON'))
+source_secrets_raw = load_json_list(env('MP_SOURCE_SECRETS_RAW'))
+target_secrets_raw = load_json_list(env('MP_TARGET_SECRETS_RAW'))
+source_secrets_list = load_text_list(env('MP_SOURCE_SECRETS_LIST'))
+target_secrets_list = load_text_list(env('MP_TARGET_SECRETS_LIST'))
+source_function_names = set(load_text_list(env('MP_SOURCE_FUNCTION_LIST')))
+target_function_names = set(load_text_list(env('MP_TARGET_FUNCTION_LIST')))
+
+edge_source_dir = env('MP_EDGE_SOURCE_DIR')
+edge_target_dir = env('MP_EDGE_TARGET_DIR')
+
+source_columns_map = build_columns_map(source_columns)
+target_columns_map = build_columns_map(target_columns)
+source_index_map = build_index_map(source_indexes)
+target_index_map = build_index_map(target_indexes)
+source_trigger_map = build_trigger_map(source_triggers)
+target_trigger_map = build_trigger_map(target_triggers)
+source_policy_map = build_policy_map(source_policies)
+target_policy_map = build_policy_map(target_policies)
+source_function_map = build_function_map(source_functions)
+target_function_map = build_function_map(target_functions)
+source_view_map = build_view_map(source_views)
+target_view_map = build_view_map(target_views)
+source_rowcount_map = build_rowcount_map(source_rowcounts)
+target_rowcount_map = build_rowcount_map(target_rowcounts)
+source_bucket_map = build_bucket_map(source_buckets)
+target_bucket_map = build_bucket_map(target_buckets)
+source_bucket_objects_map = build_bucket_objects(source_bucket_objects)
+target_bucket_objects_map = build_bucket_objects(target_bucket_objects)
+
+table_diffs = {}
+
+def ensure_table_entry(table_name):
+    entry = table_diffs.setdefault(table_name, {
+        'status': 'unchanged',
+        'add_columns': [],
+        'remove_columns': [],
+        'modify_columns': [],
+        'index_add': [],
+        'index_remove': [],
+        'trigger_add': [],
+        'trigger_remove': [],
+        'trigger_modify': [],
+        'row_count': None,
+        'notes': []
+    })
+    return entry
+
+actions = []
+actions_seen = set()
+
+all_tables = sorted(set(source_columns_map.keys()) | set(target_columns_map.keys()))
+
+for table in all_tables:
+    source_cols = source_columns_map.get(table)
+    target_cols = target_columns_map.get(table)
+    entry = ensure_table_entry(table)
+
+    if source_cols and not target_cols:
+        entry['status'] = 'new'
+        entry['add_columns'] = list(source_cols.values())
+        action = f"Create table {table} in {target_env} with {len(source_cols)} column(s)"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+        continue
+    if target_cols and not source_cols:
+        entry['status'] = 'removed'
+        entry['remove_columns'] = list(target_cols.values())
+        action = f"Review table {table} in {target_env}; not present in {source_env}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+        continue
+    if not source_cols or not target_cols:
+        continue
+
+    for column, scol in source_cols.items():
+        tcol = target_cols.get(column)
+        if not tcol:
+            entry['add_columns'].append(scol)
+            action = f"Add column {table}.{column} ({describe_column(scol)}) to match {source_env}"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+            continue
+        changes = []
+        for field, label in [
+            ('data_type', 'type'),
+            ('character_maximum_length', 'length'),
+            ('numeric_precision', 'precision'),
+            ('numeric_scale', 'scale'),
+            ('is_nullable', 'nullability'),
+            ('column_default', 'default'),
+            ('is_identity', 'identity'),
+            ('identity_generation', 'identity generation'),
+            ('generation_expression', 'generation expression')
+        ]:
+            sval = (scol.get(field) or '').strip() if isinstance(scol.get(field), str) else scol.get(field)
+            tval = (tcol.get(field) or '').strip() if isinstance(tcol.get(field), str) else tcol.get(field)
+            if sval != tval:
+                changes.append(f"{label}: {tval or 'NULL'} → {sval or 'NULL'}")
+        if changes:
+            entry['modify_columns'].append({'column': column, 'source': scol, 'target': tcol, 'changes': changes})
+            action = f"Alter column {table}.{column} ({'; '.join(changes)})"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+
+    for column, tcol in target_cols.items():
+        if column not in source_cols:
+            entry['remove_columns'].append(tcol)
+            action = f"Consider removing column {table}.{column} from {target_env} (absent in {source_env})"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+
+    source_indexes_for_table = source_index_map.get(table, {})
+    target_indexes_for_table = target_index_map.get(table, {})
+    for idx, idef in source_indexes_for_table.items():
+        tdef = target_indexes_for_table.get(idx)
+        if not tdef:
+            entry['index_add'].append({'name': idx, 'definition': idef})
+            action = f"Create index {idx} on {table}"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+        elif tdef.strip() != idef.strip():
+            entry['index_remove'].append({'name': idx, 'definition': tdef})
+            entry['index_add'].append({'name': idx, 'definition': idef, 'reason': 'definition differs'})
+            action = f"Recreate index {idx} on {table} to match definition in {source_env}"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+    for idx, tdef in target_indexes_for_table.items():
+        if idx not in source_indexes_for_table:
+            entry['index_remove'].append({'name': idx, 'definition': tdef})
+            action = f"Consider dropping index {idx} on {table} (not in {source_env})"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+
+    source_triggers_for_table = source_trigger_map.get(table, {})
+    target_triggers_for_table = target_trigger_map.get(table, {})
+    for trig, tdef in source_triggers_for_table.items():
+        other = target_triggers_for_table.get(trig)
+        if other is None:
+            entry['trigger_add'].append({'name': trig, 'definition': tdef})
+            action = f"Create trigger {trig} on {table}"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+        elif (other or '').strip() != (tdef or '').strip():
+            entry['trigger_modify'].append({'name': trig, 'source': tdef, 'target': other})
+            action = f"Alter trigger {trig} on {table}"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+    for trig, tdef in target_triggers_for_table.items():
+        if trig not in source_triggers_for_table:
+            entry['trigger_remove'].append({'name': trig, 'definition': tdef})
+            action = f"Review trigger {trig} on {table} (not in {source_env})"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+
+    source_count = source_rowcount_map.get(table)
+    target_count = target_rowcount_map.get(table)
+    if source_count is not None or target_count is not None:
+        diff = (source_count or 0) - (target_count or 0)
+        if diff != 0:
+            entry['row_count'] = {'source': source_count or 0, 'target': target_count or 0, 'diff': diff}
+
+policy_diffs = []
+for key in sorted(set(source_policy_map.keys()) | set(target_policy_map.keys())):
+    source_policy = source_policy_map.get(key)
+    target_policy = target_policy_map.get(key)
+    if source_policy and not target_policy:
+        policy_diffs.append({'type': 'add', 'policy': source_policy})
+        action = f"Create RLS policy {key}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    elif target_policy and not source_policy:
+        policy_diffs.append({'type': 'remove', 'policy': target_policy})
+        action = f"Review/removal RLS policy {key} in {target_env}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    elif source_policy and target_policy:
+        comparison_fields = ['permissive', 'roles', 'cmd', 'qual', 'with_check']
+        changes = []
+        for field in comparison_fields:
+            sval = source_policy.get(field)
+            tval = target_policy.get(field)
+            if sval != tval:
+                changes.append(f"{field}: {tval or 'NULL'} → {sval or 'NULL'}")
+        if changes:
+            policy_diffs.append({'type': 'modify', 'policy': source_policy, 'changes': changes})
+            action = f"Alter RLS policy {key}: {'; '.join(changes)}"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+
+function_diffs = []
+for key in sorted(set(source_function_map.keys()) | set(target_function_map.keys())):
+    src = source_function_map.get(key)
+    tgt = target_function_map.get(key)
+    if src and not tgt:
+        function_diffs.append({'type': 'add', 'function': src})
+        action = f"Create database function {key}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    elif tgt and not src:
+        function_diffs.append({'type': 'remove', 'function': tgt})
+        action = f"Review database function {key} in {target_env}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    elif src and tgt:
+        src_def = (src.get('definition') or '').strip()
+        tgt_def = (tgt.get('definition') or '').strip()
+        if src_def != tgt_def:
+            diff_lines = list(difflib.unified_diff(
+                (tgt_def + '\n').splitlines(),
+                (src_def + '\n').splitlines(),
+                fromfile=f"{target_env}:{key}",
+                tofile=f"{source_env}:{key}",
+                lineterm=''
+            ))
+            function_diffs.append({'type': 'modify', 'function': src, 'diff': diff_lines})
+            action = f"Update database function {key}"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+
+view_diffs = []
+for key in sorted(set(source_view_map.keys()) | set(target_view_map.keys())):
+    src = source_view_map.get(key)
+    tgt = target_view_map.get(key)
+    if src and not tgt:
+        view_diffs.append({'type': 'add', 'view': src})
+        action = f"Create view {key}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    elif tgt and not src:
+        view_diffs.append({'type': 'remove', 'view': tgt})
+        action = f"Review view {key} in {target_env}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    elif src and tgt:
+        src_def = (src.get('view_definition') or '').strip()
+        tgt_def = (tgt.get('view_definition') or '').strip()
+        if src_def != tgt_def:
+            diff_lines = list(difflib.unified_diff(
+                (tgt_def + '\n').splitlines(),
+                (src_def + '\n').splitlines(),
+                fromfile=f"{target_env}:{key}",
+                tofile=f"{source_env}:{key}",
+                lineterm=''
+            ))
+            view_diffs.append({'type': 'modify', 'view': src, 'diff': diff_lines})
+            action = f"Update view {key} definition"
+            if action not in actions_seen:
+                actions.append(action)
+                actions_seen.add(action)
+
+bucket_diffs = []
+for bucket in sorted(set(source_bucket_map.keys()) | set(target_bucket_map.keys())):
+    src_meta = source_bucket_map.get(bucket)
+    tgt_meta = target_bucket_map.get(bucket)
+    entry = {'bucket': bucket, 'type': None, 'metadata_changes': [], 'missing_files': [], 'new_files': [], 'changed_files': []}
+    if src_meta and not tgt_meta:
+        entry['type'] = 'add'
+        bucket_diffs.append(entry)
+        action = f"Create storage bucket '{bucket}'"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    elif tgt_meta and not src_meta:
+        entry['type'] = 'remove'
+        bucket_diffs.append(entry)
+        action = f"Review storage bucket '{bucket}' in {target_env} (not in {source_env})"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+    else:
+        meta_fields = ['public', 'file_size_limit', 'allowed_mime_types']
+        for field in meta_fields:
+            sval = src_meta.get(field)
+            tval = tgt_meta.get(field)
+            if sval != tval:
+                entry['metadata_changes'].append({'field': field, 'source': sval, 'target': tval})
+        src_files = source_bucket_objects_map.get(bucket, {})
+        tgt_files = target_bucket_objects_map.get(bucket, {})
+        src_names = set(src_files.keys())
+        tgt_names = set(tgt_files.keys())
+        new_files = sorted(src_names - tgt_names)
+        missing_files = sorted(tgt_names - src_names)
+        changed_files = []
+        for name in sorted(src_names & tgt_names):
+            src_obj = src_files.get(name) or {}
+            tgt_obj = tgt_files.get(name) or {}
+            src_size = parse_int(src_obj.get('size_bytes'))
+            tgt_size = parse_int(tgt_obj.get('size_bytes'))
+            if src_size != tgt_size:
+                changed_files.append({'name': name, 'source_size': src_size, 'target_size': tgt_size})
+        entry['new_files'] = new_files
+        entry['missing_files'] = missing_files
+        entry['changed_files'] = changed_files
+        if entry['metadata_changes'] or new_files or missing_files or changed_files:
+            entry['type'] = 'modify'
+            bucket_diffs.append(entry)
+            if entry['metadata_changes']:
+                action = f"Update bucket '{bucket}' configuration"
+                if action not in actions_seen:
+                    actions.append(action)
+                    actions_seen.add(action)
+            if new_files:
+                action = f"Upload {len(new_files)} file(s) to bucket '{bucket}'"
+                if action not in actions_seen:
+                    actions.append(action)
+                    actions_seen.add(action)
+            if missing_files:
+                action = f"Remove or archive {len(missing_files)} obsolete file(s) from bucket '{bucket}'"
+                if action not in actions_seen:
+                    actions.append(action)
+                    actions_seen.add(action)
+            if changed_files:
+                action = f"Update {len(changed_files)} changed file(s) in bucket '{bucket}'"
+                if action not in actions_seen:
+                    actions.append(action)
+                    actions_seen.add(action)
+
+edge_diffs = []
+
+source_edge_files = {}
+target_edge_files = {}
+edge_source_path = Path(edge_source_dir) if edge_source_dir else None
+edge_target_path = Path(edge_target_dir) if edge_target_dir else None
+
+if edge_source_path and edge_source_path.exists():
+    for child in edge_source_path.iterdir():
+        if child.is_dir():
+            source_edge_files[child.name] = load_function_files(child)
+if edge_target_path and edge_target_path.exists():
+    for child in edge_target_path.iterdir():
+        if child.is_dir():
+            target_edge_files[child.name] = load_function_files(child)
+
+edge_function_names = sorted(set(source_function_names) | set(target_function_names) | set(source_edge_files.keys()) | set(target_edge_files.keys()))
+
+for func in edge_function_names:
+    src_has = func in source_function_names or func in source_edge_files
+    tgt_has = func in target_function_names or func in target_edge_files
+    entry = {'function': func, 'type': None, 'diff': []}
+    if src_has and not tgt_has:
+        entry['type'] = 'add'
+        edge_diffs.append(entry)
+        action = f"Deploy edge function '{func}' to {target_env}"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+        continue
+    if tgt_has and not src_has:
+        entry['type'] = 'remove'
+        edge_diffs.append(entry)
+        action = f"Review edge function '{func}' in {target_env} (not in {source_env})"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+        continue
+    src_files = source_edge_files.get(func, {})
+    tgt_files = target_edge_files.get(func, {})
+    if not src_files and not tgt_files:
+        continue
+    diff_lines = []
+    for path in sorted(set(src_files.keys()) | set(tgt_files.keys())):
+        s = src_files.get(path, '')
+        t = tgt_files.get(path, '')
+        if s != t:
+            diff_lines.extend(difflib.unified_diff(
+                (t + '\n').splitlines(),
+                (s + '\n').splitlines(),
+                fromfile=f"{target_env}:{func}/{path}",
+                tofile=f"{source_env}:{func}/{path}",
+                lineterm=''
+            ))
+    if diff_lines:
+        entry['type'] = 'modify'
+        entry['diff'] = diff_lines
+        edge_diffs.append(entry)
+        action = f"Redeploy edge function '{func}'"
+        if action not in actions_seen:
+            actions.append(action)
+            actions_seen.add(action)
+
+source_secret_names = {item.get('name') for item in source_secrets_raw if isinstance(item, dict) and item.get('name')}
+target_secret_names = {item.get('name') for item in target_secrets_raw if isinstance(item, dict) and item.get('name')}
+if source_secrets_list:
+    source_secret_names.update(source_secrets_list)
+if target_secrets_list:
+    target_secret_names.update(target_secrets_list)
+
+secret_add = sorted(source_secret_names - target_secret_names)
+secret_remove = sorted(target_secret_names - source_secret_names)
+
+if secret_add:
+    action = f"Create {len(secret_add)} new secret key(s)"
+    if action not in actions_seen:
+        actions.append(action)
+        actions_seen.add(action)
+if secret_remove:
+    action = f"Review {len(secret_remove)} secret key(s) present only in {target_env}"
+    if action not in actions_seen:
+        actions.append(action)
+        actions_seen.add(action)
+
+actions_sorted = actions
+
+summary = {
+    'tables_new': sum(1 for entry in table_diffs.values() if entry['status'] == 'new'),
+    'tables_removed': sum(1 for entry in table_diffs.values() if entry['status'] == 'removed'),
+    'tables_modified': sum(1 for entry in table_diffs.values() if entry['status'] == 'unchanged' and (entry['add_columns'] or entry['remove_columns'] or entry['modify_columns'] or entry['index_add'] or entry['index_remove'] or entry['trigger_add'] or entry['trigger_remove'] or entry['trigger_modify'])),
+    'cols_added': sum(len(entry['add_columns']) for entry in table_diffs.values()),
+    'cols_removed': sum(len(entry['remove_columns']) for entry in table_diffs.values()),
+    'cols_modified': sum(len(entry['modify_columns']) for entry in table_diffs.values()),
+    'policies_add': sum(1 for diff in policy_diffs if diff['type'] == 'add'),
+    'policies_remove': sum(1 for diff in policy_diffs if diff['type'] == 'remove'),
+    'policies_modify': sum(1 for diff in policy_diffs if diff['type'] == 'modify'),
+    'functions_add': sum(1 for diff in function_diffs if diff['type'] == 'add'),
+    'functions_remove': sum(1 for diff in function_diffs if diff['type'] == 'remove'),
+    'functions_modify': sum(1 for diff in function_diffs if diff['type'] == 'modify'),
+    'views_add': sum(1 for diff in view_diffs if diff['type'] == 'add'),
+    'views_remove': sum(1 for diff in view_diffs if diff['type'] == 'remove'),
+    'views_modify': sum(1 for diff in view_diffs if diff['type'] == 'modify'),
+    'buckets_changed': len(bucket_diffs),
+    'edge_add': sum(1 for diff in edge_diffs if diff['type'] == 'add'),
+    'edge_remove': sum(1 for diff in edge_diffs if diff['type'] == 'remove'),
+    'edge_modify': sum(1 for diff in edge_diffs if diff['type'] == 'modify'),
+    'secrets_add': len(secret_add),
+    'secrets_remove': len(secret_remove),
+    'actions': len(actions_sorted)
 }
 
-# Helper function to get file contents as array
-get_file_contents() {
-    local file=$1
-    if [ -f "$file" ] && [ -s "$file" ]; then
-        cat "$file"
-    else
-        echo ""
-    fi
+timestamp_utc = datetime.now(timezone.utc)
+timestamp_display = timestamp_utc.strftime('%Y-%m-%d %H:%M:%S UTC')
+
+css = """
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    background: #f1f5f9;
+    color: #0f172a;
+    line-height: 1.6;
+    padding: 32px;
 }
-
-# Generate HTML report
-cat > "$HTML_FILE" << 'HTML_EOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Migration Plan: SOURCE_ENV to TARGET_ENV</title>
-    <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: #f5f5f5;
-            color: #333;
-            line-height: 1.6;
-            padding: 20px;
-        }
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-        header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-        header h1 {
-            font-size: 2em;
-            margin-bottom: 10px;
-        }
-        header .meta {
-            opacity: 0.9;
-            font-size: 0.9em;
-        }
-        .content {
-            padding: 30px;
-        }
-        .section {
-            margin-bottom: 40px;
-        }
-        .section h2 {
-            color: #667eea;
-            border-bottom: 2px solid #667eea;
-            padding-bottom: 10px;
-            margin-bottom: 20px;
-        }
-        .section h3 {
-            color: #764ba2;
-            margin-top: 20px;
-            margin-bottom: 15px;
-        }
-        .comparison-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .comparison-card {
-            border: 1px solid #ddd;
-            border-radius: 6px;
-            padding: 20px;
-            background: #fafafa;
-        }
-        .comparison-card h4 {
-            color: #667eea;
-            margin-bottom: 15px;
-            font-size: 1.1em;
-        }
-        .stat {
-            display: flex;
-            justify-content: space-between;
-            padding: 8px 0;
-            border-bottom: 1px solid #eee;
-        }
-        .stat:last-child {
-            border-bottom: none;
-        }
-        .stat-label {
-            font-weight: 500;
-        }
-        .stat-value {
-            font-weight: bold;
-            color: #667eea;
-        }
-        .diff-section {
-            margin-top: 30px;
-        }
-        .diff-item {
-            padding: 15px;
-            margin: 10px 0;
-            border-radius: 6px;
-            border-left: 4px solid;
-        }
-        .diff-item.added {
-            background: #e8f5e9;
-            border-color: #4caf50;
-        }
-        .diff-item.removed {
-            background: #ffebee;
-            border-color: #f44336;
-        }
-        .diff-item.modified {
-            background: #fff3e0;
-            border-color: #ff9800;
-        }
-        .diff-item-header {
-            font-weight: bold;
-            margin-bottom: 8px;
-        }
-        .diff-item-content {
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-            background: white;
-            padding: 10px;
-            border-radius: 4px;
-            margin-top: 5px;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-        }
-        th, td {
-            padding: 12px;
-            text-align: left;
-            border-bottom: 1px solid #ddd;
-        }
-        th {
-            background: #f5f5f5;
-            font-weight: 600;
-            color: #667eea;
-        }
-        tr:hover {
-            background: #f9f9f9;
-        }
-        .badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 0.85em;
-            font-weight: 500;
-        }
-        .badge-success {
-            background: #4caf50;
-            color: white;
-        }
-        .badge-warning {
-            background: #ff9800;
-            color: white;
-        }
-        .badge-danger {
-            background: #f44336;
-            color: white;
-        }
-        .badge-info {
-            background: #2196f3;
-            color: white;
-        }
-        .summary-stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        .summary-stat {
-            text-align: center;
-            padding: 20px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            border-radius: 8px;
-        }
-        .summary-stat-value {
-            font-size: 2.5em;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }
-        .summary-stat-label {
-            font-size: 0.9em;
-            opacity: 0.9;
-        }
-        .timestamp {
-            text-align: center;
-            color: #666;
-            font-size: 0.9em;
-            margin-top: 20px;
-            padding-top: 20px;
-            border-top: 1px solid #ddd;
-        }
-        .details {
-            background: #f9f9f9;
-            border-left: 4px solid #667eea;
-            padding: 20px;
-            border-radius: 4px;
-            margin-top: 20px;
-        }
-        .details-item {
-            padding: 10px 0;
-            border-bottom: 1px solid #eee;
-        }
-        .details-item:last-child {
-            border-bottom: none;
-        }
-        .details-item-content {
-            color: #666;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-            background: white;
-            padding: 10px;
-            border-radius: 4px;
-            margin-top: 5px;
-        }
-        .details-item-content ul {
-            margin: 10px 0;
-            padding-left: 20px;
-        }
-        .details-item-content li {
-            margin: 5px 0;
-            padding: 5px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header>
-            <h1>🔄 Migration Plan Report</h1>
-            <div class="meta">
-                <strong>SOURCE_ENV</strong> → <strong>TARGET_ENV</strong><br>
-                Generated: TIMESTAMP
-            </div>
-        </header>
-        <div class="content">
-HTML_EOF
-
-# Replace placeholders in HTML
-sed -i.bak "s/SOURCE_ENV/$SOURCE_ENV/g; s/TARGET_ENV/$TARGET_ENV/g; s/TIMESTAMP/$(date)/g" "$HTML_FILE"
-rm -f "$HTML_FILE.bak"
-
-# Add summary statistics
-cat >> "$HTML_FILE" << HTML_INNER_EOF
-            <div class="section">
-                <h2>📊 Executive Summary</h2>
-                <div class="summary-stats">
-                    <div class="summary-stat">
-                        <div class="summary-stat-value">$(count_items "$SOURCE_INFO.tables")</div>
-                        <div class="summary-stat-label">Source Tables</div>
-                    </div>
-                    <div class="summary-stat">
-                        <div class="summary-stat-value">$(count_items "$TARGET_INFO.tables")</div>
-                        <div class="summary-stat-label">Target Tables</div>
-                    </div>
-                    <div class="summary-stat">
-                        <div class="summary-stat-value">$(count_items "$SOURCE_INFO.buckets")</div>
-                        <div class="summary-stat-label">Source Buckets</div>
-                    </div>
-                    <div class="summary-stat">
-                        <div class="summary-stat-value">$(count_items "$TARGET_INFO.buckets")</div>
-                        <div class="summary-stat-label">Target Buckets                        </div>
-                    </div>
-                </div>
-            </div>
-
-HTML_INNER_EOF
-
-# Compare tables for differences section
-SOURCE_TABLES=$(get_file_contents "$SOURCE_INFO.tables")
-TARGET_TABLES=$(get_file_contents "$TARGET_INFO.tables")
-
-ADDED_TABLES=""
-REMOVED_TABLES=""
-COMMON_TABLES=""
-
-while IFS= read -r table; do
-    [ -z "$table" ] && continue
-    if echo "$TARGET_TABLES" | grep -q "^${table}$"; then
-        COMMON_TABLES="${COMMON_TABLES}${table}\n"
-    else
-        ADDED_TABLES="${ADDED_TABLES}${table}\n"
-    fi
-done <<< "$SOURCE_TABLES"
-
-while IFS= read -r table; do
-    [ -z "$table" ] && continue
-    if ! echo "$SOURCE_TABLES" | grep -q "^${table}$"; then
-        REMOVED_TABLES="${REMOVED_TABLES}${table}\n"
-    fi
-done <<< "$TARGET_TABLES"
-
-cat >> "$HTML_FILE" << HTML_DB_SCHEMA_EOF
-            <div class="section">
-                <h2>🗄️ Database Schema Comparison</h2>
-                <div class="comparison-grid">
-                    <div class="comparison-card">
-                        <h4>Source ($SOURCE_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Tables</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.tables")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Views</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.views")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Functions</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.db_functions")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Triggers</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.triggers")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Sequences</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.sequences")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">RLS Policies</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.policies")</span>
-                        </div>
-                    </div>
-                    <div class="comparison-card">
-                        <h4>Target ($TARGET_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Tables</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.tables")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Views</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.views")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Functions</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.db_functions")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Triggers</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.triggers")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Sequences</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.sequences")</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">RLS Policies</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.policies")</span>
-                        </div>
-                </div>
-            </div>
-HTML_DB_SCHEMA_EOF
-
-# Compare tables
-SOURCE_TABLES=$(get_file_contents "$SOURCE_INFO.tables")
-TARGET_TABLES=$(get_file_contents "$TARGET_INFO.tables")
-
-ADDED_TABLES=""
-REMOVED_TABLES=""
-COMMON_TABLES=""
-
-while IFS= read -r table; do
-    [ -z "$table" ] && continue
-    if echo "$TARGET_TABLES" | grep -q "^${table}$"; then
-        COMMON_TABLES="${COMMON_TABLES}${table}\n"
-    else
-        ADDED_TABLES="${ADDED_TABLES}${table}\n"
-    fi
-done <<< "$SOURCE_TABLES"
-
-while IFS= read -r table; do
-    [ -z "$table" ] && continue
-    if ! echo "$SOURCE_TABLES" | grep -q "^${table}$"; then
-        REMOVED_TABLES="${REMOVED_TABLES}${table}\n"
-    fi
-done <<< "$TARGET_TABLES"
-
-cat >> "$HTML_FILE" << HTML_DIFF_EOF
-                <div class="diff-section">
-                    <h3>Tables Differences</h3>
-HTML_DIFF_EOF
-
-if [ -n "$ADDED_TABLES" ]; then
-    echo "<div class='diff-item added'><div class='diff-item-header'>➕ Tables to Add ($(echo -e "$ADDED_TABLES" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'>$(echo -e "$ADDED_TABLES" | grep -v '^$' | sed 's/^/  /')</div></div>" >> "$HTML_FILE"
-fi
-
-if [ -n "$REMOVED_TABLES" ]; then
-    echo "<div class='diff-item removed'><div class='diff-item-header'>➖ Tables in Target Not in Source ($(echo -e "$REMOVED_TABLES" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'>$(echo -e "$REMOVED_TABLES" | grep -v '^$' | sed 's/^/  /')</div></div>" >> "$HTML_FILE"
-fi
-
-if [ -z "$ADDED_TABLES" ] && [ -z "$REMOVED_TABLES" ]; then
-    echo "<div class='diff-item added'><div class='diff-item-header'>✅ All tables match</div></div>" >> "$HTML_FILE"
-fi
-
-# Add table row counts comparison
-cat >> "$HTML_FILE" << HTML_ROWS_EOF
-                    <h3>Table Row Counts</h3>
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Table</th>
-                                <th>Source Rows</th>
-                                <th>Target Rows</th>
-                                <th>Difference</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-HTML_ROWS_EOF
-
-# Process row counts (using grep instead of associative arrays for bash 3.x compatibility)
-# Get all unique table names
-ALL_TABLES=$(printf "%s\n%s\n" "$SOURCE_TABLES" "$TARGET_TABLES" | sort -u)
-
-while IFS= read -r table; do
-    [ -z "$table" ] && continue
-    
-    # Initialize variables with default values (required for set -u)
-    source_count="0"
-    target_count="0"
-    diff=0
-    diff_class="badge-success"
-    diff_text="0"
-    grep_result=""
-    
-    # Get source count using grep with proper error handling
-    if [ -f "$SOURCE_INFO.row_counts" ]; then
-        grep_result=$(grep "^${table}|" "$SOURCE_INFO.row_counts" 2>/dev/null | cut -d'|' -f2 | head -1 || echo "")
-        if [ -n "$grep_result" ]; then
-            source_count=$(echo "$grep_result" | tr -d '[:space:]')
-            [ -z "$source_count" ] && source_count="0"
-        fi
-    fi
-    
-    # Reset grep_result for target
-    grep_result=""
-    
-    # Get target count using grep with proper error handling
-    if [ -f "$TARGET_INFO.row_counts" ]; then
-        grep_result=$(grep "^${table}|" "$TARGET_INFO.row_counts" 2>/dev/null | cut -d'|' -f2 | head -1 || echo "")
-        if [ -n "$grep_result" ]; then
-            target_count=$(echo "$grep_result" | tr -d '[:space:]')
-            [ -z "$target_count" ] && target_count="0"
-        fi
-    fi
-    
-    # Ensure variables are set (defensive programming)
-    source_count="${source_count:-0}"
-    target_count="${target_count:-0}"
-    
-    # Try to calculate difference, default to 0 if arithmetic fails
-    if expr "${source_count}" + 0 >/dev/null 2>&1 && expr "${target_count}" + 0 >/dev/null 2>&1; then
-        diff=$((source_count - target_count)) 2>/dev/null || diff=0
-    else
-        diff=0
-    fi
-    
-    if [ "$diff" -gt 0 ]; then
-        diff_class="badge-warning"
-        diff_text="+$diff"
-    elif [ "$diff" -lt 0 ]; then
-        diff_class="badge-danger"
-        diff_text="$diff"
-    else
-        diff_class="badge-success"
-        diff_text="0"
-    fi
-    
-    echo "<tr><td>$table</td><td>$source_count</td><td>$target_count</td><td><span class='badge $diff_class'>$diff_text</span></td></tr>" >> "$HTML_FILE"
-done <<< "$ALL_TABLES"
-
-cat >> "$HTML_FILE" << HTML_ROWS_END
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-HTML_ROWS_END
-
-# RLS Policies Comparison
-SOURCE_POLICIES=$(get_file_contents "$SOURCE_INFO.policies")
-TARGET_POLICIES=$(get_file_contents "$TARGET_INFO.policies")
-
-ADDED_POLICIES=""
-REMOVED_POLICIES=""
-COMMON_POLICIES=""
-
-# Find added policies (in source but not in target)
-while IFS= read -r policy; do
-    [ -z "$policy" ] && continue
-    if ! echo "$TARGET_POLICIES" | grep -q "^${policy}$"; then
-        ADDED_POLICIES="${ADDED_POLICIES}${policy}\n"
-    else
-        COMMON_POLICIES="${COMMON_POLICIES}${policy}\n"
-    fi
-done <<< "$SOURCE_POLICIES"
-
-# Find removed policies (in target but not in source)
-while IFS= read -r policy; do
-    [ -z "$policy" ] && continue
-    if ! echo "$SOURCE_POLICIES" | grep -q "^${policy}$"; then
-        REMOVED_POLICIES="${REMOVED_POLICIES}${policy}\n"
-    fi
-done <<< "$TARGET_POLICIES"
-
-cat >> "$HTML_FILE" << HTML_POLICIES_EOF
-            <div class="section">
-                <h2>🔒 RLS Policies Comparison</h2>
-                <div class="comparison-grid">
-                    <div class="comparison-card">
-                        <h4>Source ($SOURCE_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Total Policies</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.policies")</span>
-                        </div>
-                    </div>
-                    <div class="comparison-card">
-                        <h4>Target ($TARGET_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Total Policies</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.policies")</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="diff-section">
-                    <h3>RLS Policies Differences</h3>
-HTML_POLICIES_EOF
-
-if [ -n "$ADDED_POLICIES" ]; then
-    echo "<div class='diff-item added'><div class='diff-item-header'>➕ Policies to Add ($(echo -e "$ADDED_POLICIES" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'><ul>$(echo -e "$ADDED_POLICIES" | grep -v '^$' | sed 's/^/<li>/; s/$/<\/li>/')</ul></div></div>" >> "$HTML_FILE"
-fi
-
-if [ -n "$REMOVED_POLICIES" ]; then
-    echo "<div class='diff-item removed'><div class='diff-item-header'>➖ Policies in Target Not in Source ($(echo -e "$REMOVED_POLICIES" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'><ul>$(echo -e "$REMOVED_POLICIES" | grep -v '^$' | sed 's/^/<li>/; s/$/<\/li>/')</ul></div></div>" >> "$HTML_FILE"
-fi
-
-if [ -z "$ADDED_POLICIES" ] && [ -z "$REMOVED_POLICIES" ]; then
-    echo "<div class='diff-item added'><div class='diff-item-header'>✅ All RLS policies match</div></div>" >> "$HTML_FILE"
-fi
-
-cat >> "$HTML_FILE" << HTML_POLICIES_LIST_EOF
-                    <h3>Source RLS Policies List</h3>
-                    <div class="details">
-                        <div class="details-item">
-                            <div class="details-item-content">
-HTML_POLICIES_LIST_EOF
-
-if [ -n "$SOURCE_POLICIES" ]; then
-    echo "<ul>" >> "$HTML_FILE"
-    while IFS= read -r policy; do
-        [ -z "$policy" ] && continue
-        echo "<li>$policy</li>" >> "$HTML_FILE"
-    done <<< "$SOURCE_POLICIES"
-    echo "</ul>" >> "$HTML_FILE"
-else
-    echo "<p>No RLS policies found in source</p>" >> "$HTML_FILE"
-fi
-
-cat >> "$HTML_FILE" << HTML_POLICIES_LIST_END
-                            </div>
-                        </div>
-                    </div>
-                    
-                    <h3>Target RLS Policies List</h3>
-                    <div class="details">
-                        <div class="details-item">
-                            <div class="details-item-content">
-HTML_POLICIES_LIST_END
-
-if [ -n "$TARGET_POLICIES" ]; then
-    echo "<ul>" >> "$HTML_FILE"
-    while IFS= read -r policy; do
-        [ -z "$policy" ] && continue
-        echo "<li>$policy</li>" >> "$HTML_FILE"
-    done <<< "$TARGET_POLICIES"
-    echo "</ul>" >> "$HTML_FILE"
-else
-    echo "<p>No RLS policies found in target</p>" >> "$HTML_FILE"
-fi
-
-cat >> "$HTML_FILE" << HTML_POLICIES_END
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-HTML_POLICIES_END
-
-# Storage Buckets Comparison
-cat >> "$HTML_FILE" << HTML_STORAGE_EOF
-            <div class="section">
-                <h2>📦 Storage Buckets Comparison</h2>
-                <div class="comparison-grid">
-                    <div class="comparison-card">
-                        <h4>Source ($SOURCE_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Total Buckets</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.buckets")</span>
-                        </div>
-                    </div>
-                    <div class="comparison-card">
-                        <h4>Target ($TARGET_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Total Buckets</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.buckets")</span>
-                        </div>
-                    </div>
-                </div>
-                <h3>Bucket Details</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Bucket Name</th>
-                            <th>Source Files</th>
-                            <th>Target Files</th>
-                            <th>Public</th>
-                            <th>Status</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-HTML_STORAGE_EOF
-
-# Process buckets (using grep instead of associative arrays for bash 3.x compatibility)
-# Get all unique bucket names
-ALL_BUCKETS=$(printf "%s\n%s\n" "$(get_file_contents "$SOURCE_INFO.buckets" | cut -d'|' -f1)" "$(get_file_contents "$TARGET_INFO.buckets" | cut -d'|' -f1)" | sort -u)
-
-while IFS= read -r bucket_name; do
-    [ -z "$bucket_name" ] && continue
-    
-    # Check if bucket exists in source
-    source_bucket_line=$(grep "^${bucket_name}|" "$SOURCE_INFO.buckets" 2>/dev/null | head -1 || echo "")
-    source_exists=false
-    if [ -n "$source_bucket_line" ]; then
-        source_exists=true
-        source_files=$(echo "$source_bucket_line" | cut -d'|' -f5)
-        source_public=$(echo "$source_bucket_line" | cut -d'|' -f2)
-    else
-        source_files="0"
-        source_public=""
-    fi
-    
-    # Check if bucket exists in target
-    target_bucket_line=$(grep "^${bucket_name}|" "$TARGET_INFO.buckets" 2>/dev/null | head -1 || echo "")
-    target_exists=false
-    if [ -n "$target_bucket_line" ]; then
-        target_exists=true
-        target_files=$(echo "$target_bucket_line" | cut -d'|' -f5)
-    else
-        target_files="0"
-    fi
-    
-    # Determine status
-    if [ "$source_exists" = "true" ] && [ "$target_exists" = "true" ]; then
-        status="<span class='badge badge-success'>Exists</span>"
-        if [ "$source_files" != "$target_files" ]; then
-            status="<span class='badge badge-warning'>File Count Diff</span>"
-        fi
-    elif [ "$source_exists" = "true" ]; then
-        status="<span class='badge badge-info'>Needs Migration</span>"
-    else
-        status="<span class='badge badge-danger'>Not in Source</span>"
-    fi
-    
-    # Determine public status
-    public_status=""
-    if [ "$source_exists" = "true" ]; then
-        if [ "$source_public" = "true" ]; then
-            public_status="<span class='badge badge-success'>Public</span>"
-        else
-            public_status="<span class='badge'>Private</span>"
-        fi
-    fi
-    
-    echo "<tr><td>$bucket_name</td><td>$source_files</td><td>$target_files</td><td>$public_status</td><td>$status</td></tr>" >> "$HTML_FILE"
-done <<< "$ALL_BUCKETS"
-
-cat >> "$HTML_FILE" << HTML_STORAGE_END
-                    </tbody>
-                </table>
-                
-                <h3>Source Buckets List</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Bucket Name</th>
-                            <th>Public</th>
-                            <th>File Count</th>
-                            <th>File Size Limit</th>
-                            <th>Allowed MIME Types</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-HTML_STORAGE_END
-
-# List all source buckets
-if [ -f "$SOURCE_INFO.buckets" ] && [ -s "$SOURCE_INFO.buckets" ]; then
-    while IFS='|' read -r name public size_limit mime_types file_count; do
-        [ -z "$name" ] && continue
-        
-        if [ "$public" = "true" ]; then
-            public_badge="<span class='badge badge-success'>Public</span>"
-        else
-            public_badge="<span class='badge'>Private</span>"
-        fi
-        
-        size_limit_display="$size_limit"
-        [ "$size_limit" = "NULL" ] && size_limit_display="No limit"
-        
-        mime_display="$mime_types"
-        [ "$mime_types" = "NULL" ] && mime_display="All types"
-        
-        echo "<tr><td>$name</td><td>$public_badge</td><td>$file_count</td><td>$size_limit_display</td><td>$mime_display</td></tr>" >> "$HTML_FILE"
-    done < "$SOURCE_INFO.buckets"
-else
-    echo "<tr><td colspan='5'>No buckets found in source</td></tr>" >> "$HTML_FILE"
-fi
-
-cat >> "$HTML_FILE" << HTML_STORAGE_END2
-                    </tbody>
-                </table>
-                
-                <h3>Target Buckets List</h3>
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Bucket Name</th>
-                            <th>Public</th>
-                            <th>File Count</th>
-                            <th>File Size Limit</th>
-                            <th>Allowed MIME Types</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-HTML_STORAGE_END2
-
-# List all target buckets
-if [ -f "$TARGET_INFO.buckets" ] && [ -s "$TARGET_INFO.buckets" ]; then
-    while IFS='|' read -r name public size_limit mime_types file_count; do
-        [ -z "$name" ] && continue
-        
-        if [ "$public" = "true" ]; then
-            public_badge="<span class='badge badge-success'>Public</span>"
-        else
-            public_badge="<span class='badge'>Private</span>"
-        fi
-        
-        size_limit_display="$size_limit"
-        [ "$size_limit" = "NULL" ] && size_limit_display="No limit"
-        
-        mime_display="$mime_types"
-        [ "$mime_types" = "NULL" ] && mime_display="All types"
-        
-        echo "<tr><td>$name</td><td>$public_badge</td><td>$file_count</td><td>$size_limit_display</td><td>$mime_display</td></tr>" >> "$HTML_FILE"
-    done < "$TARGET_INFO.buckets"
-else
-    echo "<tr><td colspan='5'>No buckets found in target</td></tr>" >> "$HTML_FILE"
-fi
-
-cat >> "$HTML_FILE" << HTML_STORAGE_END3
-                    </tbody>
-                </table>
-            </div>
-
-HTML_STORAGE_END3
-
-# Edge Functions Comparison (edge functions are in .functions file)
-SOURCE_EDGE_FUNCTIONS=$(get_file_contents "$SOURCE_INFO.functions")
-TARGET_EDGE_FUNCTIONS=$(get_file_contents "$TARGET_INFO.functions")
-
-if [ -n "$SOURCE_EDGE_FUNCTIONS" ] || [ -n "$TARGET_EDGE_FUNCTIONS" ]; then
-    cat >> "$HTML_FILE" << HTML_FUNCTIONS_EOF
-            <div class="section">
-                <h2>⚡ Edge Functions Comparison</h2>
-                <div class="comparison-grid">
-                    <div class="comparison-card">
-                        <h4>Source ($SOURCE_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Functions</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.functions")</span>
-                        </div>
-                    </div>
-                    <div class="comparison-card">
-                        <h4>Target ($TARGET_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Functions</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.functions")</span>
-                        </div>
-                    </div>
-                </div>
-HTML_FUNCTIONS_EOF
-
-    ADDED_FUNCTIONS=""
-    REMOVED_FUNCTIONS=""
-    
-    while IFS= read -r func; do
-        [ -z "$func" ] && continue
-        if ! echo "$TARGET_EDGE_FUNCTIONS" | grep -q "^${func}$"; then
-            ADDED_FUNCTIONS="${ADDED_FUNCTIONS}${func}\n"
-        fi
-    done <<< "$SOURCE_EDGE_FUNCTIONS"
-    
-    while IFS= read -r func; do
-        [ -z "$func" ] && continue
-        if ! echo "$SOURCE_EDGE_FUNCTIONS" | grep -q "^${func}$"; then
-            REMOVED_FUNCTIONS="${REMOVED_FUNCTIONS}${func}\n"
-        fi
-    done <<< "$TARGET_EDGE_FUNCTIONS"
-    
-    if [ -n "$ADDED_FUNCTIONS" ]; then
-        echo "<div class='diff-item added'><div class='diff-item-header'>➕ Functions to Deploy ($(echo -e "$ADDED_FUNCTIONS" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'>$(echo -e "$ADDED_FUNCTIONS" | grep -v '^$' | sed 's/^/  /')</div></div>" >> "$HTML_FILE"
-    fi
-    
-    if [ -n "$REMOVED_FUNCTIONS" ]; then
-        echo "<div class='diff-item removed'><div class='diff-item-header'>➖ Functions in Target Not in Source ($(echo -e "$REMOVED_FUNCTIONS" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'>$(echo -e "$REMOVED_FUNCTIONS" | grep -v '^$' | sed 's/^/  /')</div></div>" >> "$HTML_FILE"
-    fi
-    
-    if [ -z "$ADDED_FUNCTIONS" ] && [ -z "$REMOVED_FUNCTIONS" ]; then
-        echo "<div class='diff-item added'><div class='diff-item-header'>✅ All functions match</div></div>" >> "$HTML_FILE"
-    fi
-    
-    cat >> "$HTML_FILE" << HTML_FUNCTIONS_END
-            </div>
-
-HTML_FUNCTIONS_END
-fi
-
-# Secrets Comparison
-SOURCE_SECRETS=$(get_file_contents "$SOURCE_INFO.secrets")
-TARGET_SECRETS=$(get_file_contents "$TARGET_INFO.secrets")
-
-if [ -n "$SOURCE_SECRETS" ] || [ -n "$TARGET_SECRETS" ]; then
-    cat >> "$HTML_FILE" << HTML_SECRETS_EOF
-            <div class="section">
-                <h2>🔐 Secrets Comparison</h2>
-                <div class="comparison-grid">
-                    <div class="comparison-card">
-                        <h4>Source ($SOURCE_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Secrets</span>
-                            <span class="stat-value">$(count_items "$SOURCE_INFO.secrets")</span>
-                        </div>
-                    </div>
-                    <div class="comparison-card">
-                        <h4>Target ($TARGET_ENV)</h4>
-                        <div class="stat">
-                            <span class="stat-label">Secrets</span>
-                            <span class="stat-value">$(count_items "$TARGET_INFO.secrets")</span>
-                        </div>
-                    </div>
-                </div>
-HTML_SECRETS_EOF
-
-    ADDED_SECRETS=""
-    REMOVED_SECRETS=""
-    
-    while IFS= read -r secret; do
-        [ -z "$secret" ] && continue
-        if ! echo "$TARGET_SECRETS" | grep -q "^${secret}$"; then
-            ADDED_SECRETS="${ADDED_SECRETS}${secret}\n"
-        fi
-    done <<< "$SOURCE_SECRETS"
-    
-    while IFS= read -r secret; do
-        [ -z "$secret" ] && continue
-        if ! echo "$SOURCE_SECRETS" | grep -q "^${secret}$"; then
-            REMOVED_SECRETS="${REMOVED_SECRETS}${secret}\n"
-        fi
-    done <<< "$TARGET_SECRETS"
-    
-    if [ -n "$ADDED_SECRETS" ]; then
-        echo "<div class='diff-item added'><div class='diff-item-header'>➕ Secrets to Add ($(echo -e "$ADDED_SECRETS" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'>$(echo -e "$ADDED_SECRETS" | grep -v '^$' | sed 's/^/  /')</div></div>" >> "$HTML_FILE"
-    fi
-    
-    if [ -n "$REMOVED_SECRETS" ]; then
-        echo "<div class='diff-item removed'><div class='diff-item-header'>➖ Secrets in Target Not in Source ($(echo -e "$REMOVED_SECRETS" | grep -v '^$' | wc -l | tr -d ' '))</div><div class='diff-item-content'>$(echo -e "$REMOVED_SECRETS" | grep -v '^$' | sed 's/^/  /')</div></div>" >> "$HTML_FILE"
-    fi
-    
-    if [ -z "$ADDED_SECRETS" ] && [ -z "$REMOVED_SECRETS" ]; then
-        echo "<div class='diff-item added'><div class='diff-item-header'>✅ All secrets match</div></div>" >> "$HTML_FILE"
-    fi
-    
-    # Add full lists of secrets
-    cat >> "$HTML_FILE" << HTML_SECRETS_LIST_EOF
-                <h3>Source Secrets List</h3>
-                <div class="details">
-                    <div class="details-item">
-                        <div class="details-item-content">
-HTML_SECRETS_LIST_EOF
-
-    # List all source secrets
-    if [ -n "$SOURCE_SECRETS" ]; then
-        echo "<ul>" >> "$HTML_FILE"
-        while IFS= read -r secret; do
-            [ -z "$secret" ] && continue
-            echo "<li>$secret</li>" >> "$HTML_FILE"
-        done <<< "$SOURCE_SECRETS"
-        echo "</ul>" >> "$HTML_FILE"
-    else
-        echo "<p>No secrets found in source</p>" >> "$HTML_FILE"
-    fi
-    
-    cat >> "$HTML_FILE" << HTML_SECRETS_LIST_END
-                        </div>
-                    </div>
-                </div>
-                
-                <h3>Target Secrets List</h3>
-                <div class="details">
-                    <div class="details-item">
-                        <div class="details-item-content">
-HTML_SECRETS_LIST_END
-
-    # List all target secrets
-    if [ -n "$TARGET_SECRETS" ]; then
-        echo "<ul>" >> "$HTML_FILE"
-        while IFS= read -r secret; do
-            [ -z "$secret" ] && continue
-            echo "<li>$secret</li>" >> "$HTML_FILE"
-        done <<< "$TARGET_SECRETS"
-        echo "</ul>" >> "$HTML_FILE"
-    else
-        echo "<p>No secrets found in target</p>" >> "$HTML_FILE"
-    fi
-    
-    cat >> "$HTML_FILE" << HTML_SECRETS_END
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-HTML_SECRETS_END
-fi
-
-# Calculate differences for migration action plan (at the end, after all comparisons)
-log_info "Calculating migration action plan..."
-
-# Re-read source tables if not already set
-if [ -z "${SOURCE_TABLES:-}" ]; then
-    SOURCE_TABLES=$(get_file_contents "$SOURCE_INFO.tables")
-fi
-if [ -z "${TARGET_TABLES:-}" ]; then
-    TARGET_TABLES=$(get_file_contents "$TARGET_INFO.tables")
-fi
-
-SOURCE_VIEWS=$(get_file_contents "$SOURCE_INFO.views")
-TARGET_VIEWS=$(get_file_contents "$TARGET_INFO.views")
-SOURCE_FUNCTIONS=$(get_file_contents "$SOURCE_INFO.db_functions")
-TARGET_FUNCTIONS=$(get_file_contents "$TARGET_INFO.db_functions")
-SOURCE_SECRETS=$(get_file_contents "$SOURCE_INFO.secrets")
-TARGET_SECRETS=$(get_file_contents "$TARGET_INFO.secrets")
-
-# Calculate what needs to be migrated
-TABLES_TO_MIGRATE=""
-TABLES_TO_REMOVE=""
-VIEWS_TO_MIGRATE=""
-FUNCTIONS_TO_MIGRATE=""
-SECRETS_TO_MIGRATE=""
-BUCKETS_TO_MIGRATE=""
-BUCKETS_TO_REMOVE=""
-EDGE_FUNCTIONS_TO_MIGRATE=""
-EDGE_FUNCTIONS_TO_REMOVE=""
-
-# Calculate database differences (with proper empty check)
-if [ -n "$SOURCE_TABLES" ]; then
-    while IFS= read -r table; do
-        [ -z "$table" ] && continue
-        if [ -z "$TARGET_TABLES" ] || ! echo "$TARGET_TABLES" | grep -q "^${table}$"; then
-            TABLES_TO_MIGRATE="${TABLES_TO_MIGRATE}${table}\n"
-        fi
-    done <<< "$SOURCE_TABLES"
-fi
-
-if [ -n "$TARGET_TABLES" ]; then
-    while IFS= read -r table; do
-        [ -z "$table" ] && continue
-        if [ -z "$SOURCE_TABLES" ] || ! echo "$SOURCE_TABLES" | grep -q "^${table}$"; then
-            TABLES_TO_REMOVE="${TABLES_TO_REMOVE}${table}\n"
-        fi
-    done <<< "$TARGET_TABLES"
-fi
-
-if [ -n "$SOURCE_VIEWS" ]; then
-    while IFS= read -r view; do
-        [ -z "$view" ] && continue
-        if [ -z "$TARGET_VIEWS" ] || ! echo "$TARGET_VIEWS" | grep -q "^${view}$"; then
-            VIEWS_TO_MIGRATE="${VIEWS_TO_MIGRATE}${view}\n"
-        fi
-    done <<< "$SOURCE_VIEWS"
-fi
-
-if [ -n "$SOURCE_FUNCTIONS" ]; then
-    while IFS= read -r func; do
-        [ -z "$func" ] && continue
-        if [ -z "$TARGET_FUNCTIONS" ] || ! echo "$TARGET_FUNCTIONS" | grep -q "^${func}$"; then
-            FUNCTIONS_TO_MIGRATE="${FUNCTIONS_TO_MIGRATE}${func}\n"
-        fi
-    done <<< "$SOURCE_FUNCTIONS"
-fi
-
-# Calculate RLS policies differences
-SOURCE_POLICIES=$(get_file_contents "$SOURCE_INFO.policies")
-TARGET_POLICIES=$(get_file_contents "$TARGET_INFO.policies")
-
-if [ -n "$SOURCE_POLICIES" ]; then
-    while IFS= read -r policy; do
-        [ -z "$policy" ] && continue
-        if [ -z "$TARGET_POLICIES" ] || ! echo "$TARGET_POLICIES" | grep -q "^${policy}$"; then
-            POLICIES_TO_MIGRATE="${POLICIES_TO_MIGRATE}${policy}\n"
-        fi
-    done <<< "$SOURCE_POLICIES"
-fi
-
-if [ -n "$TARGET_POLICIES" ]; then
-    while IFS= read -r policy; do
-        [ -z "$policy" ] && continue
-        if [ -z "$SOURCE_POLICIES" ] || ! echo "$SOURCE_POLICIES" | grep -q "^${policy}$"; then
-            POLICIES_TO_REMOVE="${POLICIES_TO_REMOVE}${policy}\n"
-        fi
-    done <<< "$TARGET_POLICIES"
-fi
-
-# Calculate secrets differences
-if [ -n "$SOURCE_SECRETS" ]; then
-    while IFS= read -r secret; do
-        [ -z "$secret" ] && continue
-        if [ -z "$TARGET_SECRETS" ] || ! echo "$TARGET_SECRETS" | grep -q "^${secret}$"; then
-            SECRETS_TO_MIGRATE="${SECRETS_TO_MIGRATE}${secret}\n"
-        fi
-    done <<< "$SOURCE_SECRETS"
-fi
-
-# Calculate edge functions differences
-SOURCE_EDGE_FUNCTIONS=$(get_file_contents "$SOURCE_INFO.functions")
-TARGET_EDGE_FUNCTIONS=$(get_file_contents "$TARGET_INFO.functions")
-
-if [ -n "$SOURCE_EDGE_FUNCTIONS" ]; then
-    while IFS= read -r func; do
-        [ -z "$func" ] && continue
-        if [ -z "$TARGET_EDGE_FUNCTIONS" ] || ! echo "$TARGET_EDGE_FUNCTIONS" | grep -q "^${func}$"; then
-            EDGE_FUNCTIONS_TO_MIGRATE="${EDGE_FUNCTIONS_TO_MIGRATE}${func}\n"
-        fi
-    done <<< "$SOURCE_EDGE_FUNCTIONS"
-fi
-
-if [ -n "$TARGET_EDGE_FUNCTIONS" ]; then
-    while IFS= read -r func; do
-        [ -z "$func" ] && continue
-        if [ -z "$SOURCE_EDGE_FUNCTIONS" ] || ! echo "$SOURCE_EDGE_FUNCTIONS" | grep -q "^${func}$"; then
-            EDGE_FUNCTIONS_TO_REMOVE="${EDGE_FUNCTIONS_TO_REMOVE}${func}\n"
-        fi
-    done <<< "$TARGET_EDGE_FUNCTIONS"
-fi
-
-# Calculate bucket differences
-SOURCE_BUCKET_NAMES=$(get_file_contents "$SOURCE_INFO.buckets" | cut -d'|' -f1)
-TARGET_BUCKET_NAMES=$(get_file_contents "$TARGET_INFO.buckets" | cut -d'|' -f1)
-
-if [ -n "$SOURCE_BUCKET_NAMES" ]; then
-    while IFS= read -r bucket; do
-        [ -z "$bucket" ] && continue
-        if [ -z "$TARGET_BUCKET_NAMES" ] || ! echo "$TARGET_BUCKET_NAMES" | grep -q "^${bucket}$"; then
-            BUCKETS_TO_MIGRATE="${BUCKETS_TO_MIGRATE}${bucket}\n"
-        fi
-    done <<< "$SOURCE_BUCKET_NAMES"
-fi
-
-if [ -n "$TARGET_BUCKET_NAMES" ]; then
-    while IFS= read -r bucket; do
-        [ -z "$bucket" ] && continue
-        if [ -z "$SOURCE_BUCKET_NAMES" ] || ! echo "$SOURCE_BUCKET_NAMES" | grep -q "^${bucket}$"; then
-            BUCKETS_TO_REMOVE="${BUCKETS_TO_REMOVE}${bucket}\n"
-        fi
-    done <<< "$TARGET_BUCKET_NAMES"
-fi
-
-# Count items (with safe defaults)
-TABLES_TO_MIGRATE_COUNT=0
-if [ -n "$TABLES_TO_MIGRATE" ]; then
-    TABLES_TO_MIGRATE_COUNT=$(echo -e "$TABLES_TO_MIGRATE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-TABLES_TO_REMOVE_COUNT=0
-if [ -n "$TABLES_TO_REMOVE" ]; then
-    TABLES_TO_REMOVE_COUNT=$(echo -e "$TABLES_TO_REMOVE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-VIEWS_TO_MIGRATE_COUNT=0
-if [ -n "$VIEWS_TO_MIGRATE" ]; then
-    VIEWS_TO_MIGRATE_COUNT=$(echo -e "$VIEWS_TO_MIGRATE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-FUNCTIONS_TO_MIGRATE_COUNT=0
-if [ -n "$FUNCTIONS_TO_MIGRATE" ]; then
-    FUNCTIONS_TO_MIGRATE_COUNT=$(echo -e "$FUNCTIONS_TO_MIGRATE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-POLICIES_TO_MIGRATE_COUNT=0
-if [ -n "$POLICIES_TO_MIGRATE" ]; then
-    POLICIES_TO_MIGRATE_COUNT=$(echo -e "$POLICIES_TO_MIGRATE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-POLICIES_TO_REMOVE_COUNT=0
-if [ -n "$POLICIES_TO_REMOVE" ]; then
-    POLICIES_TO_REMOVE_COUNT=$(echo -e "$POLICIES_TO_REMOVE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-SECRETS_TO_MIGRATE_COUNT=0
-if [ -n "$SECRETS_TO_MIGRATE" ]; then
-    SECRETS_TO_MIGRATE_COUNT=$(echo -e "$SECRETS_TO_MIGRATE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-BUCKETS_TO_MIGRATE_COUNT=0
-if [ -n "$BUCKETS_TO_MIGRATE" ]; then
-    BUCKETS_TO_MIGRATE_COUNT=$(echo -e "$BUCKETS_TO_MIGRATE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-BUCKETS_TO_REMOVE_COUNT=0
-if [ -n "$BUCKETS_TO_REMOVE" ]; then
-    BUCKETS_TO_REMOVE_COUNT=$(echo -e "$BUCKETS_TO_REMOVE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-EDGE_FUNCTIONS_TO_MIGRATE_COUNT=0
-if [ -n "$EDGE_FUNCTIONS_TO_MIGRATE" ]; then
-    EDGE_FUNCTIONS_TO_MIGRATE_COUNT=$(echo -e "$EDGE_FUNCTIONS_TO_MIGRATE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-EDGE_FUNCTIONS_TO_REMOVE_COUNT=0
-if [ -n "$EDGE_FUNCTIONS_TO_REMOVE" ]; then
-    EDGE_FUNCTIONS_TO_REMOVE_COUNT=$(echo -e "$EDGE_FUNCTIONS_TO_REMOVE" | grep -v '^$' | wc -l | tr -d ' ' || echo "0")
-fi
-
-# Calculate total file count to migrate
-TOTAL_FILES_TO_MIGRATE=0
-if [ -n "$BUCKETS_TO_MIGRATE" ] && [ -f "$SOURCE_INFO.buckets" ]; then
-    while IFS= read -r bucket; do
-        [ -z "$bucket" ] && continue
-        file_count=$(grep "^${bucket}|" "$SOURCE_INFO.buckets" 2>/dev/null | cut -d'|' -f5 | head -1 || echo "0")
-        if [ -n "$file_count" ] && expr "$file_count" + 0 >/dev/null 2>&1; then
-            TOTAL_FILES_TO_MIGRATE=$((TOTAL_FILES_TO_MIGRATE + file_count))
-        fi
-    done <<< "$BUCKETS_TO_MIGRATE"
-fi
-
-log_info "Migration action plan calculation completed"
-
-# Add Migration Action Plan section at the end
-cat >> "$HTML_FILE" << HTML_ACTION_PLAN_EOF
-            <div class="section">
-                <h2>📋 Migration Action Plan</h2>
-                <p style="margin-bottom: 20px; color: #666; font-size: 1.05em;">
-                    This section summarizes what needs to be migrated from <strong>$SOURCE_ENV</strong> to <strong>$TARGET_ENV</strong> 
-                    to make the target environment identical to the source.
-                </p>
-                
-HTML_ACTION_PLAN_EOF
-
-# Generate database migration section
-cat >> "$HTML_FILE" << HTML_DB_ACTION_EOF
-                <div class="details" style="margin-top: 20px;">
-                    <h3 style="color: #667eea; margin-bottom: 15px;">🗄️ Database Migration Required</h3>
-HTML_DB_ACTION_EOF
-
-# Tables to migrate
-if [ "$TABLES_TO_MIGRATE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_TABLES_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Tables to Migrate:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $TABLES_TO_MIGRATE_COUNT table(s)<br><br>
-                            <strong>Tables:</strong><br>
-HTML_TABLES_EOF
-    echo -e "$TABLES_TO_MIGRATE" | grep -v '^$' | while IFS= read -r table; do
-        echo "                            • $table<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_TABLES_END
-                        </div>
-                    </div>
-HTML_TABLES_END
-else
-    echo "                    <div class='details-item'><div class='details-item-label'>Tables:</div><div class='details-item-content'>✅ No tables need migration - all tables exist in target</div></div>" >> "$HTML_FILE"
-fi
-
-# Tables to remove
-if [ "$TABLES_TO_REMOVE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_REMOVE_TABLES_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Tables to Remove from Target:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $TABLES_TO_REMOVE_COUNT table(s)<br><br>
-                            <strong>Tables:</strong><br>
-HTML_REMOVE_TABLES_EOF
-    echo -e "$TABLES_TO_REMOVE" | grep -v '^$' | while IFS= read -r table; do
-        echo "                            • $table<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_REMOVE_TABLES_END
-                        </div>
-                    </div>
-HTML_REMOVE_TABLES_END
-fi
-
-# Views to migrate
-if [ "$VIEWS_TO_MIGRATE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_VIEWS_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Views to Migrate:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $VIEWS_TO_MIGRATE_COUNT view(s)<br><br>
-                            <strong>Views:</strong><br>
-HTML_VIEWS_EOF
-    echo -e "$VIEWS_TO_MIGRATE" | grep -v '^$' | while IFS= read -r view; do
-        echo "                            • $view<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_VIEWS_END
-                        </div>
-                    </div>
-HTML_VIEWS_END
-else
-    echo "                    <div class='details-item'><div class='details-item-label'>Views:</div><div class='details-item-content'>✅ No views need migration - all views exist in target</div></div>" >> "$HTML_FILE"
-fi
-
-# Database functions to migrate
-if [ "$FUNCTIONS_TO_MIGRATE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_FUNCS_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Database Functions to Migrate:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $FUNCTIONS_TO_MIGRATE_COUNT function(s)<br><br>
-                            <strong>Functions:</strong><br>
-HTML_FUNCS_EOF
-    echo -e "$FUNCTIONS_TO_MIGRATE" | grep -v '^$' | head -10 | while IFS= read -r func; do
-        echo "                            • $func<br>" >> "$HTML_FILE"
-    done
-    if [ "$FUNCTIONS_TO_MIGRATE_COUNT" -gt 10 ]; then
-        echo "                            ... and $((FUNCTIONS_TO_MIGRATE_COUNT - 10)) more<br>" >> "$HTML_FILE"
-    fi
-    cat >> "$HTML_FILE" << HTML_FUNCS_END
-                        </div>
-                    </div>
-HTML_FUNCS_END
-else
-    echo "                    <div class='details-item'><div class='details-item-label'>Database Functions:</div><div class='details-item-content'>✅ No functions need migration - all functions exist in target</div></div>" >> "$HTML_FILE"
-fi
-
-# RLS Policies to migrate
-if [ "$POLICIES_TO_MIGRATE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_POLICIES_ACTION_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">RLS Policies to Migrate:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $POLICIES_TO_MIGRATE_COUNT policy/policies<br><br>
-                            <strong>Policies:</strong><br>
-HTML_POLICIES_ACTION_EOF
-    echo -e "$POLICIES_TO_MIGRATE" | grep -v '^$' | head -20 | while IFS= read -r policy; do
-        echo "                            • $policy<br>" >> "$HTML_FILE"
-    done
-    if [ "$POLICIES_TO_MIGRATE_COUNT" -gt 20 ]; then
-        echo "                            ... and $((POLICIES_TO_MIGRATE_COUNT - 20)) more policy/policies<br>" >> "$HTML_FILE"
-    fi
-    cat >> "$HTML_FILE" << HTML_POLICIES_ACTION_END
-                        </div>
-                    </div>
-HTML_POLICIES_ACTION_END
-else
-    echo "                    <div class='details-item'><div class='details-item-label'>RLS Policies:</div><div class='details-item-content'>✅ No RLS policies need migration - all policies exist in target</div></div>" >> "$HTML_FILE"
-fi
-
-# RLS Policies to remove
-if [ "$POLICIES_TO_REMOVE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_REMOVE_POLICIES_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">RLS Policies to Remove from Target:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $POLICIES_TO_REMOVE_COUNT policy/policies<br><br>
-                            <strong>Policies:</strong><br>
-HTML_REMOVE_POLICIES_EOF
-    echo -e "$POLICIES_TO_REMOVE" | grep -v '^$' | head -20 | while IFS= read -r policy; do
-        echo "                            • $policy<br>" >> "$HTML_FILE"
-    done
-    if [ "$POLICIES_TO_REMOVE_COUNT" -gt 20 ]; then
-        echo "                            ... and $((POLICIES_TO_REMOVE_COUNT - 20)) more policy/policies<br>" >> "$HTML_FILE"
-    fi
-    cat >> "$HTML_FILE" << HTML_REMOVE_POLICIES_END
-                        </div>
-                    </div>
-HTML_REMOVE_POLICIES_END
-fi
-
-cat >> "$HTML_FILE" << HTML_DB_ACTION_END
-                </div>
-                
-HTML_DB_ACTION_END
-
-# Generate storage migration section
-cat >> "$HTML_FILE" << HTML_STORAGE_ACTION_EOF
-                <div class="details" style="margin-top: 20px;">
-                    <h3 style="color: #667eea; margin-bottom: 15px;">📦 Storage Migration Required</h3>
-HTML_STORAGE_ACTION_EOF
-
-# Buckets to migrate
-if [ "$BUCKETS_TO_MIGRATE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_BUCKETS_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Buckets to Migrate:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $BUCKETS_TO_MIGRATE_COUNT bucket(s)<br><br>
-                            <strong>Buckets:</strong><br>
-HTML_BUCKETS_EOF
-    echo -e "$BUCKETS_TO_MIGRATE" | grep -v '^$' | while IFS= read -r bucket; do
-        [ -z "$bucket" ] && continue
-        file_count=$(grep "^${bucket}|" "$SOURCE_INFO.buckets" 2>/dev/null | cut -d'|' -f5 | head -1 || echo "0")
-        echo "                            • $bucket ($file_count files)<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_BUCKETS_END
-                            <br><strong>Total Files to Migrate:</strong> $TOTAL_FILES_TO_MIGRATE file(s)
-                        </div>
-                    </div>
-HTML_BUCKETS_END
-else
-    echo "                    <div class='details-item'><div class='details-item-label'>Buckets:</div><div class='details-item-content'>✅ No buckets need migration - all buckets exist in target</div></div>" >> "$HTML_FILE"
-fi
-
-# Buckets to remove
-if [ "$BUCKETS_TO_REMOVE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_REMOVE_BUCKETS_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Buckets to Remove from Target:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $BUCKETS_TO_REMOVE_COUNT bucket(s)<br><br>
-                            <strong>Buckets:</strong><br>
-HTML_REMOVE_BUCKETS_EOF
-    echo -e "$BUCKETS_TO_REMOVE" | grep -v '^$' | while IFS= read -r bucket; do
-        echo "                            • $bucket<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_REMOVE_BUCKETS_END
-                        </div>
-                    </div>
-HTML_REMOVE_BUCKETS_END
-fi
-
-cat >> "$HTML_FILE" << HTML_STORAGE_ACTION_END
-                </div>
-                
-HTML_STORAGE_ACTION_END
-
-# Generate edge functions migration section
-cat >> "$HTML_FILE" << HTML_EDGE_ACTION_EOF
-                <div class="details" style="margin-top: 20px;">
-                    <h3 style="color: #667eea; margin-bottom: 15px;">⚡ Edge Functions Migration Required</h3>
-HTML_EDGE_ACTION_EOF
-
-# Edge functions to migrate
-if [ "$EDGE_FUNCTIONS_TO_MIGRATE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_EDGE_FUNCS_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Functions to Deploy:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $EDGE_FUNCTIONS_TO_MIGRATE_COUNT function(s)<br><br>
-                            <strong>Functions:</strong><br>
-HTML_EDGE_FUNCS_EOF
-    echo -e "$EDGE_FUNCTIONS_TO_MIGRATE" | grep -v '^$' | while IFS= read -r func; do
-        echo "                            • $func<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_EDGE_FUNCS_END
-                        </div>
-                    </div>
-HTML_EDGE_FUNCS_END
-else
-    echo "                    <div class='details-item'><div class='details-item-label'>Edge Functions:</div><div class='details-item-content'>✅ No edge functions need deployment - all functions exist in target</div></div>" >> "$HTML_FILE"
-fi
-
-# Edge functions to remove
-if [ "$EDGE_FUNCTIONS_TO_REMOVE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_REMOVE_EDGE_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Functions to Remove from Target:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $EDGE_FUNCTIONS_TO_REMOVE_COUNT function(s)<br><br>
-                            <strong>Functions:</strong><br>
-HTML_REMOVE_EDGE_EOF
-    echo -e "$EDGE_FUNCTIONS_TO_REMOVE" | grep -v '^$' | while IFS= read -r func; do
-        echo "                            • $func<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_REMOVE_EDGE_END
-                        </div>
-                    </div>
-HTML_REMOVE_EDGE_END
-fi
-
-cat >> "$HTML_FILE" << HTML_EDGE_ACTION_END
-                </div>
-                
-HTML_EDGE_ACTION_END
-
-# Generate secrets migration section
-cat >> "$HTML_FILE" << HTML_SECRETS_ACTION_EOF
-                <div class="details" style="margin-top: 20px;">
-                    <h3 style="color: #667eea; margin-bottom: 15px;">🔐 Secrets Migration Required</h3>
-HTML_SECRETS_ACTION_EOF
-
-# Secrets to migrate
-if [ "$SECRETS_TO_MIGRATE_COUNT" -gt 0 ]; then
-    cat >> "$HTML_FILE" << HTML_SECRETS_MIGRATE_EOF
-                    <div class="details-item">
-                        <div class="details-item-label">Secrets to Add:</div>
-                        <div class="details-item-content">
-                            <strong>Count:</strong> $SECRETS_TO_MIGRATE_COUNT secret(s)<br><br>
-                            <strong>Secrets:</strong><br>
-HTML_SECRETS_MIGRATE_EOF
-    echo -e "$SECRETS_TO_MIGRATE" | grep -v '^$' | while IFS= read -r secret; do
-        echo "                            • $secret<br>" >> "$HTML_FILE"
-    done
-    cat >> "$HTML_FILE" << HTML_SECRETS_MIGRATE_END
-                            <br><strong>⚠️ Note:</strong> Secret values cannot be migrated automatically. You must set values manually after migration.
-                        </div>
-                    </div>
-HTML_SECRETS_MIGRATE_END
-else
-    echo "                    <div class='details-item'><div class='details-item-label'>Secrets:</div><div class='details-item-content'>✅ No secrets need migration - all secrets exist in target</div></div>" >> "$HTML_FILE"
-fi
-
-cat >> "$HTML_FILE" << HTML_SECRETS_ACTION_END
-                </div>
-                
-HTML_SECRETS_ACTION_END
-
-# Generate final summary
-cat >> "$HTML_FILE" << HTML_FINAL_SUMMARY_EOF
-                <div class="details" style="margin-top: 20px; background: #e3f2fd; border-left-color: #2196f3;">
-                    <h3 style="color: #1976d2; margin-bottom: 15px;">📝 Migration Summary</h3>
-                    <div class="details-item">
-                        <div class="details-item-content" style="font-size: 1em; font-family: inherit;">
-                            <strong>Total Items to Migrate:</strong><br>
-                            • Database Tables: $TABLES_TO_MIGRATE_COUNT<br>
-                            • Database Views: $VIEWS_TO_MIGRATE_COUNT<br>
-                            • Database Functions: $FUNCTIONS_TO_MIGRATE_COUNT<br>
-                            • RLS Policies: $POLICIES_TO_MIGRATE_COUNT<br>
-                            • Storage Buckets: $BUCKETS_TO_MIGRATE_COUNT<br>
-                            • Storage Files: $TOTAL_FILES_TO_MIGRATE<br>
-                            • Edge Functions: $EDGE_FUNCTIONS_TO_MIGRATE_COUNT<br>
-                            • Secrets: $SECRETS_TO_MIGRATE_COUNT<br><br>
-                            
-                            <strong>Total Items to Remove from Target:</strong><br>
-                            • Database Tables: $TABLES_TO_REMOVE_COUNT<br>
-                            • RLS Policies: $POLICIES_TO_REMOVE_COUNT<br>
-                            • Storage Buckets: $BUCKETS_TO_REMOVE_COUNT<br>
-                            • Edge Functions: $EDGE_FUNCTIONS_TO_REMOVE_COUNT<br><br>
-HTML_FINAL_SUMMARY_EOF
-
-# Determine if migration is needed
-if [ "$TABLES_TO_MIGRATE_COUNT" -eq 0 ] && [ "$VIEWS_TO_MIGRATE_COUNT" -eq 0 ] && \
-   [ "$FUNCTIONS_TO_MIGRATE_COUNT" -eq 0 ] && [ "$POLICIES_TO_MIGRATE_COUNT" -eq 0 ] && \
-   [ "$BUCKETS_TO_MIGRATE_COUNT" -eq 0 ] && [ "$EDGE_FUNCTIONS_TO_MIGRATE_COUNT" -eq 0 ] && \
-   [ "$SECRETS_TO_MIGRATE_COUNT" -eq 0 ] && [ "$TABLES_TO_REMOVE_COUNT" -eq 0 ] && \
-   [ "$POLICIES_TO_REMOVE_COUNT" -eq 0 ] && [ "$BUCKETS_TO_REMOVE_COUNT" -eq 0 ] && \
-   [ "$EDGE_FUNCTIONS_TO_REMOVE_COUNT" -eq 0 ]; then
-    echo "                            <strong style='color: #4caf50;'>✅ Target environment is already identical to source - no migration needed!</strong>" >> "$HTML_FILE"
-else
-    echo "                            <strong style='color: #ff9800;'>⚠️ Migration required to synchronize target with source</strong>" >> "$HTML_FILE"
-fi
-
-cat >> "$HTML_FILE" << HTML_FINAL_SUMMARY_END
-                        </div>
-                    </div>
-                </div>
-            </div>
-
-HTML_FINAL_SUMMARY_END
-
-# Close HTML
-cat >> "$HTML_FILE" << HTML_END
-            <div class="timestamp">
-                Report generated on $(date)
-            </div>
-        </div>
+.page-wrapper {
+    max-width: 1200px;
+    margin: 0 auto;
+}
+.hero {
+    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+    color: white;
+    padding: 48px;
+    border-radius: 24px;
+    box-shadow: 0 24px 60px rgba(15, 23, 42, 0.18);
+    margin-bottom: 36px;
+}
+.hero h1 {
+    font-size: 2.6rem;
+    margin-bottom: 12px;
+    letter-spacing: -0.5px;
+}
+.hero p {
+    font-size: 1.1rem;
+    opacity: 0.92;
+}
+.hero-meta {
+    margin-top: 18px;
+    font-size: 0.95rem;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+}
+.env-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 14px;
+    border-radius: 999px;
+    font-weight: 600;
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+}
+.env-chip span {
+    opacity: 0.85;
+    font-weight: 500;
+}
+.section-block {
+    background: white;
+    border-radius: 24px;
+    border: 1px solid rgba(99, 102, 241, 0.16);
+    box-shadow: 0 24px 48px rgba(15, 23, 42, 0.12);
+    padding: 32px 36px;
+    margin-bottom: 32px;
+}
+.section-block h2 {
+    font-size: 1.7rem;
+    margin-bottom: 20px;
+    color: #312e81;
+}
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+}
+.summary-card {
+    border-radius: 16px;
+    border: 1px solid rgba(99, 102, 241, 0.18);
+    padding: 20px;
+    background: linear-gradient(135deg, rgba(79,70,229,0.08) 0%, rgba(124,58,237,0.05) 100%);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.35);
+}
+.summary-card h3 {
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #4338ca;
+    margin-bottom: 8px;
+}
+.summary-card p {
+    font-size: 2rem;
+    font-weight: 700;
+    color: #1e1b4b;
+}
+.timeline {
+    display: grid;
+    gap: 12px;
+}
+.timeline-item {
+    position: relative;
+    padding-left: 20px;
+    color: #1f2937;
+}
+.timeline-item::before {
+    content: '';
+    position: absolute;
+    left: 6px;
+    top: 4px;
+    width: 8px;
+    height: 8px;
+    background: #4f46e5;
+    border-radius: 999px;
+}
+.timeline-item::after {
+    content: '';
+    position: absolute;
+    left: 9px;
+    top: 16px;
+    bottom: -12px;
+    width: 2px;
+    background: rgba(79, 70, 229, 0.25);
+}
+.timeline-item:last-child::after {
+    display: none;
+}
+.data-card {
+    border: 1px solid rgba(148, 163, 184, 0.3);
+    border-radius: 18px;
+    padding: 24px;
+    margin-bottom: 20px;
+    background: linear-gradient(180deg, rgba(248, 250, 252, 0.95) 0%, rgba(241, 245, 249, 0.9) 100%);
+}
+.data-card h3 {
+    font-size: 1.15rem;
+    margin-bottom: 12px;
+    color: #312e81;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.status-new,
+.status-review,
+.status-update {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+}
+.status-new { background: rgba(16, 185, 129, 0.18); color: #047857; }
+.status-review { background: rgba(248, 113, 113, 0.18); color: #b91c1c; }
+.status-update { background: rgba(255, 186, 8, 0.2); color: #a16207; }
+.item-list { margin-left: 18px; margin-top: 8px; }
+.item-list li { margin-bottom: 6px; }
+.diff-box {
+    margin-top: 12px;
+    background: #0f172a;
+    color: #e2e8f0;
+    border-radius: 12px;
+    padding: 16px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    overflow-x: auto;
+}
+.footer-note {
+    margin-top: 32px;
+    text-align: right;
+    font-size: 0.88rem;
+    color: #475569;
+}
+@media (max-width: 768px) {
+    body { padding: 24px; }
+    .hero { padding: 32px; }
+    .section-block { padding: 26px; }
+}
+"""
+
+html_parts = [
+    "<!DOCTYPE html>",
+    "<html lang='en'>",
+    "<head>",
+    "<meta charset='UTF-8'>",
+    "<meta name='viewport' content='width=device-width, initial-scale=1.0'>",
+    f"<title>Migration Plan: {html.escape(source_env)} → {html.escape(target_env)}</title>",
+    f"<style>{css}</style>",
+    "</head>",
+    "<body>",
+    "<div class='page-wrapper'>"
+]
+
+hero_markup = f"""
+<section class='hero'>
+    <div class='hero-head'>
+        <h1>Migration Plan</h1>
+        <p>Synchronize <strong>{html.escape(source_env)}</strong> → <strong>{html.escape(target_env)}</strong></p>
     </div>
-</body>
-</html>
-HTML_END
+    <div class='hero-meta'>
+        <span>Project refs</span>
+        <span class='env-chip'>Source<span>{html.escape(source_ref or 'n/a')}</span></span>
+        <span class='env-chip'>Target<span>{html.escape(target_ref or 'n/a')}</span></span>
+        <span class='env-chip'>Generated<span>{timestamp_display}</span></span>
+        <span class='env-chip'>Actions<span>{summary['actions']}</span></span>
+    </div>
+</section>
+"""
+
+html_parts.append(hero_markup)
+
+html_parts.append("<section class='section-block'><h2>Executive Summary</h2><div class='summary-grid'>")
+
+summary_items = [
+    ("New Tables", summary['tables_new']),
+    ("Tables to Review", summary['tables_removed']),
+    ("Tables with Updates", summary['tables_modified']),
+    ("Columns Added", summary['cols_added']),
+    ("Columns Removed", summary['cols_removed']),
+    ("Columns Modified", summary['cols_modified']),
+    ("RLS Policies (add/update/remove)", f"{summary['policies_add']}/{summary['policies_modify']}/{summary['policies_remove']}") ,
+    ("Functions (add/update/remove)", f"{summary['functions_add']}/{summary['functions_modify']}/{summary['functions_remove']}") ,
+    ("Views (add/update/remove)", f"{summary['views_add']}/{summary['views_modify']}/{summary['views_remove']}") ,
+    ("Buckets to Review", summary['buckets_changed']),
+    ("Edge Functions (add/update/remove)", f"{summary['edge_add']}/{summary['edge_modify']}/{summary['edge_remove']}") ,
+    ("Secrets (add/remove)", f"{summary['secrets_add']}/{summary['secrets_remove']}") ,
+    ("Recommended Actions", summary['actions'])
+]
+
+for label, value in summary_items:
+    html_parts.append(f"<div class='summary-card'><h3>{html.escape(str(label))}</h3><p>{html.escape(str(value))}</p></div>")
+
+html_parts.append("</div></section>")
+
+html_parts.append("<section class='section-block'><h2>Action Plan</h2>")
+if actions_sorted:
+    html_parts.append("<div class='timeline'>")
+    for action in actions_sorted:
+        html_parts.append(f"<div class='timeline-item'>{html.escape(action)}</div>")
+    html_parts.append("</div>")
+else:
+    html_parts.append("<p>✅ Target environment already matches source. No actions required.</p>")
+html_parts.append("</section>")
+
+html_parts.append("<section class='section-block'><h2>Database Schema Details</h2>")
+if table_diffs:
+    for table in sorted(table_diffs.keys()):
+        entry = table_diffs[table]
+        status_chip = ""
+        if entry['status'] == 'new':
+            status_chip = "<span class='status-new'>New</span>"
+        elif entry['status'] == 'removed':
+            status_chip = "<span class='status-review'>Only in target</span>"
+        elif entry['add_columns'] or entry['remove_columns'] or entry['modify_columns']:
+            status_chip = "<span class='status-update'>Updates</span>"
+        html_parts.append(f"<div class='data-card'><h3>{html.escape(table)} {status_chip}</h3>")
+        if entry['status'] == 'new':
+            html_parts.append("<p>Table exists only in source.</p><ul class='item-list'>")
+            for col in entry['add_columns']:
+                html_parts.append(f"<li>{html.escape(col.get('column_name',''))}: {html.escape(describe_column(col))}</li>")
+            html_parts.append("</ul>")
+        elif entry['status'] == 'removed':
+            html_parts.append("<p>Table exists only in target.</p>")
+        else:
+            if entry['add_columns']:
+                html_parts.append("<p><strong>Columns to add:</strong></p><ul class='item-list'>")
+                for col in entry['add_columns']:
+                    html_parts.append(f"<li>{html.escape(col.get('column_name',''))}: {html.escape(describe_column(col))}</li>")
+                html_parts.append("</ul>")
+            if entry['remove_columns']:
+                html_parts.append("<p><strong>Columns present only in target:</strong></p><ul class='item-list'>")
+                for col in entry['remove_columns']:
+                    html_parts.append(f"<li>{html.escape(col.get('column_name',''))}</li>")
+                html_parts.append("</ul>")
+            if entry['modify_columns']:
+                html_parts.append("<p><strong>Columns to alter:</strong></p><ul class='item-list'>")
+                for mod in entry['modify_columns']:
+                    html_parts.append(f"<li>{html.escape(mod['column'])}: {html.escape('; '.join(mod['changes']))}</li>")
+                html_parts.append("</ul>")
+            if entry['index_add'] or entry['index_remove']:
+                if entry['index_add']:
+                    html_parts.append("<p><strong>Indexes to create:</strong></p><ul class='item-list'>")
+                    for idx in entry['index_add']:
+                        html_parts.append(f"<li>{html.escape(idx['name'])}</li>")
+                    html_parts.append("</ul>")
+                if entry['index_remove']:
+                    html_parts.append("<p><strong>Indexes to review/remove:</strong></p><ul class='item-list'>")
+                    for idx in entry['index_remove']:
+                        html_parts.append(f"<li>{html.escape(idx['name'])}</li>")
+                    html_parts.append("</ul>")
+            if entry['trigger_add'] or entry['trigger_remove'] or entry['trigger_modify']:
+                if entry['trigger_add']:
+                    html_parts.append("<p><strong>Triggers to create:</strong></p><ul class='item-list'>")
+                    for trig in entry['trigger_add']:
+                        html_parts.append(f"<li>{html.escape(trig['name'])}</li>")
+                    html_parts.append("</ul>")
+                if entry['trigger_remove']:
+                    html_parts.append("<p><strong>Triggers to review:</strong></p><ul class='item-list'>")
+                    for trig in entry['trigger_remove']:
+                        html_parts.append(f"<li>{html.escape(trig['name'])}</li>")
+                    html_parts.append("</ul>")
+                if entry['trigger_modify']:
+                    html_parts.append("<p><strong>Triggers with definition changes:</strong></p><ul class='item-list'>")
+                    for trig in entry['trigger_modify']:
+                        html_parts.append(f"<li>{html.escape(trig['name'])}</li>")
+                    html_parts.append("</ul>")
+            if entry['row_count']:
+                rc = entry['row_count']
+                html_parts.append(f"<p><strong>Data difference:</strong> {rc['source']} rows (source) vs {rc['target']} rows (target) → Δ {rc['diff']}</p>")
+        html_parts.append("</div>")
+else:
+    html_parts.append("<p>Database structures are identical between source and target.</p>")
+html_parts.append("</section>")
+
+html_parts.append("<section class='section-block'><h2>RLS Policies</h2>")
+if policy_diffs:
+    for diff in policy_diffs:
+        policy = diff['policy']
+        title = html.escape(f"{policy.get('schemaname')}.{policy.get('tablename')}.{policy.get('policyname')}")
+        if diff['type'] == 'add':
+            chip = "<span class='status-new'>Create</span>"
+            html_parts.append(f"<div class='data-card'><h3>{title} {chip}</h3><p>Roles: {html.escape(str(policy.get('roles')))} • Command: {html.escape(str(policy.get('cmd')))}</p></div>")
+        elif diff['type'] == 'remove':
+            chip = "<span class='status-review'>Review</span>"
+            html_parts.append(f"<div class='data-card'><h3>{title} {chip}</h3><p>Present only in target. Review necessity.</p></div>")
+        else:
+            chip = "<span class='status-update'>Alter</span>"
+            html_parts.append(f"<div class='data-card'><h3>{title} {chip}</h3><ul class='item-list'>")
+            for change in diff.get('changes', []):
+                html_parts.append(f"<li>{html.escape(change)}</li>")
+            html_parts.append("</ul></div>")
+else:
+    html_parts.append("<p>No RLS differences.</p>")
+html_parts.append("</section>")
+
+html_parts.append("<section class='section-block'><h2>Database Functions</h2>")
+if function_diffs:
+    for diff in function_diffs:
+        func = diff['function']
+        name = html.escape(diff['function'].get('schema','') + '.' + diff['function'].get('name',''))
+        if diff['type'] == 'add':
+            chip = "<span class='status-new'>Create</span>"
+            html_parts.append(f"<div class='data-card'><h3>{name} {chip}</h3></div>")
+        elif diff['type'] == 'remove':
+            chip = "<span class='status-review'>Review</span>"
+            html_parts.append(f"<div class='data-card'><h3>{name} {chip}</h3></div>")
+        else:
+            chip = "<span class='status-update'>Alter</span>"
+            diff_lines = diff.get('diff', [])
+            preview = diff_lines[:120]
+            text = '\n'.join(preview)
+            html_parts.append(f"<div class='data-card'><h3>{name} {chip}</h3><div class='diff-box'>{html.escape(text) if text else 'Definition differs'}</div></div>")
+else:
+    html_parts.append("<p>No function differences.</p>")
+html_parts.append("</section>")
+
+html_parts.append("<section class='section-block'><h2>Views</h2>")
+if view_diffs:
+    for diff in view_diffs:
+        view = diff['view']
+        name = html.escape(diff['view'].get('schema','') + '.' + diff['view'].get('table_name',''))
+        if diff['type'] == 'add':
+            chip = "<span class='status-new'>Create</span>"
+            html_parts.append(f"<div class='data-card'><h3>{name} {chip}</h3></div>")
+        elif diff['type'] == 'remove':
+            chip = "<span class='status-review'>Review</span>"
+            html_parts.append(f"<div class='data-card'><h3>{name} {chip}</h3></div>")
+        else:
+            chip = "<span class='status-update'>Alter</span>"
+            diff_lines = diff.get('diff', [])
+            preview = diff_lines[:120]
+            text = '\n'.join(preview)
+            html_parts.append(f"<div class='data-card'><h3>{name} {chip}</h3><div class='diff-box'>{html.escape(text) if text else 'Definition differs'}</div></div>")
+else:
+    html_parts.append("<p>No view differences.</p>")
+html_parts.append("</section>")
+
+html_parts.append("<section class='section-block'><h2>Storage Buckets</h2>")
+if bucket_diffs:
+    for diff in bucket_diffs:
+        bucket = html.escape(diff['bucket'])
+        if diff['type'] == 'add':
+            chip = "<span class='status-new'>Create</span>"
+            html_parts.append(f"<div class='data-card'><h3>{bucket} {chip}</h3><p>Bucket exists only in source.</p></div>")
+        elif diff['type'] == 'remove':
+            chip = "<span class='status-review'>Review</span>"
+            html_parts.append(f"<div class='data-card'><h3>{bucket} {chip}</h3><p>Bucket exists only in target.</p></div>")
+        else:
+            chip = "<span class='status-update'>Update</span>"
+            html_parts.append(f"<div class='data-card'><h3>{bucket} {chip}</h3>")
+            if diff['metadata_changes']:
+                html_parts.append("<p><strong>Metadata changes:</strong></p><ul class='item-list'>")
+                for change in diff['metadata_changes']:
+                    html_parts.append(f"<li>{html.escape(change['field'])}: {html.escape(str(change['target']))} → {html.escape(str(change['source']))}</li>")
+                html_parts.append("</ul>")
+            if diff['new_files']:
+                html_parts.append(f"<p><strong>Files to upload ({len(diff['new_files'])}):</strong></p><ul class='item-list'>")
+                for name in diff['new_files'][:10]:
+                    html_parts.append(f"<li>{html.escape(name)}</li>")
+                if len(diff['new_files']) > 10:
+                    html_parts.append(f"<li>… {len(diff['new_files']) - 10} more</li>")
+                html_parts.append("</ul>")
+            if diff['missing_files']:
+                html_parts.append(f"<p><strong>Files only in target ({len(diff['missing_files'])}):</strong></p><ul class='item-list'>")
+                for name in diff['missing_files'][:10]:
+                    html_parts.append(f"<li>{html.escape(name)}</li>")
+                if len(diff['missing_files']) > 10:
+                    html_parts.append(f"<li>… {len(diff['missing_files']) - 10} more</li>")
+                html_parts.append("</ul>")
+            if diff['changed_files']:
+                html_parts.append(f"<p><strong>Files with size differences ({len(diff['changed_files'])}):</strong></p><ul class='item-list'>")
+                for item in diff['changed_files'][:10]:
+                    html_parts.append(f"<li>{html.escape(item['name'])}: {item['target_size']} → {item['source_size']} bytes</li>")
+                if len(diff['changed_files']) > 10:
+                    html_parts.append(f"<li>… {len(diff['changed_files']) - 10} more</li>")
+                html_parts.append("</ul>")
+            html_parts.append("</div>")
+else:
+    html_parts.append("<p>No storage differences.</p>")
+html_parts.append("</section>")
+
+html_parts.append("<section class='section-block'><h2>Edge Functions</h2>")
+if edge_diffs:
+    for diff in edge_diffs:
+        func = html.escape(diff['function'])
+        if diff['type'] == 'add':
+            chip = "<span class='status-new'>Deploy</span>"
+            html_parts.append(f"<div class='data-card'><h3>{func} {chip}</h3></div>")
+        elif diff['type'] == 'remove':
+            chip = "<span class='status-review'>Review</span>"
+            html_parts.append(f"<div class='data-card'><h3>{func} {chip}</h3></div>")
+        else:
+            chip = "<span class='status-update'>Update</span>"
+            diff_lines = diff.get('diff', [])
+            preview = diff_lines[:200]
+            text = '\n'.join(preview)
+            if not text:
+                text = 'Code differs between environments.'
+            html_parts.append(f"<div class='data-card'><h3>{func} {chip}</h3><div class='diff-box'>{html.escape(text)}</div></div>")
+else:
+    html_parts.append("<p>No edge function differences detected or code comparison unavailable.</p>")
+html_parts.append("</section>")
+
+html_parts.append("<section class='section-block'><h2>Secrets</h2>")
+if secret_add or secret_remove:
+    if secret_add:
+        html_parts.append("<p><strong>Secrets to add:</strong></p><ul class='item-list'>")
+        for name in secret_add:
+            html_parts.append(f"<li>{html.escape(name)}</li>")
+        html_parts.append("</ul>")
+    if secret_remove:
+        html_parts.append("<p><strong>Secrets only in target:</strong></p><ul class='item-list'>")
+        for name in secret_remove:
+            html_parts.append(f"<li>{html.escape(name)}</li>")
+        html_parts.append("</ul>")
+else:
+    html_parts.append("<p>No secret key differences.</p>")
+html_parts.append("</section>")
+
+html_parts.append(f"<div class='footer-note'>Report generated on {timestamp_display}</div>")
+html_parts.append("</div></body></html>")
+
+planner_data = {
+    'source_env': source_env,
+    'target_env': target_env,
+    'source_ref': source_ref,
+    'target_ref': target_ref,
+    'generated_at': timestamp_utc.isoformat(),
+    'summary': summary,
+    'database': {
+        'tables': table_diffs,
+        'policies': policy_diffs,
+        'functions': function_diffs,
+        'views': view_diffs,
+    },
+    'storage': bucket_diffs,
+    'edge_functions': edge_diffs,
+    'secrets': {
+        'to_create': secret_add,
+        'only_in_target': secret_remove
+    },
+    'actions': actions_sorted
+}
+
+Path(html_file).write_text('\n'.join(html_parts), encoding='utf-8')
+
+if diff_json_file:
+    Path(diff_json_file).write_text(json.dumps(planner_data, indent=2, ensure_ascii=False), encoding='utf-8')
+
+print(f"[INFO] Detailed planner created with {summary['actions']} recommended action(s)")
+PY
+
+if [ $? -ne 0 ]; then
+    log_error "Failed to generate migration plan report"
+    exit 1
+fi
 
 log_success "Migration plan generated successfully!"
 log_info ""
 log_info "📄 Report saved to: $HTML_FILE"
+log_info "📦 Diff JSON saved to: $DIFF_JSON_FILE"
 log_info ""
 log_info "You can open it in your browser:"
 log_info "  open $HTML_FILE"
-log_info ""
 
 exit 0
 

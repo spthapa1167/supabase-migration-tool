@@ -110,6 +110,275 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
     <style>
+        :root {
+            --ui-background: #f4f6ff;
+            --ui-surface: rgba(255, 255, 255, 0.86);
+            --ui-border: rgba(99, 102, 241, 0.2);
+            --ui-shadow: 0 24px 60px rgba(15, 23, 42, 0.12);
+            --ui-radius-xl: 24px;
+            --ui-text: #0f172a;
+            --ui-muted: #475569;
+            --ui-primary: #4f46e5;
+            --ui-primary-dark: #4338ca;
+            --ui-primary-light: rgba(99, 102, 241, 0.16);
+        }
+
+        body.ui-body {
+            background:
+                radial-gradient(circle at 10% -10%, rgba(99, 102, 241, 0.12), transparent 55%),
+                radial-gradient(circle at 90% 0%, rgba(56, 189, 248, 0.10), transparent 60%),
+                #eef2ff;
+            color: var(--ui-text);
+            min-height: 100vh;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        header.app-header {
+            background: rgba(255, 255, 255, 0.78);
+            backdrop-filter: blur(18px);
+            border-bottom: 1px solid rgba(148, 163, 184, 0.28);
+            box-shadow: 0 18px 40px rgba(15, 23, 42, 0.08);
+        }
+
+        .main-shell {
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 3rem 1.75rem 4rem;
+        }
+
+        .glass-card {
+            background: var(--ui-surface);
+            border: 1px solid var(--ui-border);
+            border-radius: var(--ui-radius-xl);
+            box-shadow: var(--ui-shadow);
+            backdrop-filter: blur(22px);
+            padding: 2rem;
+        }
+
+        [class*="bg-white/80"].rounded-2xl,
+        [class*="bg-white/70"].rounded-2xl {
+            background: var(--ui-surface) !important;
+            border: 1px solid var(--ui-border) !important;
+            border-radius: var(--ui-radius-xl) !important;
+            box-shadow: var(--ui-shadow) !important;
+            backdrop-filter: blur(22px);
+            padding: 2rem !important;
+        }
+
+        .section-title {
+            font-size: 1.65rem;
+            font-weight: 700;
+            color: #1f2937;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .section-title span {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 42px;
+            height: 42px;
+            border-radius: 14px;
+            background: rgba(79, 70, 229, 0.12);
+            color: var(--ui-primary);
+            font-size: 1.1rem;
+        }
+
+        .section-subtitle {
+            font-size: 0.95rem;
+            color: var(--ui-muted);
+            margin-top: 0.35rem;
+        }
+
+        .tab-strip {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+            gap: 0.75rem;
+            padding: 0.75rem;
+            margin-bottom: 2.5rem;
+            border-radius: 22px;
+            background: rgba(248, 250, 252, 0.8);
+        }
+
+        .tab-button {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 0.45rem;
+            min-height: 82px;
+            border-radius: 18px;
+            border: 1px solid transparent;
+            color: var(--ui-muted);
+            font-weight: 600;
+            font-size: 0.92rem;
+            background: transparent;
+            transition: all 0.25s ease;
+        }
+
+        .tab-button svg {
+            width: 1.2rem;
+            height: 1.2rem;
+        }
+
+        .tab-button:hover {
+            color: var(--ui-primary);
+            border-color: rgba(99, 102, 241, 0.28);
+            background: rgba(99, 102, 241, 0.08);
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
+        }
+
+        .tab-button.active {
+            color: var(--ui-primary);
+            border-color: rgba(79, 70, 229, 0.38);
+            background: linear-gradient(135deg, rgba(79, 70, 229, 0.2) 0%, rgba(99, 102, 241, 0.12) 100%);
+            box-shadow: 0 14px 30px rgba(79, 70, 229, 0.2);
+        }
+
+        .tab-button span {
+            pointer-events: none;
+        }
+
+        .btn-primary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.55rem;
+            padding: 0.9rem 1.35rem;
+            border-radius: 16px;
+            font-weight: 600;
+            background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
+            color: #fff;
+            box-shadow: 0 16px 32px rgba(99, 102, 241, 0.28);
+            border: none;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 20px 40px rgba(79, 70, 229, 0.25);
+        }
+
+        button[class*="bg-primary-600"] {
+            border: none !important;
+            color: #fff !important;
+            border-radius: 16px !important;
+            font-weight: 600 !important;
+            padding: 0.9rem 1.35rem !important;
+            background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%) !important;
+            box-shadow: 0 16px 32px rgba(99, 102, 241, 0.25) !important;
+        }
+
+        button[class*="bg-primary-600"]:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 20px 40px rgba(79, 70, 229, 0.25) !important;
+        }
+
+        .btn-secondary {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.85rem 1.25rem;
+            border-radius: 16px;
+            font-weight: 600;
+            color: var(--ui-primary);
+            background: rgba(99, 102, 241, 0.12);
+            border: 1px solid rgba(99, 102, 241, 0.22);
+        }
+
+        .btn-secondary:hover {
+            background: rgba(99, 102, 241, 0.18);
+        }
+
+        input, select, textarea {
+            width: 100%;
+            border-radius: 16px !important;
+            border: 1px solid rgba(148, 163, 184, 0.35) !important;
+            background: rgba(255, 255, 255, 0.95) !important;
+            padding: 0.75rem 1rem !important;
+            font-weight: 500;
+            color: var(--ui-text);
+        }
+
+        input:focus,
+        select:focus,
+        textarea:focus {
+            outline: none;
+            border-color: rgba(99, 102, 241, 0.55) !important;
+            box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.12) !important;
+        }
+
+        label {
+            font-weight: 600;
+            color: var(--ui-muted);
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 1rem;
+        }
+
+        .metric-card {
+            border-radius: 18px;
+            padding: 1.25rem;
+            background: rgba(248, 250, 252, 0.88);
+            border: 1px solid rgba(226, 232, 240, 0.7);
+        }
+
+        .metric-card h4 {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--ui-muted);
+            margin-bottom: 0.35rem;
+        }
+
+        .metric-card p {
+            font-size: 1.65rem;
+            font-weight: 700;
+            color: var(--ui-primary);
+        }
+
+        .log-container {
+            border: 1px solid rgba(15, 23, 42, 0.35);
+            border-radius: 20px;
+            background: #0f172a;
+            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+        }
+
+        table {
+            border-radius: 18px;
+            overflow: hidden;
+            border: 1px solid rgba(226, 232, 240, 0.7);
+            background: rgba(255, 255, 255, 0.88);
+        }
+
+        table thead {
+            background: rgba(99, 102, 241, 0.08);
+            color: #312e81;
+        }
+
+        table th,
+        table td {
+            padding: 0.85rem 1rem;
+        }
+
+        .badge {
+            padding: 0.3rem 0.65rem;
+            border-radius: 999px;
+            font-size: 0.72rem;
+            font-weight: 600;
+        }
+
+        .badge-success { background: rgba(34, 197, 94, 0.18); color: #15803d; }
+        .badge-warning { background: rgba(249, 115, 22, 0.18); color: #c2410c; }
+        .badge-danger { background: rgba(239, 68, 68, 0.18); color: #b91c1c; }
+        .badge-info { background: rgba(59, 130, 246, 0.18); color: #1d4ed8; }
+
         /* Custom scrollbar */
         .custom-scrollbar::-webkit-scrollbar {
             width: 8px;
@@ -151,14 +420,14 @@
 
         /* Focus visible for accessibility */
         *:focus-visible {
-            outline: 2px solid #3498db;
+            outline: 2px solid rgba(99, 102, 241, 0.6);
             outline-offset: 2px;
         }
     </style>
 </head>
-<body class="bg-gradient-to-br from-primary-50 via-primary-100 to-accent-50 min-h-screen font-sans flex flex-col">
+<body class="ui-body font-sans min-h-screen flex flex-col">
     <!-- Header -->
-    <header class="bg-white/90 backdrop-blur-lg border-b border-primary-200/60 sticky top-0 z-50 shadow-md">
+    <header class="app-header sticky top-0 z-50">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
             <div class="flex items-center justify-between h-24">
                 <div class="flex items-center space-x-4">
@@ -257,110 +526,89 @@
     </header>
 
     <!-- Main Container -->
-    <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1">
+    <main class="main-shell flex-1 space-y-12">
         <!-- Tabs Navigation -->
-        <div class="bg-white/70 backdrop-blur-sm rounded-2xl shadow-lg border border-primary-200/60 mb-6 overflow-hidden">
-            <div class="flex space-x-1 p-2 bg-neutral-50/50">
-                <button onclick="switchTab('migration-plan', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200 active bg-primary-600 text-white shadow-md">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
-                        </svg>
-                        <span>Migration Plan</span>
-                    </span>
-                </button>
-                <button onclick="switchTab('main-migration', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
-                        </svg>
-                        <span>Main Migration</span>
-                    </span>
-                </button>
-                <button onclick="switchTab('components', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
-                        </svg>
-                        <span>Components</span>
-                    </span>
-                </button>
-                <button onclick="switchTab('connection-test', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                        </svg>
-                        <span>Connection Test</span>
-                    </span>
-                </button>
-                <button onclick="switchTab('env-comparison', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
-                        </svg>
-                        <span>Environment Comparison</span>
-                    </span>
-                </button>
-                <button onclick="switchTab('history', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                        </svg>
-                        <span>History & Reports</span>
-                    </span>
-                </button>
-                <button onclick="switchTab('cli-manual', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path>
-                        </svg>
-                        <span>CLI Manual</span>
-                    </span>
-                </button>
-                <button onclick="switchTab('ui-manual', this)" 
-                    class="tab-button flex-1 px-6 py-3 text-sm font-semibold rounded-xl transition-all duration-200">
-                    <span class="flex items-center justify-center space-x-2">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
-                        </svg>
-                        <span>UI Manual</span>
-                    </span>
-                </button>
-            </div>
+        <div class="glass-card tab-strip">
+            <button onclick="switchTab('migration-plan', this)" class="tab-button active">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                </svg>
+                <span>Migration Plan</span>
+            </button>
+            <button onclick="switchTab('main-migration', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                <span>Main Migration</span>
+            </button>
+            <button onclick="switchTab('components', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+                </svg>
+                <span>Components</span>
+            </button>
+            <button onclick="switchTab('connection-test', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span>Connection Test</span>
+            </button>
+            <button onclick="switchTab('env-comparison', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                </svg>
+                <span>Environment Comparison</span>
+            </button>
+            <button onclick="switchTab('edge-comparison', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c1.657 0 3-1.343 3-3S13.657 2 12 2 9 3.343 9 5s1.343 3 3 3zm0 0c-2.21 0-4 1.343-4 3v9a2 2 0 002 2h4a2 2 0 002-2v-9c0-1.657-1.79-3-4-3zm6 5a2 2 0 012 2v5a2 2 0 11-4 0v-5a2 2 0 012-2zm-12 0a2 2 0 012 2v5a2 2 0 11-4 0v-5a2 2 0 012-2z" />
+                </svg>
+                <span>Edge Functions</span>
+            </button>
+            <button onclick="switchTab('history', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+                <span>History & Reports</span>
+            </button>
+            <button onclick="switchTab('cli-manual', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+                <span>CLI Manual</span>
+            </button>
+            <button onclick="switchTab('ui-manual', this)" class="tab-button">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.247 18 16.5 18c-1.746 0-3.332.477-4.5 1.253"></path>
+                </svg>
+                <span>UI Manual</span>
+            </button>
         </div>
 
         <!-- Tab Contents -->
         <div class="space-y-6">
             <!-- Migration Plan Tab -->
             <div id="migration-plan" class="tab-content">
-                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
-                    <div class="flex items-center space-x-3 mb-6">
-                        <div class="flex items-center justify-center w-12 h-12 bg-primary-100 rounded-xl">
-                            <svg class="w-6 h-6 text-primary-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <div class="glass-card animate-fade-in space-y-6">
+                    <div class="section-title">
+                        <span>
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path>
                             </svg>
-                        </div>
+                        </span>
                         <div>
-                            <h2 class="text-2xl font-bold text-primary-900">Generate Migration Plan</h2>
-                            <p class="text-neutral-600 text-sm">Compare source and target environments to see what needs to be migrated</p>
+                            <div>Generate Migration Plan</div>
+                            <p class="section-subtitle">Compare source and target environments to see what needs to be migrated.</p>
                         </div>
                     </div>
-                    
+
                     <form id="planForm" class="space-y-6">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                             <div>
                                 <label for="planSource" class="block text-sm font-semibold text-primary-800 mb-2">
                                     Source Environment
                                 </label>
-                                <select id="planSource" required
-                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-300 rounded-xl text-primary-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                <select id="planSource" required class="w-full">
                                     <option value="">Select source environment...</option>
                                     <option value="dev">Development (dev)</option>
                                     <option value="test">Test (test)</option>
@@ -372,8 +620,7 @@
                                 <label for="planTarget" class="block text-sm font-semibold text-neutral-700 mb-2">
                                     Target Environment
                                 </label>
-                                <select id="planTarget" required
-                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-200 rounded-xl text-neutral-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                <select id="planTarget" required class="w-full">
                                     <option value="">Select target environment...</option>
                                     <option value="dev">Development (dev)</option>
                                     <option value="test">Test (test)</option>
@@ -382,8 +629,7 @@
                             </div>
                         </div>
 
-                        <button type="submit" 
-                            class="w-full md:w-auto px-8 py-3.5 bg-gradient-to-r from-primary-500 to-primary-700 text-white font-semibold rounded-xl shadow-lg shadow-primary-500/25 hover:shadow-xl hover:shadow-primary-500/30 hover:from-primary-600 hover:to-primary-800 transform hover:-tranneutral-y-0.5 transition-all duration-200 flex items-center justify-center space-x-2">
+                        <button type="submit" class="btn-primary w-full md:w-auto">
                             <span>Generate Migration Plan</span>
                             <span id="planLoading" class="loading-spinner hidden"></span>
                         </button>
@@ -395,27 +641,26 @@
 
             <!-- Main Migration Tab -->
             <div id="main-migration" class="tab-content hidden">
-                <div class="bg-white/80 backdrop-blur-sm rounded-2xl shadow-xl border border-primary-200/60 p-8 animate-fade-in">
-                    <div class="flex items-center space-x-3 mb-6">
-                        <div class="flex items-center justify-center w-12 h-12 bg-accent-100 rounded-xl">
-                            <svg class="w-6 h-6 text-accent-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                <div class="glass-card animate-fade-in space-y-6">
+                    <div class="section-title">
+                        <span>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                             </svg>
-                        </div>
+                        </span>
                         <div>
-                            <h2 class="text-2xl font-bold text-primary-900">Complete Migration</h2>
-                            <p class="text-neutral-600 text-sm">Run complete migration with all components</p>
+                            <div>Complete Migration</div>
+                            <p class="section-subtitle">Run a full migration with schema, data, storage, and secrets.</p>
                         </div>
                     </div>
-                    
+
                     <form id="mainMigrationForm" class="space-y-6">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
                             <div>
                                 <label for="mainSource" class="block text-sm font-semibold text-neutral-700 mb-2">
                                     Source Environment
                                 </label>
-                                <select id="mainSource" required
-                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-200 rounded-xl text-neutral-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                <select id="mainSource" required class="w-full">
                                     <option value="">Select source environment...</option>
                                     <option value="dev">Development (dev)</option>
                                     <option value="test">Test (test)</option>
@@ -427,8 +672,7 @@
                                 <label for="mainTarget" class="block text-sm font-semibold text-neutral-700 mb-2">
                                     Target Environment
                                 </label>
-                                <select id="mainTarget" required
-                                    class="w-full px-4 py-3 bg-white border-2 border-neutral-200 rounded-xl text-neutral-900 focus:border-primary-500 focus:ring-2 focus:ring-primary-200 transition-all duration-200">
+                                <select id="mainTarget" required class="w-full">
                                     <option value="">Select target environment...</option>
                                     <option value="dev">Development (dev)</option>
                                     <option value="test">Test (test)</option>
@@ -437,60 +681,44 @@
                             </div>
                         </div>
 
-                        <div>
-                            <label class="block text-sm font-semibold text-neutral-700 mb-3">Migration Options</label>
-                            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
-                                    <input type="checkbox" id="mainData" 
-                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
-                                    <div>
-                                        <span class="font-medium text-neutral-900">Include Data</span>
-                                        <p class="text-xs text-neutral-500">Migrate database rows</p>
-                                    </div>
-                                </label>
-                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
-                                    <input type="checkbox" id="mainUsers" 
-                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
-                                    <div>
-                                        <span class="font-medium text-neutral-900">Auth Users</span>
-                                        <p class="text-xs text-neutral-500">Migrate auth users</p>
-                                    </div>
-                                </label>
-                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
-                                    <input type="checkbox" id="mainFiles" 
-                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
-                                    <div>
-                                        <span class="font-medium text-neutral-900">Include Files</span>
-                                        <p class="text-xs text-neutral-500">Migrate bucket files</p>
-                                    </div>
-                                </label>
-                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
-                                    <input type="checkbox" id="mainBackup" 
-                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
-                                    <div>
-                                        <span class="font-medium text-neutral-900">Create Backup</span>
-                                        <p class="text-xs text-neutral-500">Backup before migration</p>
-                                    </div>
-                                </label>
-                                <label class="flex items-center space-x-3 p-4 bg-neutral-50 rounded-xl border-2 border-neutral-200 hover:border-primary-300 hover:bg-primary-50/50 cursor-pointer transition-all duration-200">
-                                    <input type="checkbox" id="mainDryRun" 
-                                        class="w-5 h-5 text-primary-600 border-neutral-300 rounded focus:ring-2 focus:ring-primary-500 focus:ring-offset-2">
-                                    <div>
-                                        <span class="font-medium text-neutral-900">Dry Run</span>
-                                        <p class="text-xs text-neutral-500">Preview only</p>
-                                    </div>
-                                </label>
-                            </div>
+                        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                            <label class="inline-flex items-center space-x-3 bg-white/70 border border-neutral-200 rounded-xl px-4 py-3">
+                                <input type="checkbox" id="mainData" class="h-4 w-4 text-primary-600 border-neutral-300 rounded focus:ring-primary-500">
+                                <span class="text-sm font-semibold text-neutral-700">Include Data (--data)</span>
+                            </label>
+                            <label class="inline-flex items-center space-x-3 bg-white/70 border border-neutral-200 rounded-xl px-4 py-3">
+                                <input type="checkbox" id="mainUsers" class="h-4 w-4 text-primary-600 border-neutral-300 rounded focus:ring-primary-500">
+                                <span class="text-sm font-semibold text-neutral-700">Auth Users (--users)</span>
+                            </label>
+                            <label class="inline-flex items-center space-x-3 bg-white/70 border border-neutral-200 rounded-xl px-4 py-3">
+                                <input type="checkbox" id="mainFiles" class="h-4 w-4 text-primary-600 border-neutral-300 rounded focus:ring-primary-500">
+                                <span class="text-sm font-semibold text-neutral-700">Include Files (--file)</span>
+                            </label>
+                            <label class="inline-flex items-center space-x-3 bg-white/70 border border-neutral-200 rounded-xl px-4 py-3">
+                                <input type="checkbox" id="mainBackup" class="h-4 w-4 text-primary-600 border-neutral-300 rounded focus:ring-primary-500">
+                                <span class="text-sm font-semibold text-neutral-700">Create Backup</span>
+                            </label>
+                            <label class="inline-flex items-center space-x-3 bg-white/70 border border-neutral-200 rounded-xl px-4 py-3">
+                                <input type="checkbox" id="mainDryRun" class="h-4 w-4 text-primary-600 border-neutral-300 rounded focus:ring-primary-500">
+                                <span class="text-sm font-semibold text-neutral-700">Dry Run</span>
+                            </label>
                         </div>
 
-                        <button type="submit" 
-                            class="w-full md:w-auto px-8 py-3.5 bg-gradient-to-r from-accent-500 to-accent-600 text-white font-semibold rounded-xl shadow-lg shadow-accent-500/25 hover:shadow-xl hover:shadow-accent-500/30 hover:from-accent-600 hover:to-accent-700 transform hover:-tranneutral-y-0.5 transition-all duration-200 flex items-center justify-center space-x-2">
-                            <span>Run Complete Migration</span>
-                            <span id="mainLoading" class="loading-spinner hidden"></span>
-                        </button>
+                        <div class="flex flex-wrap items-center gap-3">
+                            <button type="submit" class="btn-primary">
+                                <span>Run Complete Migration</span>
+                                <span id="mainLoading" class="loading-spinner hidden"></span>
+                            </button>
+                            <button type="button" onclick="openLogs('full')" class="btn-secondary">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 15l-3 3m0 0l-3-3m3 3V3" />
+                                </svg>
+                                <span>View Last Logs</span>
+                            </button>
+                        </div>
                     </form>
 
-                    <div id="mainResult" class="mt-6"></div>
+                    <div id="mainResult"></div>
                 </div>
             </div>
 
@@ -748,6 +976,60 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Edge Functions Comparison Tab -->
+            <div id="edge-comparison" class="tab-content hidden">
+                <div class="glass-card animate-fade-in space-y-6">
+                    <div class="section-title">
+                        <span>
+                            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8c1.657 0 3-1.343 3-3S13.657 2 12 2 9 3.343 9 5s1.343 3 3 3zm0 0c-2.21 0-4 1.343-4 3v9a2 2 0 002 2h4a2 2 0 002-2v-9c0-1.657-1.79-3-4-3zm6 5a2 2 0 012 2v5a2 2 0 11-4 0v-5a2 2 0 012-2zm-12 0a2 2 0 012 2v5a2 2 0 11-4 0v-5a2 2 0 012-2z" />
+                            </svg>
+                        </span>
+                        <div>
+                            <div>Edge Function Comparison</div>
+                            <p class="section-subtitle">Generate a focused diff for edge function deployments between environments.</p>
+                        </div>
+                    </div>
+
+                    <form id="edgeCompareForm" class="space-y-6">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <div>
+                                <label for="edgeCompareSource" class="block text-sm font-semibold text-primary-800 mb-2">
+                                    Source Environment
+                                </label>
+                                <select id="edgeCompareSource" required class="w-full">
+                                    <option value="">Select source environment...</option>
+                                    <option value="dev" selected>Development (dev)</option>
+                                    <option value="test">Test (test)</option>
+                                    <option value="prod">Production (prod)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label for="edgeCompareTarget" class="block text-sm font-semibold text-neutral-700 mb-2">
+                                    Target Environment
+                                </label>
+                                <select id="edgeCompareTarget" required class="w-full">
+                                    <option value="">Select target environment...</option>
+                                    <option value="dev">Development (dev)</option>
+                                    <option value="test" selected>Test (test)</option>
+                                    <option value="prod">Production (prod)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="flex flex-wrap items-center gap-3">
+                            <button type="submit" class="btn-primary">
+                                <span>Run Edge Comparison</span>
+                                <span id="edgeCompareLoading" class="loading-spinner hidden"></span>
+                            </button>
+                            <div id="edgeCompareStatus" class="text-sm text-neutral-600"></div>
+                        </div>
+                    </form>
+                </div>
+
+                <div id="edgeComparisonResult" class="space-y-6 mt-6"></div>
+            </div>
             
             <!-- Connection Test Tab -->
             <div id="connection-test" class="tab-content hidden">
@@ -862,11 +1144,11 @@
                         </div>
                         <div>
                             <h2 class="text-2xl font-bold text-primary-900">Command Line Manual</h2>
-                            <p class="text-neutral-600 text-sm">Complete guide for using migration scripts from the command line</p>
+                            <p class="text-neutral-600 text-sm">Latest CLI workflow and command references</p>
                         </div>
                     </div>
-                    <div class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar">
-                        <iframe src="user_manual.html" class="w-full h-[800px] border-0 rounded-lg" frameborder="0" style="min-height: 800px;"></iframe>
+                    <div id="cliManualContainer" class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar text-sm text-neutral-700 leading-relaxed">
+                        <div class="text-center text-neutral-500">Loading CLI manual...</div>
                     </div>
                 </div>
             </div>
@@ -882,159 +1164,11 @@
                         </div>
                         <div>
                             <h2 class="text-2xl font-bold text-primary-900">Web UI Manual</h2>
-                            <p class="text-neutral-600 text-sm">Complete guide for using the web-based migration interface</p>
+                            <p class="text-neutral-600 text-sm">Latest reference for operating the web application</p>
                         </div>
                     </div>
-                    <div class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar">
-                        <h3 class="text-2xl font-bold text-primary-900 mb-4">Web UI User Guide</h3>
-                        
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Overview</h4>
-                            <p class="text-neutral-700 mb-4">
-                                The Supabase Migration Tool Web UI provides a user-friendly interface for managing all aspects of Supabase migrations. 
-                                You can generate migration plans, run complete or component-specific migrations, and view detailed reports and logs.
-                            </p>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Getting Started</h4>
-                            <ol class="list-decimal list-inside space-y-2 text-neutral-700">
-                                <li>Enter your access key on the login page</li>
-                                <li>Once authenticated, you'll see the main dashboard</li>
-                                <li>Select your source and target environments</li>
-                                <li>Choose migration options and run migrations</li>
-                            </ol>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Tabs Overview</h4>
-                            
-                            <div class="space-y-4">
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">1. Migration Plan</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Generate a comprehensive comparison report between source and target environments. 
-                                        This shows what needs to be migrated, what's different, and provides a detailed action plan.
-                                    </p>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">2. Main Migration</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Run a complete migration with all components. Options include:
-                                    </p>
-                                    <ul class="list-disc list-inside ml-4 mt-2 text-sm text-neutral-600">
-                                        <li><strong>Include Data:</strong> Migrate database rows (--data)</li>
-                                        <li><strong>Auth Users:</strong> Migrate authentication users (--users)</li>
-                                        <li><strong>Include Files:</strong> Migrate bucket files (--files)</li>
-                                        <li><strong>Create Backup:</strong> Backup target before migration (--backup)</li>
-                                        <li><strong>Dry Run:</strong> Preview changes without applying (--dry-run)</li>
-                                    </ul>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">3. Component Migrations</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Run individual component migrations:
-                                    </p>
-                                    <ul class="list-disc list-inside ml-4 mt-2 text-sm text-neutral-600">
-                                        <li><strong>Database Migration:</strong> Schema, data, and auth users</li>
-                                        <li><strong>Storage Migration:</strong> Buckets and files</li>
-                                        <li><strong>Edge Functions:</strong> Deploy edge functions</li>
-                                        <li><strong>Secrets Migration:</strong> Migrate project secrets</li>
-                                    </ul>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">4. History & Reports</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        View past migrations and generated plans. Click "View Report" to see detailed HTML reports 
-                                        or "View Log" to see the complete migration log.
-                                    </p>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">5. CLI Manual</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Complete documentation for using migration scripts from the command line.
-                                    </p>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">6. UI Manual</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        This guide - complete documentation for using the web interface.
-                                    </p>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Features</h4>
-                            
-                            <div class="space-y-3">
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">Real-time Log Streaming:</strong>
-                                        <p class="text-neutral-700 text-sm">Watch migrations progress in real-time with live log updates</p>
-                                    </div>
-                                </div>
-
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">Active Job Indicator:</strong>
-                                        <p class="text-neutral-700 text-sm">See running jobs in the header and navigate to them directly</p>
-                                    </div>
-                                </div>
-
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">HTML Reports:</strong>
-                                        <p class="text-neutral-700 text-sm">Detailed HTML reports for every migration with statistics and change logs</p>
-                                    </div>
-                                </div>
-
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">Color-coded Logs:</strong>
-                                        <p class="text-neutral-700 text-sm">Success (green), errors (red), and warnings (yellow) are clearly highlighted</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Best Practices</h4>
-                            <ul class="list-disc list-inside space-y-2 text-neutral-700">
-                                <li>Always generate a migration plan first to understand what will be migrated</li>
-                                <li>Use dry-run mode to preview changes before applying them</li>
-                                <li>Create backups before running migrations on production environments</li>
-                                <li>Review migration reports after completion to verify success</li>
-                                <li>Check logs if a migration fails to identify the issue</li>
-                            </ul>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Troubleshooting</h4>
-                            <div class="bg-warning-50 border-2 border-warning-200 rounded-lg p-4">
-                                <p class="text-warning-800 text-sm">
-                                    <strong>If a migration fails:</strong> Check the log output for specific error messages. 
-                                    Common issues include missing environment variables, authentication problems, or network connectivity issues.
-                                </p>
-                            </div>
-                        </section>
+                    <div id="uiManualContainer" class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar text-sm text-neutral-700 leading-relaxed">
+                        <div class="text-center text-neutral-500">Loading UI manual...</div>
                     </div>
                 </div>
             </div>
@@ -1171,54 +1305,7 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="ui.js"></script>
-    <script>
-        // Tab switching with Tailwind classes
-        function switchTab(tabName, clickedElement) {
-            // Hide all tabs
-            document.querySelectorAll('.tab-content').forEach(tab => {
-                tab.classList.add('hidden');
-                tab.classList.remove('animate-fade-in');
-            });
-            document.querySelectorAll('.tab-button').forEach(btn => {
-                    btn.classList.remove('active', 'bg-primary-600', 'text-white', 'shadow-md');
-                    btn.classList.add('text-neutral-600', 'hover:bg-neutral-100');
-            });
-
-            // Show selected tab
-            const selectedTab = document.getElementById(tabName);
-            if (selectedTab) {
-                selectedTab.classList.remove('hidden');
-                selectedTab.classList.add('animate-fade-in');
-            }
-
-            // Update button
-            if (clickedElement) {
-                clickedElement.classList.add('active', 'bg-primary-600', 'text-white', 'shadow-md');
-                clickedElement.classList.remove('text-neutral-600', 'hover:bg-neutral-100');
-            }
-
-            // Load data for history tab
-            if (tabName === 'history') {
-                setTimeout(() => {
-                    loadHistory();
-                    loadPlans();
-                }, 100);
-            }
-        }
-
-        // Loading spinner component
-        const loadingSpinnerHTML = `
-            <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-            </svg>
-        `;
-
-        // Update loading spinner
-        document.querySelectorAll('.loading-spinner').forEach(spinner => {
-            spinner.innerHTML = loadingSpinnerHTML;
-        });
-    </script>
 </body>
 </html>

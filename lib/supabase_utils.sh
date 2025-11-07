@@ -205,6 +205,107 @@ get_pooler_host() {
     echo "${SUPABASE_POOLER_HOST:-aws-1-us-east-2.pooler.supabase.com}"
 }
 
+# Retrieve pooler region for an environment (falls back to default shared region)
+get_pooler_region_for_env() {
+    local env_name=$1
+    case $env_name in
+        prod|production|main)
+            echo "${SUPABASE_PROD_POOLER_REGION:-aws-1-us-east-2}"
+            ;;
+        test|staging)
+            echo "${SUPABASE_TEST_POOLER_REGION:-aws-1-us-east-2}"
+            ;;
+        dev|develop)
+            echo "${SUPABASE_DEV_POOLER_REGION:-aws-1-us-east-2}"
+            ;;
+        *)
+            echo "aws-1-us-east-2"
+            ;;
+    esac
+}
+
+# Retrieve pooler port for an environment (defaults to 6543)
+get_pooler_port_for_env() {
+    local env_name=$1
+    case $env_name in
+        prod|production|main)
+            echo "${SUPABASE_PROD_POOLER_PORT:-6543}"
+            ;;
+        test|staging)
+            echo "${SUPABASE_TEST_POOLER_PORT:-6543}"
+            ;;
+        dev|develop)
+            echo "${SUPABASE_DEV_POOLER_PORT:-6543}"
+            ;;
+        *)
+            echo "6543"
+            ;;
+    esac
+}
+
+# Enumerate connection endpoints (host|port|label) to try for a project
+get_supabase_connection_endpoints() {
+    local project_ref=$1
+    local pooler_region=${2:-aws-1-us-east-2}
+    local pooler_port=${3:-6543}
+
+    local shared_pooler_host="${pooler_region}.pooler.supabase.com"
+    local dedicated_pooler_host="db.${project_ref}.supabase.co"
+
+    echo "${shared_pooler_host}|${pooler_port}|postgres.${project_ref}|shared_pooler_${pooler_port}"
+    echo "${shared_pooler_host}|5432|postgres.${project_ref}|shared_pooler_5432"
+    echo "${dedicated_pooler_host}|${pooler_port}|postgres|dedicated_pooler_${pooler_port}"
+    echo "${dedicated_pooler_host}|5432|postgres|dedicated_pooler_5432"
+}
+
+# Run a PostgreSQL tool (pg_dump, pg_restore, etc.) with fallback connections
+run_pg_tool_with_fallback() {
+    local tool=$1
+    local project_ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    local log_file=$6
+    shift 6
+    local tool_args=("$@")
+
+    local success=1
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if [ "$tool" = "psql" ]; then
+            log_error "run_pg_tool_with_fallback does not support psql; use run_psql_with_fallback instead"
+            return 1
+        fi
+
+        log_info "Trying ${tool} via ${label} (${host}:${port})"
+
+        local status
+        if [ -n "$log_file" ]; then
+            PGPASSWORD="$password" PGSSLMODE=require "$tool" \
+                -h "$host" -p "$port" -U "$user" "${tool_args[@]}" 2>&1 | tee -a "$log_file"
+            status=${PIPESTATUS[0]}
+        else
+            PGPASSWORD="$password" PGSSLMODE=require "$tool" \
+                -h "$host" -p "$port" -U "$user" "${tool_args[@]}"
+            status=$?
+        fi
+
+        if [ $status -eq 0 ]; then
+            log_success "${tool} succeeded via ${label}"
+            success=0
+            break
+        else
+            log_warning "${tool} failed via ${label}"
+        fi
+    done < <(get_supabase_connection_endpoints "$project_ref" "$pooler_region" "$pooler_port")
+
+    if [ $success -ne 0 ]; then
+        log_error "${tool} failed for all connection attempts"
+    fi
+
+    return $success
+}
+
 # Check if direct connection is available (DNS resolution test)
 check_direct_connection_available() {
     local project_ref=$1

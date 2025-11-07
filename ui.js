@@ -2,11 +2,44 @@
 
 const API_BASE = '';
 
+let appInfoData = null;
+let cliManualLoaded = false;
+let uiManualLoaded = false;
+let lastEdgeComparison = null;
+let edgeComparisonInFlight = false;
+
+// Persist token from query string (if present) and clean URL
+(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tokenFromUrl = params.get('token');
+    if (tokenFromUrl) {
+        localStorage.setItem('migrationToolToken', tokenFromUrl);
+        params.delete('token');
+        const newQuery = params.toString();
+        const newUrl = window.location.pathname + (newQuery ? `?${newQuery}` : '') + window.location.hash;
+        window.history.replaceState({}, document.title, newUrl);
+    }
+})();
+
 // Get auth token from URL or localStorage
 function getAuthToken() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const token = urlParams.get('token') || localStorage.getItem('migrationToolToken');
-    return token;
+    const storedToken = localStorage.getItem('migrationToolToken');
+    if (storedToken) {
+        return storedToken;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const tokenFromUrl = params.get('token');
+    if (tokenFromUrl) {
+        localStorage.setItem('migrationToolToken', tokenFromUrl);
+        params.delete('token');
+        const newQuery = params.toString();
+        const newUrl = window.location.pathname + (newQuery ? `?${newQuery}` : '') + window.location.hash;
+        window.history.replaceState({}, document.title, newUrl);
+        return tokenFromUrl;
+    }
+
+    return null;
 }
 
 // Set auth token for API requests
@@ -34,8 +67,7 @@ function switchTab(tabName, clickedElement) {
         tab.classList.add('hidden');
     });
     document.querySelectorAll('.tab-button').forEach(btn => {
-        btn.classList.remove('active', 'bg-primary-600', 'text-white', 'shadow-md');
-        btn.classList.add('text-slate-600', 'hover:bg-slate-100');
+        btn.classList.remove('active');
     });
 
     // Show selected tab
@@ -46,8 +78,7 @@ function switchTab(tabName, clickedElement) {
 
     // Update button
     if (clickedElement) {
-        clickedElement.classList.add('active', 'bg-primary-600', 'text-white', 'shadow-md');
-        clickedElement.classList.remove('text-slate-600', 'hover:bg-slate-100');
+        clickedElement.classList.add('active');
     }
 
     // Load data for history tab
@@ -62,6 +93,26 @@ function switchTab(tabName, clickedElement) {
     if (tabName === 'connection-test') {
         // Load environments immediately (no API call, hardcoded)
         loadEnvironmentsList();
+    }
+
+    if (tabName === 'edge-comparison') {
+        onEdgeComparisonTabOpen();
+    }
+
+    if (tabName === 'cli-manual' && !cliManualLoaded) {
+        loadManualContent('cliManualContainer', 'MIGRATION_GUIDE.md').then(() => {
+            cliManualLoaded = true;
+        }).catch(() => {
+            cliManualLoaded = false;
+        });
+    }
+
+    if (tabName === 'ui-manual' && !uiManualLoaded) {
+        loadManualContent('uiManualContainer', 'WEB_UI_GUIDE.md').then(() => {
+            uiManualLoaded = true;
+        }).catch(() => {
+            uiManualLoaded = false;
+        });
     }
 }
 
@@ -131,8 +182,15 @@ function formatLogOutput(output) {
     lines.forEach(line => {
         if (!line.trim()) return;
         let className = 'text-slate-300';
-        if (line.includes('ERROR') || line.includes('✗') || line.includes('Failed')) {
-            className = 'text-error-400';
+        const lowered = line.toLowerCase();
+         if (line.includes('ERROR') || line.includes('✗') || line.includes('Failed')) {
+             className = 'text-error-400';
+        } else if (lowered.includes('retrieved') && lowered.includes(' via ')) {
+            className = 'text-success-400';
+        } else if (lowered.includes('returned no rows')) {
+            className = 'text-neutral-400';
+        } else if (lowered.includes('trying next endpoint')) {
+            className = 'text-warning-400';
         } else if (line.includes('SUCCESS') || line.includes('✓') || line.includes('Completed')) {
             className = 'text-success-400';
         } else if (line.includes('WARNING') || line.includes('⚠')) {
@@ -148,8 +206,16 @@ function addLogLine(container, text, type = 'stdout') {
     const logLine = document.createElement('div');
     logLine.className = 'font-mono text-sm mb-1';
     
+    const normalizedText = text.toLowerCase();
+    
     // Apply styling based on content
-    if (type === 'stderr' || text.includes('ERROR') || text.includes('✗') || text.includes('Failed')) {
+    if (normalizedText.includes('retrieved') && normalizedText.includes(' via ')) {
+        logLine.classList.add('text-success-400', 'font-semibold');
+    } else if (normalizedText.includes('returned no rows')) {
+        logLine.classList.add('text-neutral-400', 'italic');
+    } else if (normalizedText.includes('trying next endpoint')) {
+        logLine.classList.add('text-warning-400', 'italic');
+    } else if (type === 'stderr' || text.includes('ERROR') || text.includes('✗') || text.includes('Failed')) {
         logLine.classList.add('text-error-400');
     } else if (text.includes('SUCCESS') || text.includes('✓') || text.includes('Completed')) {
         logLine.classList.add('text-success-400');
@@ -202,64 +268,57 @@ async function loadAppInfo() {
             headers: getAuthHeaders()
         });
         if (!response.ok) {
-            console.error('Failed to load app info');
-            return;
+            throw new Error('Failed to load app info');
         }
         
-        const info = await response.json();
+        const data = await response.json();
+        appInfoData = data;
         
-        // Update app name in header
-        const appNameElement = document.getElementById('appName');
-        if (appNameElement && info.appName) {
-            appNameElement.textContent = info.appName;
-        }
-        
-        // Update environment project names
         const envInfoElement = document.getElementById('envInfo');
-        if (envInfoElement && info.environments) {
-            const envs = info.environments;
-            const envItems = [];
-            
-            // Production
-            if (envs.prod && envs.prod.projectName && envs.prod.projectName !== 'N/A') {
-                envItems.push(`
-                    <div class="flex items-center space-x-1">
-                        <span class="px-2 py-0.5 bg-error-100 text-error-700 rounded font-semibold text-xs">PROD</span>
-                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.prod.projectName)}</span>
-                    </div>
+        if (envInfoElement && data.environments) {
+            const envOrder = ['prod', 'test', 'dev'];
+            const envBadgeColors = {
+                prod: 'bg-error-100 text-error-700',
+                test: 'bg-warning-100 text-warning-700',
+                dev: 'bg-success-100 text-success-700'
+            };
+
+            const envBadges = [];
+
+            envOrder.forEach(key => {
+                const envData = data.environments[key];
+                if (!envData || !envData.projectName || envData.projectName === 'N/A') {
+                    return;
+                }
+
+                const badgeClass = envBadgeColors[key] || 'bg-neutral-100 text-neutral-700';
+                const projectName = escapeHtml(envData.projectName);
+                const projectRef = escapeHtml(envData.projectRef || 'N/A');
+                const poolerRegion = escapeHtml(envData.poolerRegion || 'aws-1-us-east-2');
+                const poolerPort = escapeHtml(envData.poolerPort || '6543');
+                const directHostRaw = envData.projectRef && envData.projectRef !== 'N/A'
+                    ? `db.${envData.projectRef}.supabase.co`
+                    : '';
+                const directHost = directHostRaw ? escapeHtml(directHostRaw) : '';
+
+                envBadges.push(`
+                    <span class="inline-flex items-center space-x-2 px-2.5 py-1 rounded-full text-xs font-semibold border border-neutral-200 bg-white/80">
+                        <span class="inline-flex items-center justify-center w-6 h-6 rounded-full ${badgeClass}">${key.toUpperCase()}</span>
+                        <span class="text-neutral-700">${projectName}</span>
+                    </span>
                 `);
-            }
-            
-            // Test/Staging
-            if (envs.test && envs.test.projectName && envs.test.projectName !== 'N/A') {
-                envItems.push(`
-                    <div class="flex items-center space-x-1">
-                        <span class="px-2 py-0.5 bg-warning-100 text-warning-700 rounded font-semibold text-xs">TEST</span>
-                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.test.projectName)}</span>
-                    </div>
-                `);
-            }
-            
-            // Development
-            if (envs.dev && envs.dev.projectName && envs.dev.projectName !== 'N/A') {
-                envItems.push(`
-                    <div class="flex items-center space-x-1">
-                        <span class="px-2 py-0.5 bg-success-100 text-success-700 rounded font-semibold text-xs">DEV</span>
-                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.dev.projectName)}</span>
-                    </div>
-                `);
-            }
-            
-            if (envItems.length > 0) {
-                envInfoElement.innerHTML = envItems.join('<span class="text-neutral-300 mx-2">•</span>');
-            } else {
-                envInfoElement.innerHTML = '<span class="text-neutral-500 italic">No environment projects configured</span>';
+            });
+
+            if (envInfoElement) {
+                envInfoElement.innerHTML = envBadges.length
+                    ? envBadges.join('<span class="text-neutral-300">•</span>')
+                    : '<span class="text-neutral-500 italic">No environment projects configured</span>';
             }
         }
     } catch (error) {
         console.error('Error loading app info:', error);
     }
-}
+ }
 
 // Load environments list for connection test (hardcoded)
 function loadEnvironmentsList() {
@@ -352,8 +411,14 @@ async function testConnection(env) {
     
     // Summary card
     const summaryCard = document.createElement('div');
-    summaryCard.className = 'bg-gradient-to-r from-primary-50 to-primary-100 border-2 border-primary-200 rounded-xl p-6';
+    summaryCard.className = 'bg-gradient-to-r from-primary-50 to-primary-100 border-2 border-primary-200 rounded-xl p-6 mb-4';
     summaryCard.id = `testSummary_${env}`;
+    const envConfig = appInfoData?.environments?.[env] || {};
+    const poolerRegion = escapeHtml(envConfig.poolerRegion || 'aws-1-us-east-2');
+    const poolerPort = escapeHtml(envConfig.poolerPort || '6543');
+    const directHostRaw = envConfig.projectRef && envConfig.projectRef !== 'N/A' ? `db.${envConfig.projectRef}.supabase.co` : '';
+    const directHost = directHostRaw ? escapeHtml(directHostRaw) : '';
+    const configLine = directHost ? `Pooler ${poolerRegion}:${poolerPort} • Direct ${directHost}` : `Pooler ${poolerRegion}:${poolerPort}`;
     summaryCard.innerHTML = `
         <div class="flex items-center justify-between">
             <div class="flex items-center space-x-4">
@@ -363,8 +428,10 @@ async function testConnection(env) {
                     </svg>
                 </div>
                 <div>
-                    <h4 class="text-xl font-bold text-primary-900">${envName}</h4>
-                    <p class="text-sm text-primary-700 mt-1">Running connection tests...</p>
+                    <h4 class="text-xl font-bold text-primary-900">${envNames[env]}</h4>
+                    <p class="status-text text-sm text-primary-700 mt-1">Running connection tests...</p>
+                    <p class="config-detail text-xs text-primary-600 mt-1">${configLine}</p>
+                    <p class="connection-detail text-xs text-success-600 mt-1 hidden"></p>
                 </div>
             </div>
             <div class="text-right">
@@ -400,12 +467,6 @@ async function testConnection(env) {
     // Scroll to results
     testResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
     
-    let testStatus = 'running';
-    let passedCount = 0;
-    let failedCount = 0;
-    let totalCount = 0;
-    let skippedCount = 0;
-    
     // Use the shared test function
     await testConnectionForEnv(env, false);
     
@@ -425,13 +486,15 @@ function updateTestSummary(env, passed, failed, total) {
 }
 
 // Update test summary with final status
-function updateTestSummaryFinal(env, passed, failed, total, skipped, success) {
+function updateTestSummaryFinal(env, passed, failed, total, skipped, success, connectionDetail = '') {
     const summaryCard = document.getElementById(`testSummary_${env}`);
     if (!summaryCard) return;
     
     // Update counts
     updateTestSummary(env, passed, failed, total);
-    
+    const statusText = summaryCard.querySelector('.status-text');
+    const connectionDetailEl = summaryCard.querySelector('.connection-detail');
+     
     // Update card styling based on result
     if (success && failed === 0) {
         summaryCard.className = 'bg-gradient-to-r from-success-50 to-success-100 border-2 border-success-200 rounded-xl p-6';
@@ -443,10 +506,18 @@ function updateTestSummaryFinal(env, passed, failed, total, skipped, success) {
                 </svg>
             `;
         }
-        const statusText = summaryCard.querySelector('.text-primary-700');
         if (statusText) {
             statusText.textContent = 'All tests passed!';
-            statusText.className = 'text-sm text-success-700 mt-1 font-semibold';
+            statusText.className = 'status-text text-sm text-success-700 mt-1 font-semibold';
+        }
+        if (connectionDetailEl) {
+            if (connectionDetail) {
+                connectionDetailEl.textContent = `Connected via ${connectionDetail}`;
+                connectionDetailEl.className = 'connection-detail text-xs text-success-600 mt-1';
+            } else {
+                connectionDetailEl.textContent = '';
+                connectionDetailEl.className = 'connection-detail text-xs text-success-600 mt-1 hidden';
+            }
         }
     } else if (failed > 0) {
         summaryCard.className = 'bg-gradient-to-r from-error-50 to-error-100 border-2 border-error-200 rounded-xl p-6';
@@ -458,10 +529,42 @@ function updateTestSummaryFinal(env, passed, failed, total, skipped, success) {
                 </svg>
             `;
         }
-        const statusText = summaryCard.querySelector('.text-primary-700');
         if (statusText) {
             statusText.textContent = `${failed} test(s) failed`;
-            statusText.className = 'text-sm text-error-700 mt-1 font-semibold';
+            statusText.className = 'status-text text-sm text-error-700 mt-1 font-semibold';
+        }
+        if (connectionDetailEl) {
+            if (connectionDetail) {
+                connectionDetailEl.textContent = connectionDetail;
+                connectionDetailEl.className = 'connection-detail text-xs text-error-600 mt-1';
+            } else {
+                connectionDetailEl.textContent = '';
+                connectionDetailEl.className = 'connection-detail text-xs text-error-600 mt-1 hidden';
+            }
+        }
+    } else {
+        // Neutral outcome (no failures but not marked success)
+        summaryCard.className = 'bg-gradient-to-r from-warning-50 to-warning-100 border-2 border-warning-200 rounded-xl p-6';
+        const iconContainer = summaryCard.querySelector('.w-16');
+        if (iconContainer) {
+            iconContainer.innerHTML = `
+                <svg class="w-8 h-8 text-warning-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                </svg>
+            `;
+        }
+        if (statusText) {
+            statusText.textContent = 'Tests finished with warnings';
+            statusText.className = 'status-text text-sm text-warning-700 mt-1 font-semibold';
+        }
+        if (connectionDetailEl) {
+            if (connectionDetail) {
+                connectionDetailEl.textContent = connectionDetail;
+                connectionDetailEl.className = 'connection-detail text-xs text-warning-600 mt-1';
+            } else {
+                connectionDetailEl.textContent = '';
+                connectionDetailEl.className = 'connection-detail text-xs text-warning-600 mt-1 hidden';
+            }
         }
     }
 }
@@ -507,6 +610,12 @@ async function testAllConnections() {
         const summaryCard = document.createElement('div');
         summaryCard.className = 'bg-gradient-to-r from-primary-50 to-primary-100 border-2 border-primary-200 rounded-xl p-6 mb-4';
         summaryCard.id = `testSummary_${env}`;
+        const envConfig = appInfoData?.environments?.[env] || {};
+        const poolerRegion = escapeHtml(envConfig.poolerRegion || 'aws-1-us-east-2');
+        const poolerPort = escapeHtml(envConfig.poolerPort || '6543');
+        const directHostRaw = envConfig.projectRef && envConfig.projectRef !== 'N/A' ? `db.${envConfig.projectRef}.supabase.co` : '';
+        const directHost = directHostRaw ? escapeHtml(directHostRaw) : '';
+        const configLine = directHost ? `Pooler ${poolerRegion}:${poolerPort} • Direct ${directHost}` : `Pooler ${poolerRegion}:${poolerPort}`;
         summaryCard.innerHTML = `
             <div class="flex items-center justify-between">
                 <div class="flex items-center space-x-4">
@@ -517,14 +626,16 @@ async function testAllConnections() {
                     </div>
                     <div>
                         <h4 class="text-xl font-bold text-primary-900">${envNames[env]}</h4>
-                        <p class="text-sm text-primary-700 mt-1">Running connection tests...</p>
+                        <p class="status-text text-sm text-primary-700 mt-1">Running connection tests...</p>
+                        <p class="config-detail text-xs text-primary-600 mt-1">${configLine}</p>
+                        <p class="connection-detail text-xs text-success-600 mt-1 hidden"></p>
                     </div>
                 </div>
                 <div class="text-right">
                     <div class="flex items-center space-x-6">
                         <div class="text-center">
-                            <div class="text-3xl font-bold text-success-600" id="testPassed_${env}">0</div>
-                            <div class="text-xs text-success-600 font-semibold mt-1">Passed</div>
+                            <div class="text-3xl font-bold text-primary-600" id="testPassed_${env}">0</div>
+                            <div class="text-xs text-primary-600 font-semibold mt-1">Passed</div>
                         </div>
                         <div class="text-center">
                             <div class="text-3xl font-bold text-error-600" id="testFailed_${env}">0</div>
@@ -564,13 +675,23 @@ async function testConnectionForEnv(env, isAllTests = false) {
     };
     const envName = envNames[env] || env;
     
+    const envConfig = appInfoData?.environments?.[env] || {};
+    const poolerRegion = escapeHtml(envConfig.poolerRegion || 'aws-1-us-east-2');
+    const poolerPort = escapeHtml(envConfig.poolerPort || '6543');
+    const directHostRaw = envConfig.projectRef && envConfig.projectRef !== 'N/A' ? `db.${envConfig.projectRef}.supabase.co` : '';
+    const directHost = directHostRaw ? escapeHtml(directHostRaw) : '';
+    const configLine = directHost ? `Pooler ${poolerRegion}:${poolerPort} • Direct ${directHost}` : `Pooler ${poolerRegion}:${poolerPort}`;
+    
     const logContainer = document.getElementById(`connectionTestLog_${env}`);
     if (!logContainer) return;
     
+    const TOTAL_TESTS = 13;
     let passedCount = 0;
     let failedCount = 0;
     let totalCount = 0;
     let skippedCount = 0;
+    let lastConnectionLabel = '';
+    let lastFailureDetail = '';
     
     try {
         const response = await fetch(`${API_BASE}/api/connection-test`, {
@@ -616,24 +737,79 @@ async function testConnectionForEnv(env, isAllTests = false) {
                             // Parse test results - be more flexible with patterns
                             const cleanText = text.replace(/\033\[[0-9;]*m/g, ''); // Remove ANSI codes
                             
+                            const totalMatch = cleanText.match(/Total Tests:\s*(\d+)/i);
+                            const passedMatch = cleanText.match(/Passed:\s*(\d+)/i);
+                            const failedMatch = cleanText.match(/Failed:\s*(\d+)/i);
+                            const skippedMatch = cleanText.match(/Skipped:\s*(\d+)/i);
+                            if (totalMatch || passedMatch || failedMatch || skippedMatch) {
+                                if (totalMatch) {
+                                    totalCount = parseInt(totalMatch[1], 10) || totalCount;
+                                }
+                                if (passedMatch) {
+                                    passedCount = parseInt(passedMatch[1], 10) || passedCount;
+                                }
+                                if (failedMatch) {
+                                    failedCount = parseInt(failedMatch[1], 10) || failedCount;
+                                }
+                                if (skippedMatch) {
+                                    skippedCount = parseInt(skippedMatch[1], 10) || skippedCount;
+                                }
+                                totalCount = Math.min(totalCount, TOTAL_TESTS);
+                                passedCount = Math.min(passedCount, TOTAL_TESTS);
+                                failedCount = Math.min(failedCount, TOTAL_TESTS);
+                                skippedCount = Math.min(skippedCount, TOTAL_TESTS - passedCount - failedCount);
+                                updateTestSummary(env, passedCount, failedCount, totalCount);
+                                logLine.className += ' text-primary-300';
+                                logLine.textContent = cleanText;
+                                const placeholder = logContainer.querySelector('.text-slate-400.text-xs');
+                                if (placeholder) {
+                                    placeholder.remove();
+                                }
+                                logContainer.appendChild(logLine);
+                                requestAnimationFrame(() => {
+                                    logContainer.scrollTop = logContainer.scrollHeight;
+                                });
+                                continue;
+                            }
+                            
                             if (cleanText.includes('✅') || cleanText.includes('PASS:') || cleanText.match(/PASS:/i)) {
                                 logLine.className += ' text-success-400 font-semibold';
                                 if (cleanText.includes('PASS:') || cleanText.includes('✅')) {
                                     passedCount++;
                                     totalCount++;
+                                    if (totalCount > TOTAL_TESTS) {
+                                        totalCount = TOTAL_TESTS;
+                                    }
+                                    if (passedCount > TOTAL_TESTS) {
+                                        passedCount = TOTAL_TESTS;
+                                    }
                                     updateTestSummary(env, passedCount, failedCount, totalCount);
+                                    const match = cleanText.match(/Database connectivity \(([^)]+)\)/i);
+                                    if (match) {
+                                        lastConnectionLabel = match[1];
+                                    }
                                 }
                             } else if (cleanText.includes('❌') || cleanText.includes('FAIL:') || cleanText.match(/FAIL:/i)) {
                                 logLine.className += ' text-error-400 font-semibold';
                                 if (cleanText.includes('FAIL:') || cleanText.includes('❌')) {
                                     failedCount++;
                                     totalCount++;
+                                    if (totalCount > TOTAL_TESTS) {
+                                        totalCount = TOTAL_TESTS;
+                                    }
+                                    if (failedCount > TOTAL_TESTS) {
+                                        failedCount = TOTAL_TESTS;
+                                    }
                                     updateTestSummary(env, passedCount, failedCount, totalCount);
+                                    lastFailureDetail = cleanText;
                                 }
                             } else if (cleanText.includes('⚠️') || cleanText.includes('SKIP:') || cleanText.match(/SKIP:/i)) {
                                 logLine.className += ' text-warning-400';
                                 if (cleanText.includes('SKIP:') || cleanText.includes('⚠️')) {
                                     skippedCount++;
+                                    if (skippedCount > TOTAL_TESTS) {
+                                        skippedCount = TOTAL_TESTS;
+                                    }
                                 }
                             } else if (cleanText.includes('[INFO]') || cleanText.includes('━━') || cleanText.includes('━━━')) {
                                 logLine.className += ' text-primary-400';
@@ -661,7 +837,14 @@ async function testConnectionForEnv(env, isAllTests = false) {
                             });
                         } else if (data.type === 'complete') {
                             const success = data.status === 'completed' && failedCount === 0;
-                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, success);
+                            if (totalCount < TOTAL_TESTS) {
+                                totalCount = TOTAL_TESTS;
+                            }
+                            if (passedCount > totalCount) {
+                                passedCount = totalCount;
+                            }
+                            const connectionDetail = success ? lastConnectionLabel : lastFailureDetail;
+                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, success, connectionDetail);
                             
                             // Add final summary to log
                             const summaryLine = document.createElement('div');
@@ -673,7 +856,7 @@ async function testConnectionForEnv(env, isAllTests = false) {
                                             <svg class="w-6 h-6 text-success-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
                                             </svg>
-                                            <span class="font-semibold">All tests passed!</span>
+                                            <span class="font-semibold">All tests passed! (${envName})</span>
                                         ` : `
                                             <svg class="w-6 h-6 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
@@ -685,6 +868,7 @@ async function testConnectionForEnv(env, isAllTests = false) {
                                         ${passedCount} passed, ${failedCount} failed${skippedCount > 0 ? `, ${skippedCount} skipped` : ''}
                                     </div>
                                 </div>
+                                ${connectionDetail ? `<div class="mt-2 text-xs ${success ? 'text-success-600' : 'text-error-600'}">${escapeHtml(connectionDetail)}</div>` : ''}
                             `;
                             logContainer.appendChild(summaryLine);
                         } else if (data.type === 'error') {
@@ -699,7 +883,11 @@ async function testConnectionForEnv(env, isAllTests = false) {
                                 </div>
                             `;
                             logContainer.appendChild(errorLine);
-                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false);
+                            lastFailureDetail = data.error;
+                            if (totalCount < TOTAL_TESTS) {
+                                totalCount = TOTAL_TESTS;
+                            }
+                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false, lastFailureDetail);
                         }
                     } catch (e) {
                         console.error('Error parsing SSE data:', e);
@@ -720,7 +908,11 @@ async function testConnectionForEnv(env, isAllTests = false) {
             </div>
         `;
         logContainer.appendChild(errorDiv);
-        updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false);
+        lastFailureDetail = error.message;
+        if (totalCount < TOTAL_TESTS) {
+            totalCount = TOTAL_TESTS;
+        }
+        updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false, lastFailureDetail);
     }
 }
 
@@ -730,6 +922,282 @@ function closeTestResults() {
     if (testResults) {
         testResults.classList.add('hidden');
     }
+}
+
+function setEdgeCompareStatus(message = '', tone = 'info') {
+    const statusEl = document.getElementById('edgeCompareStatus');
+    if (!statusEl) return;
+
+    const toneClasses = {
+        info: 'text-neutral-600',
+        success: 'text-success-600',
+        error: 'text-error-600',
+        warning: 'text-warning-600'
+    };
+
+    statusEl.className = 'text-sm';
+    if (toneClasses[tone]) {
+        statusEl.classList.add(toneClasses[tone]);
+    } else {
+        statusEl.classList.add(toneClasses.info);
+    }
+
+    statusEl.textContent = message || '';
+}
+
+function renderEdgeComparisonResult(data) {
+    const container = document.getElementById('edgeComparisonResult');
+    if (!container) return;
+
+    const summary = data?.summary || {};
+    const edgeFunctions = Array.isArray(data?.edgeFunctions) ? data.edgeFunctions : [];
+    const generatedAt = data?.generatedAt ? formatDate(data.generatedAt) : null;
+    const sourceSnapshot = Array.isArray(data?.sourceSnapshot) ? data.sourceSnapshot : [];
+    const targetSnapshot = Array.isArray(data?.targetSnapshot) ? data.targetSnapshot : [];
+
+    const metricCards = [
+        { label: 'To Deploy', value: summary.add || 0, tone: 'text-success-600' },
+        { label: 'To Review', value: summary.remove || 0, tone: 'text-error-600' },
+        { label: 'Updates', value: summary.modify || 0, tone: 'text-warning-600' },
+        { label: 'Total Functions', value: summary.total || 0, tone: 'text-primary-600' }
+    ]
+        .map(metric => `
+            <div class="metric-card">
+                <h4>${escapeHtml(metric.label)}</h4>
+                <p class="${metric.tone}">${metric.value}</p>
+            </div>
+        `)
+        .join('');
+
+    const reportButtons = [`
+        ${data?.reportUrl ? `<a href="${data.reportUrl}" target="_blank" rel="noopener" class="btn-secondary">View HTML Report</a>` : ''}
+        ${data?.diffJsonUrl ? `<a href="${data.diffJsonUrl}" target="_blank" rel="noopener" class="px-4 py-2 bg-neutral-200 text-neutral-700 text-sm font-semibold rounded-lg hover:bg-neutral-300 transition-colors">Download JSON Diff</a>` : ''}
+    `]
+        .filter(Boolean)
+        .join('');
+
+    const actionBadgeMap = {
+        add: { label: 'Deploy', classes: 'bg-success-100 text-success-700' },
+        remove: { label: 'Review', classes: 'bg-error-100 text-error-700' },
+        modify: { label: 'Redeploy', classes: 'bg-warning-100 text-warning-700' }
+    };
+
+    const renderSnapshotList = (items) => {
+        if (!items.length) {
+            return '<li class="px-3 py-2 bg-neutral-100 rounded-lg text-sm text-neutral-500">None detected</li>';
+        }
+        return items
+            .map((name) => `<li class="px-3 py-2 bg-neutral-100 border border-neutral-200 rounded-lg text-sm text-neutral-700">${escapeHtml(name)}</li>`)
+            .join('');
+    };
+
+    const tableRows = edgeFunctions.length
+        ? edgeFunctions
+              .map(item => {
+                  const badge = actionBadgeMap[item.action] || { label: 'Unknown', classes: 'bg-neutral-100 text-neutral-700' };
+                  const diffLines = Array.isArray(item.diff) ? item.diff : [];
+                  const diffSummary = diffLines.length ? `View diff (${diffLines.length} lines)` : 'No diff available';
+                  const diffContent = diffLines.length
+                      ? `
+                          <details class="group">
+                              <summary class="cursor-pointer text-sm font-semibold text-primary-600 flex items-center justify-between">
+                                  <span>${escapeHtml(diffSummary)}</span>
+                                  <svg class="w-4 h-4 text-primary-500 group-open:rotate-180 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+                                  </svg>
+                              </summary>
+                              <pre class="mt-3 bg-slate-900 text-slate-100 rounded-xl p-4 text-xs leading-5 overflow-x-auto whitespace-pre-wrap">${escapeHtml(diffLines.join('\n'))}</pre>
+                          </details>
+                      `
+                      : '<p class="text-sm text-neutral-600">No code changes detected. Ensure function exists in both environments.</p>';
+
+                  return `
+                      <tr class="hover:bg-neutral-50">
+                          <td class="px-6 py-4 whitespace-nowrap text-sm font-semibold text-neutral-900">${escapeHtml(item.name || 'Unnamed')}</td>
+                          <td class="px-6 py-4 whitespace-nowrap text-sm">
+                              <span class="badge ${badge.classes}">${badge.label}</span>
+                          </td>
+                          <td class="px-6 py-4 text-sm text-neutral-600">${item.action === 'modify' ? 'Definitions differ' : item.action === 'add' ? 'New function in source' : item.action === 'remove' ? 'Target-only function' : 'No change detected'}</td>
+                          <td class="px-6 py-4 text-sm">${diffContent}</td>
+                      </tr>
+                  `;
+              })
+              .join('')
+        : `
+            <tr>
+                <td colspan="4" class="px-6 py-8 text-center text-sm text-neutral-500">
+                    <div class="flex flex-col items-center space-y-2">
+                        <svg class="w-8 h-8 text-success-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <span class="font-semibold">No edge function differences detected.</span>
+                        <span class="text-xs text-neutral-400">Source and target are aligned for edge functions.</span>
+                    </div>
+                </td>
+            </tr>
+        `;
+
+    container.innerHTML = `
+        <div class="glass-card animate-fade-in space-y-5">
+            <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-6">
+                <div>
+                    <h3 class="text-xl font-bold text-primary-900">Edge Function Sync</h3>
+                    <p class="text-sm text-neutral-600 mt-1">
+                        Source <span class="font-semibold">${escapeHtml(data?.sourceEnv || '')}</span>
+                        → Target <span class="font-semibold">${escapeHtml(data?.targetEnv || '')}</span>
+                    </p>
+                    ${generatedAt ? `<p class="text-xs text-neutral-500 mt-1">Generated ${escapeHtml(generatedAt)}</p>` : ''}
+                </div>
+                <div class="metrics-grid">
+                    ${metricCards}
+                </div>
+            </div>
+            ${reportButtons ? `<div class="flex flex-wrap gap-3">${reportButtons}</div>` : ''}
+        </div>
+        <div class="glass-card animate-fade-in">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div class="border border-neutral-200 rounded-2xl p-4 bg-white/70">
+                    <div class="flex items-center justify-between mb-3">
+                        <h4 class="text-sm font-semibold text-primary-900">Source (${escapeHtml(data?.sourceEnv || '')})</h4>
+                        <span class="text-xs font-semibold text-primary-600 bg-primary-50 px-2.5 py-1 rounded-full">${sourceSnapshot.length} function(s)</span>
+                    </div>
+                    <ul class="space-y-2 max-h-56 overflow-y-auto">
+                        ${renderSnapshotList(sourceSnapshot)}
+                    </ul>
+                </div>
+                <div class="border border-neutral-200 rounded-2xl p-4 bg-white/70">
+                    <div class="flex items-center justify-between mb-3">
+                        <h4 class="text-sm font-semibold text-primary-900">Target (${escapeHtml(data?.targetEnv || '')})</h4>
+                        <span class="text-xs font-semibold text-primary-600 bg-primary-50 px-2.5 py-1 rounded-full">${targetSnapshot.length} function(s)</span>
+                    </div>
+                    <ul class="space-y-2 max-h-56 overflow-y-auto">
+                        ${renderSnapshotList(targetSnapshot)}
+                    </ul>
+                </div>
+            </div>
+        </div>
+        <div class="glass-card animate-fade-in">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-lg font-semibold text-primary-900">Edge Functions</h3>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-neutral-200">
+                    <thead class="bg-neutral-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-neutral-700 uppercase tracking-wider">Function</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-neutral-700 uppercase tracking-wider">Action</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-neutral-700 uppercase tracking-wider">Summary</th>
+                            <th class="px-6 py-3 text-left text-xs font-semibold text-neutral-700 uppercase tracking-wider">Diff</th>
+                        </tr>
+                    </thead>
+                    <tbody class="bg-white divide-y divide-neutral-200">
+                        ${tableRows}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    `;
+}
+
+async function performEdgeComparison(source, target, { auto = false } = {}) {
+    const resultContainer = document.getElementById('edgeComparisonResult');
+    if (!resultContainer) return;
+
+    if (edgeComparisonInFlight) {
+        if (!auto) {
+            setEdgeCompareStatus('An edge comparison is already running. Please wait...', 'warning');
+        }
+        return;
+    }
+
+    edgeComparisonInFlight = true;
+    const runButton = document.querySelector('#edgeCompareForm button[type="submit"]');
+    if (runButton) {
+        runButton.disabled = true;
+        runButton.classList.add('opacity-70', 'cursor-not-allowed');
+    }
+    setEdgeCompareStatus(auto ? 'Refreshing edge comparison...' : 'Running edge comparison...', 'info');
+    showLoading('edgeCompareLoading');
+
+    resultContainer.innerHTML = `
+        <div class="glass-card animate-fade-in">
+            <div class="flex items-center space-x-3 text-neutral-600">
+                <svg class="w-5 h-5 text-primary-500 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+                <span class="text-sm font-semibold">Comparing edge functions...</span>
+            </div>
+        </div>
+    `;
+
+    try {
+        const response = await fetch(`${API_BASE}/api/edge-comparison`, {
+            method: 'POST',
+            headers: {
+                ...getAuthHeaders(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                sourceEnv: source,
+                targetEnv: target
+            })
+        });
+
+        if (!response.ok) {
+            let errorMessage = 'Failed to generate edge comparison';
+            try {
+                const errorPayload = await response.json();
+                errorMessage = errorPayload?.error || errorMessage;
+            } catch (parseError) {
+                errorMessage = response.statusText || errorMessage;
+            }
+            throw new Error(errorMessage);
+        }
+
+        const data = await response.json();
+        lastEdgeComparison = { source, target };
+        renderEdgeComparisonResult(data);
+        setEdgeCompareStatus(data.generatedAt ? `Generated ${formatDate(data.generatedAt)}` : 'Edge comparison completed.', 'success');
+
+        // Refresh plans list to surface new report
+        setTimeout(loadPlans, 1000);
+    } catch (error) {
+        console.error('Edge comparison error:', error);
+        const message = error?.message || 'Failed to run edge comparison';
+        resultContainer.innerHTML = `
+            <div class="glass-card bg-error-50 border border-error-200 text-error-700 p-6 animate-fade-in">
+                <p class="font-semibold">${escapeHtml(message)}</p>
+                <p class="text-sm mt-1">Check server logs for more details.</p>
+            </div>
+        `;
+        setEdgeCompareStatus(message, 'error');
+    } finally {
+        hideLoading('edgeCompareLoading');
+        edgeComparisonInFlight = false;
+        const submitButton = document.querySelector('#edgeCompareForm button[type="submit"]');
+        if (submitButton) {
+            submitButton.disabled = false;
+            submitButton.classList.remove('opacity-70', 'cursor-not-allowed');
+        }
+    }
+}
+
+function onEdgeComparisonTabOpen() {
+    const sourceSelect = document.getElementById('edgeCompareSource');
+    const targetSelect = document.getElementById('edgeCompareTarget');
+
+    if (!sourceSelect || !targetSelect) {
+        return;
+    }
+
+    if (lastEdgeComparison) {
+        sourceSelect.value = lastEdgeComparison.source;
+        targetSelect.value = lastEdgeComparison.target;
+    }
+
+    syncSourceTargetDropdowns('edgeCompareSource', 'edgeCompareTarget');
+
+    setEdgeCompareStatus('Select source and target environments, then run the comparison.', 'info');
 }
 
 // Generate snapshot for all environments
@@ -1679,6 +2147,7 @@ function syncAllDropdowns() {
     syncSourceTargetDropdowns('storageSource', 'storageTarget');
     syncSourceTargetDropdowns('edgeSource', 'edgeTarget');
     syncSourceTargetDropdowns('secretsSource', 'secretsTarget');
+    syncSourceTargetDropdowns('edgeCompareSource', 'edgeCompareTarget');
 }
 
 // Load environments on page load
@@ -1857,6 +2326,27 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Initialize production confirmation modal
     initProdConfirmModal();
+
+    const edgeCompareForm = document.getElementById('edgeCompareForm');
+    if (edgeCompareForm) {
+        edgeCompareForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            const source = document.getElementById('edgeCompareSource')?.value;
+            const target = document.getElementById('edgeCompareTarget')?.value;
+
+            if (!source || !target) {
+                setEdgeCompareStatus('Please select both source and target environments.', 'warning');
+                return;
+            }
+
+            if (source === target) {
+                setEdgeCompareStatus('Source and target environments must be different.', 'error');
+                return;
+            }
+
+            performEdgeComparison(source, target, { auto: false });
+        });
+    }
     
     loadAppInfo();
     loadEnvironments();
@@ -1877,3 +2367,26 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 });
+
+async function loadManualContent(containerId, sourcePath) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    try {
+        const response = await fetch(sourcePath);
+        if (!response.ok) {
+            throw new Error(`Unable to load ${sourcePath}`);
+        }
+        const markdown = await response.text();
+        let htmlContent = '';
+        if (window.marked) {
+            htmlContent = window.marked.parse(markdown);
+        } else {
+            htmlContent = `<pre class="whitespace-pre-wrap">${escapeHtml(markdown)}</pre>`;
+        }
+        container.innerHTML = `<article class="space-y-4 prose prose-slate max-w-none">${htmlContent}</article>`;
+    } catch (error) {
+        container.innerHTML = `<div class="text-error-600 text-center">${escapeHtml(error.message)}</div>`;
+        throw error;
+    }
+}

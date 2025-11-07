@@ -1,0 +1,72 @@
+{
+  "timestamp": "2025-11-06 20:36:12",
+  "generatedAt": 1762482992,
+  "environments": {
+    "dev": {
+      "env": "dev",
+      "name": "Development",
+      "projectRef": "rkiovortqlqaqksllzqz",
+      "projectName": "Test_Supabase_Dev",
+      "timestamp": "2025-11-07T02:36:19Z",
+      "counts": {
+        "tables": 29,
+        "views": 0,
+        "functions": 33,
+        "sequences": 1,
+        "indexes": 93,
+        "policies": 3,
+        "triggers": 7,
+        "types": 29,
+        "enums": 10,
+        "authUsers": 3,
+        "edgeFunctions": 3,
+        "buckets": 2,
+        "secrets": 9
+      }
+    },
+    "test": {
+      "env": "test",
+      "name": "Test/Staging",
+      "projectRef": "tkaapbxrheffccvfdben",
+      "projectName": "Test_Supabase_Test",
+      "timestamp": "2025-11-07T02:36:25Z",
+      "counts": {
+        "tables": 29,
+        "views": 0,
+        "functions": 33,
+        "sequences": 1,
+        "indexes": 93,
+        "policies": 3,
+        "triggers": 7,
+        "types": 29,
+        "enums": 10,
+        "authUsers": 3,
+        "edgeFunctions": 3,
+        "buckets": 2,
+        "secrets": 9
+      }
+    },
+    "prod": {
+      "env": "prod",
+      "name": "Production",
+      "projectRef": "qkngycoksmmfwldqzjoz",
+      "projectName": "Test_Supabase_Prod",
+      "timestamp": "2025-11-07T02:36:32Z",
+      "counts": {
+        "tables": 29,
+        "views": 0,
+        "functions": 33,
+        "sequences": 1,
+        "indexes": 93,
+        "policies": 3,
+        "triggers": 7,
+        "types": 29,
+        "enums": 10,
+        "authUsers": 3,
+        "edgeFunctions": 3,
+        "buckets": 2,
+        "secrets": 9
+      }
+    }
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "timestamp": "2025-11-06 22:02:25",
+  "generatedAt": 1762488162,
+  "environments": {
+    "dev": {
+      "env": "dev",
+      "name": "Development",
+      "projectRef": "woeymnjpojemymkoqsoz",
+      "projectName": "XyntraAI-Web-Dev",
+      "timestamp": "2025-11-07T04:02:31Z",
+      "counts": {
+        "tables": 30,
+        "views": 0,
+        "functions": 36,
+        "sequences": 1,
+        "indexes": 97,
+        "policies": 13,
+        "triggers": 8,
+        "types": 30,
+        "enums": 11,
+        "authUsers": 1,
+        "edgeFunctions": 13,
+        "buckets": 1,
+        "secrets": 10
+      }
+    },
+    "test": {
+      "env": "test",
+      "name": "Test/Staging",
+      "projectRef": "ceurnrexwpniqxkmcfyi",
+      "projectName": "XyntraAI-Web-Test",
+      "timestamp": "2025-11-07T04:02:36Z",
+      "counts": {
+        "tables": 30,
+        "views": 0,
+        "functions": 36,
+        "sequences": 1,
+        "indexes": 97,
+        "policies": 13,
+        "triggers": 8,
+        "types": 30,
+        "enums": 11,
+        "authUsers": 1,
+        "edgeFunctions": 13,
+        "buckets": 1,
+        "secrets": 10
+      }
+    },
+    "prod": {
+      "env": "prod",
+      "name": "Production",
+      "projectRef": "myasfyqrqwbsukpjwdxx",
+      "projectName": "XyntraAI-Web-Prod",
+      "timestamp": "2025-11-07T04:02:42Z",
+      "counts": {
+        "tables": 30,
+        "views": 0,
+        "functions": 36,
+        "sequences": 1,
+        "indexes": 97,
+        "policies": 13,
+        "triggers": 8,
+        "types": 30,
+        "enums": 11,
+        "authUsers": 1,
+        "edgeFunctions": 13,
+        "buckets": 1,
+        "secrets": 10
+      }
+    }
+  }
+}

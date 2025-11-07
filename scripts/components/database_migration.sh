@@ -120,6 +120,10 @@ SOURCE_REF=$(get_project_ref "$SOURCE_ENV")
 TARGET_REF=$(get_project_ref "$TARGET_ENV")
 SOURCE_PASSWORD=$(get_db_password "$SOURCE_ENV")
 TARGET_PASSWORD=$(get_db_password "$TARGET_ENV")
+SOURCE_POOLER_REGION=$(get_pooler_region_for_env "$SOURCE_ENV")
+TARGET_POOLER_REGION=$(get_pooler_region_for_env "$TARGET_ENV")
+SOURCE_POOLER_PORT=$(get_pooler_port_for_env "$SOURCE_ENV")
+TARGET_POOLER_PORT=$(get_pooler_port_for_env "$TARGET_ENV")
 
 # Create migration directory if not provided
 if [ -z "$MIGRATION_DIR" ]; then
@@ -180,23 +184,13 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
     log_to_file "$LOG_FILE" "Creating backup of target"
     
     if link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
-        # Get pooler host using environment name (more reliable)
-        POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
-        if [ -z "$POOLER_HOST" ]; then
-            POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
-        fi
         log_info "Backing up target database (binary format)..."
-        # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-        PGPASSWORD="$TARGET_PASSWORD" pg_dump \
-            -h "$POOLER_HOST" \
-            -p 6543 \
-            -U "postgres.${TARGET_REF}" \
-            -d postgres \
-            -Fc \
-            -f "$MIGRATION_DIR/target_backup.dump" \
-            2>&1 | tee -a "$LOG_FILE" || log_warning "Backup may have failed, continuing..."
-        
-        log_success "Backup created: $MIGRATION_DIR/target_backup.dump"
+        if run_pg_tool_with_fallback "pg_dump" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$LOG_FILE" \
+            -d postgres -Fc -f "$MIGRATION_DIR/target_backup.dump"; then
+            log_success "Backup created: $MIGRATION_DIR/target_backup.dump"
+        else
+            log_warning "Backup may have failed, continuing..."
+        fi
         
         # Capture target state as SQL for manual rollback
         log_info "Creating rollback SQL script..."
@@ -232,55 +226,18 @@ if [ "$INCLUDE_DATA" = "true" ]; then
         POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
     fi
     
-    # If --users is also specified, exclude auth schema from main dump to avoid conflicts
-    # We'll dump and restore auth separately
     if [ "$INCLUDE_USERS" = "true" ]; then
-        log_info "Creating full database dump (excluding auth schema - will be handled separately)..."
-        # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-        PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-            -h "$POOLER_HOST" \
-            -p 6543 \
-            -U "postgres.${SOURCE_REF}" \
-            -d postgres \
-            -Fc \
-            --verbose \
-            --exclude-schema=auth \
-            -f "$DUMP_FILE" \
-            2>&1 | tee -a "$LOG_FILE" || {
-            log_warning "Pooler connection failed, trying direct connection..."
-            PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-                -h "db.${SOURCE_REF}.supabase.co" \
-                -p 5432 \
-                -U "postgres.${SOURCE_REF}" \
-                -d postgres \
-                -Fc \
-                --verbose \
-                --exclude-schema=auth \
-                -f "$DUMP_FILE" \
-                2>&1 | tee -a "$LOG_FILE"
-        }
+         log_info "Creating full database dump (excluding auth schema - will be handled separately)..."
+        if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
+            -d postgres -Fc --verbose --exclude-schema=auth -f "$DUMP_FILE"; then
+            log_warning "Failed to create full dump via any connection"
+        fi
     else
         log_info "Creating full database dump..."
-        PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-            -h "$POOLER_HOST" \
-            -p 6543 \
-            -U "postgres.${SOURCE_REF}" \
-            -d postgres \
-            -Fc \
-            --verbose \
-            -f "$DUMP_FILE" \
-            2>&1 | tee -a "$LOG_FILE" || {
-            log_warning "Pooler connection failed, trying direct connection..."
-            PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-                -h "db.${SOURCE_REF}.supabase.co" \
-                -p 5432 \
-                -U "postgres.${SOURCE_REF}" \
-                -d postgres \
-                -Fc \
-                --verbose \
-                -f "$DUMP_FILE" \
-                2>&1 | tee -a "$LOG_FILE"
-        }
+        if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
+            -d postgres -Fc --verbose -f "$DUMP_FILE"; then
+            log_warning "Failed to create full dump via any connection"
+        fi
     fi
 else
     log_info "Step 1/3: Dumping source schema (structure only)..."
@@ -300,34 +257,11 @@ else
     fi
     
     log_info "Creating schema-only dump (no data)..."
-    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-    PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${SOURCE_REF}" \
-        -d postgres \
-        -Fc \
-        --schema-only \
-        --no-owner \
-        --no-acl \
-        --verbose \
-        -f "$DUMP_FILE" \
-        2>&1 | tee -a "$LOG_FILE" || {
-        log_warning "Pooler connection failed, trying direct connection..."
-        PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-            -h db.${SOURCE_REF}.supabase.co \
-            -p 5432 \
-            -U postgres.${SOURCE_REF} \
-            -d postgres \
-            -Fc \
-            --schema-only \
-            --no-owner \
-            --no-acl \
-            --verbose \
-            -f "$DUMP_FILE" \
-            2>&1 | tee -a "$LOG_FILE"
-    }
-fi
+    if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
+        -d postgres -Fc --schema-only --no-owner --no-acl --verbose -f "$DUMP_FILE"; then
+        log_warning "Failed to create schema-only dump via any connection"
+    fi
+ fi
 
 if [ ! -f "$DUMP_FILE" ] || [ ! -s "$DUMP_FILE" ]; then
     log_error "Failed to create dump file"
