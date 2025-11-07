@@ -172,17 +172,23 @@ app.get('/api/info', (req, res) => {
             prod: {
                 name: 'Production',
                 projectName: process.env.SUPABASE_PROD_PROJECT_NAME || 'N/A',
-                projectRef: process.env.SUPABASE_PROD_PROJECT_REF || 'N/A'
+                projectRef: process.env.SUPABASE_PROD_PROJECT_REF || 'N/A',
+                poolerRegion: process.env.SUPABASE_PROD_POOLER_REGION || 'aws-1-us-east-2',
+                poolerPort: process.env.SUPABASE_PROD_POOLER_PORT || '6543'
             },
             test: {
                 name: 'Test/Staging',
                 projectName: process.env.SUPABASE_TEST_PROJECT_NAME || 'N/A',
-                projectRef: process.env.SUPABASE_TEST_PROJECT_REF || 'N/A'
+                projectRef: process.env.SUPABASE_TEST_PROJECT_REF || 'N/A',
+                poolerRegion: process.env.SUPABASE_TEST_POOLER_REGION || 'aws-1-us-east-2',
+                poolerPort: process.env.SUPABASE_TEST_POOLER_PORT || '6543'
             },
             dev: {
                 name: 'Development',
                 projectName: process.env.SUPABASE_DEV_PROJECT_NAME || 'N/A',
-                projectRef: process.env.SUPABASE_DEV_PROJECT_REF || 'N/A'
+                projectRef: process.env.SUPABASE_DEV_PROJECT_REF || 'N/A',
+                poolerRegion: process.env.SUPABASE_DEV_POOLER_REGION || 'aws-1-us-east-2',
+                poolerPort: process.env.SUPABASE_DEV_POOLER_PORT || '6543'
             }
         },
         scripts: {

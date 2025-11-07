@@ -106,6 +106,7 @@ PROJECT_NAME_VAR="SUPABASE_${ENV_PREFIX}_PROJECT_NAME"
 PROJECT_REF_VAR="SUPABASE_${ENV_PREFIX}_PROJECT_REF"
 DB_PASSWORD_VAR="SUPABASE_${ENV_PREFIX}_DB_PASSWORD"
 POOLER_REGION_VAR="SUPABASE_${ENV_PREFIX}_POOLER_REGION"
+POOLER_PORT_VAR="SUPABASE_${ENV_PREFIX}_POOLER_PORT"
 URL_VAR="SUPABASE_${ENV_PREFIX}_URL"
 ANON_KEY_VAR="SUPABASE_${ENV_PREFIX}_ANON_KEY"
 SERVICE_ROLE_KEY_VAR="SUPABASE_${ENV_PREFIX}_SERVICE_ROLE_KEY"
@@ -114,15 +115,16 @@ PROJECT_NAME="${!PROJECT_NAME_VAR:-}"
 PROJECT_REF="${!PROJECT_REF_VAR:-}"
 DB_PASSWORD="${!DB_PASSWORD_VAR:-}"
 POOLER_REGION="${!POOLER_REGION_VAR:-}"
+POOLER_PORT="${!POOLER_PORT_VAR:-}"
 URL="${!URL_VAR:-}"
 ANON_KEY="${!ANON_KEY_VAR:-}"
 SERVICE_ROLE_KEY="${!SERVICE_ROLE_KEY_VAR:-}"
 
-# If pooler region is not set, try to extract from URL or use default
-if [ -z "$POOLER_REGION" ] && [ -n "$URL" ]; then
-    # Try to extract pooler region from URL (e.g., aws-1-us-east-2 from project URL pattern)
-    # This is a fallback - ideally POOLER_REGION should be set in .env.local
-    POOLER_REGION="aws-1-us-east-2"  # Default fallback
+# If URL is missing but project ref exists, generate default Supabase URL
+URL_GENERATED=false
+if [ -z "$URL" ] && [ -n "$PROJECT_REF" ]; then
+    URL="https://${PROJECT_REF}.supabase.co"
+    URL_GENERATED=true
 fi
 
 # Test results
@@ -142,16 +144,20 @@ run_test() {
         log_info "Testing: $test_name"
     fi
     
-    if eval "$test_command" >/dev/null 2>&1; then
-        if [ "$expected_result" = "success" ]; then
-            TESTS_PASSED=$((TESTS_PASSED + 1))
-            echo "✅ PASS: $test_name"
-            return 0
-        else
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            echo "❌ FAIL: $test_name (expected failure but got success)"
-            return 1
+TEST_OUTPUT=""
+if TEST_OUTPUT=$(eval "$test_command" 2>&1); then
+    if [ "$expected_result" = "success" ]; then
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo "✅ PASS: $test_name"
+        return 0
+    else
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo "❌ FAIL: $test_name (expected failure but got success)"
+        if [ "$VERBOSE" = "true" ] && [ -n "$TEST_OUTPUT" ]; then
+            echo "$TEST_OUTPUT" | head -5 | sed 's/^/   /'
         fi
+        return 1
+    fi
     else
         if [ "$expected_result" = "failure" ]; then
             TESTS_PASSED=$((TESTS_PASSED + 1))
@@ -160,11 +166,13 @@ run_test() {
         else
             TESTS_FAILED=$((TESTS_FAILED + 1))
             echo "❌ FAIL: $test_name"
-            if [ "$VERBOSE" = "true" ]; then
-                echo "   Command: $test_command"
-                eval "$test_command" 2>&1 | head -5 | sed 's/^/   /'
+        if [ "$VERBOSE" = "true" ]; then
+            echo "   Command: $test_command"
+            if [ -n "$TEST_OUTPUT" ]; then
+                echo "$TEST_OUTPUT" | head -5 | sed 's/^/   /'
             fi
-            return 1
+        fi
+        return 1
         fi
     fi
 }
@@ -231,153 +239,75 @@ fi
 # Test 13: Test database connectivity
 log_info "Test 13: Testing Database Connectivity..."
 if command -v psql >/dev/null 2>&1; then
-    # Build pooler host dynamically from pooler region
-    # Format: {POOLER_REGION}.pooler.supabase.com
-    # Example: aws-1-us-east-2.pooler.supabase.com
-    if [ -n "$POOLER_REGION" ]; then
-        POOLER_HOST="${POOLER_REGION}.pooler.supabase.com"
-        
+    if [ -n "$PROJECT_REF" ]; then
         if [ "$VERBOSE" = "true" ]; then
-            log_info "  Pooler Region: $POOLER_REGION"
-            log_info "  Pooler Host: $POOLER_HOST"
             log_info "  Project Ref: $PROJECT_REF"
-            log_info "  Connection String Format: postgresql://postgres.${PROJECT_REF}:***@${POOLER_HOST}:6543/postgres?pgbouncer=true"
         fi
-        
-        # Test connection via shared connection pooler (port 6543)
-        # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-        # For psql: -h host -p port -U user -d database
-        # Username format: postgres.{PROJECT_REF} (e.g., postgres.rkiovortqlqaqksllzqz)
-        # Note: Pooler connections typically require SSL, but psql will auto-negotiate
-        DB_TEST_CMD="PGPASSWORD=\"$DB_PASSWORD\" psql -h \"$POOLER_HOST\" -p 6543 -U \"postgres.${PROJECT_REF}\" -d postgres -c \"SELECT 1;\" 2>&1"
-        
-        # Run test and capture output for verbose mode
-        TESTS_TOTAL=$((TESTS_TOTAL + 1))
-        # Execute the command and capture both stdout and stderr
-        TEST_OUTPUT=$(bash -c "$DB_TEST_CMD" 2>&1)
-        TEST_EXIT_CODE=$?
-        
-        if [ $TEST_EXIT_CODE -eq 0 ]; then
-            TESTS_PASSED=$((TESTS_PASSED + 1))
-            echo "✅ PASS: Database connectivity (via pooler port 6543)"
-            POOLER_TEST_RESULT=0
-        else
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            echo "❌ FAIL: Database connectivity (via pooler port 6543)"
-            POOLER_TEST_RESULT=1
-            if [ "$VERBOSE" = "true" ]; then
-                echo "$TEST_OUTPUT" | head -3 | sed 's/^/   /'
-                log_info "  Trying direct connection on port 5432..."
+
+        run_db_connection_attempt() {
+            local host=$1
+            local port=$2
+
+            local timeout_prefix=""
+            if command -v timeout >/dev/null 2>&1; then
+                timeout_prefix="timeout 10 "
             fi
-            
-            # If pooler test fails, also try direct connection (port 5432) for migrations
-            # Direct connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:5432/postgres
-            DB_DIRECT_TEST_CMD="PGPASSWORD=\"$DB_PASSWORD\" psql -h \"$POOLER_HOST\" -p 5432 -U \"postgres.${PROJECT_REF}\" -d postgres -c \"SELECT 1;\" 2>&1"
-            
-            TESTS_TOTAL=$((TESTS_TOTAL + 1))
-            DIRECT_TEST_OUTPUT=$(bash -c "$DB_DIRECT_TEST_CMD" 2>&1)
-            DIRECT_TEST_EXIT_CODE=$?
-            
-            if [ $DIRECT_TEST_EXIT_CODE -eq 0 ]; then
-                TESTS_PASSED=$((TESTS_PASSED + 1))
-                echo "✅ PASS: Database connectivity (direct port 5432)"
-                POOLER_TEST_RESULT=0  # Mark as success since direct connection worked
+
+            local db_user="postgres.${PROJECT_REF}"
+            if [[ "$host" == db.*.supabase.co ]]; then
+                db_user="postgres"
+            fi
+
+            local cmd="PGPASSWORD=\"$DB_PASSWORD\" PGSSLMODE=require ${timeout_prefix}psql -h \"$host\" -p \"$port\" -U \"$db_user\" -d postgres -c \"SELECT 1;\" >/dev/null 2>&1"
+            if eval "$cmd"; then
+                return 0
             else
-                TESTS_FAILED=$((TESTS_FAILED + 1))
-                echo "❌ FAIL: Database connectivity (direct port 5432)"
-                if [ "$VERBOSE" = "true" ]; then
-                    echo "$DIRECT_TEST_OUTPUT" | head -3 | sed 's/^/   /'
-                fi
+                return 1
             fi
+        }
+
+        pooler_port="${POOLER_PORT:-6543}"
+        shared_pooler_host="${POOLER_REGION:-aws-1-us-east-2}.pooler.supabase.com"
+
+        if [ "$VERBOSE" = "true" ]; then
+            log_info "  Shared Pooler Host: $shared_pooler_host"
+            log_info "  Pooler Port: $pooler_port"
         fi
+
+        TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+        attempts=(
+            "$shared_pooler_host|$pooler_port|shared pooler port ${pooler_port}"
+            "$shared_pooler_host|5432|direct shared pooler port 5432"
+            "db.${PROJECT_REF}.supabase.co|$pooler_port|dedicated pooler port ${pooler_port}"
+            "db.${PROJECT_REF}.supabase.co|5432|dedicated direct port 5432"
+        )
+
+        success=false
+        failure_messages=()
+
+        for attempt in "${attempts[@]}"; do
+            IFS='|' read -r host port label <<< "$attempt"
+            if run_db_connection_attempt "$host" "$port"; then
+                TESTS_PASSED=$((TESTS_PASSED + 1))
+                echo "✅ PASS: Database connectivity (${label})"
+                success=true
+                break
+            else
+                failure_messages+=("❌ FAIL: Database connectivity (${label})")
+            fi
+        done
+
+        if ! $success; then
+            TESTS_FAILED=$((TESTS_FAILED + 1))
+            printf '%s\n' "${failure_messages[@]}"
+        fi
+        unset attempts failure_messages success
     else
-        # Fallback: try to get pooler host using get_pooler_host function
-        POOLER_HOST=$(get_pooler_host "$PROJECT_REF")
-        if [ -n "$POOLER_HOST" ] && [ "$POOLER_HOST" != "aws-1-us-east-2.pooler.supabase.com" ]; then
-            if [ "$VERBOSE" = "true" ]; then
-                log_info "  Using pooler host from get_pooler_host: $POOLER_HOST"
-            fi
-            DB_TEST_CMD="PGPASSWORD=\"$DB_PASSWORD\" timeout 10 psql -h \"$POOLER_HOST\" -p 6543 -U \"postgres.${PROJECT_REF}\" -d postgres -c \"SELECT 1;\" >/dev/null 2>&1"
-            run_test "Database connectivity (via pooler)" "$DB_TEST_CMD"
-        else
-            echo "⚠️  SKIP: Database connectivity test (pooler region not configured)"
-            echo "   Add SUPABASE_${ENV_PREFIX}_POOLER_REGION to .env.local"
-            echo "   Example: SUPABASE_${ENV_PREFIX}_POOLER_REGION=aws-1-us-east-2"
-        fi
+        echo "⚠️  SKIP: Database connectivity test (project reference not configured)"
     fi
 else
     echo "⚠️  SKIP: Database connectivity test (psql not available)"
-fi
-
-# Test 14: Test URL accessibility
-log_info "Test 14: Testing URL Accessibility..."
-if command -v curl >/dev/null 2>&1; then
-    # Test REST API endpoint with anon key
-    URL_TEST_CMD="curl -s -o /dev/null -w '%{http_code}' --max-time 10 \"$URL/rest/v1/\" -H \"apikey: $ANON_KEY\" -H \"Authorization: Bearer $ANON_KEY\" | grep -q '200\|401\|404'"
-    run_test "URL accessibility (REST API)" "$URL_TEST_CMD"
-else
-    echo "⚠️  SKIP: URL accessibility test (curl not available)"
-fi
-
-# Test 15: Verify URL format and extract project reference
-log_info "Test 15: Verifying URL Format and Project Reference..."
-if [ -n "$PROJECT_REF" ] && [ -n "$URL" ]; then
-    # Extract project reference from URL
-    # URL format: https://{PROJECT_REF}.supabase.co
-    # Note: The URL project reference may differ from PROJECT_REF in some cases
-    # This is acceptable as Supabase URLs can point to different references
-    URL_REF=$(echo "$URL" | sed -E 's|https?://([^.]+)\.supabase\.co.*|\1|')
-    
-    # Alternative extraction method if first one didn't work (for macOS compatibility)
-    if [ -z "$URL_REF" ] || [ "$URL_REF" = "$URL" ]; then
-        URL_REF=$(echo "$URL" | sed -n 's|https\?://\([^.]*\)\.supabase\.co.*|\1|p')
-    fi
-    
-    if [ "$VERBOSE" = "true" ]; then
-        log_info "  Project Reference from env: $PROJECT_REF"
-        log_info "  Project Reference from URL: $URL_REF"
-        log_info "  Full URL: $URL"
-    fi
-    
-    # Check if URL is valid and contains a project reference
-    if [ -n "$URL_REF" ] && [ "$URL_REF" != "$URL" ] && [ ${#URL_REF} -ge 10 ]; then
-        # Verify URL format is correct (starts with https:// and ends with .supabase.co)
-        if [[ "$URL" =~ ^https://.*\.supabase\.co ]]; then
-            TESTS_TOTAL=$((TESTS_TOTAL + 1))
-            TESTS_PASSED=$((TESTS_PASSED + 1))
-            echo "✅ PASS: URL format is valid and contains project reference"
-            
-            # Optional: Show if references match (informational only, not a requirement)
-            if [ "$PROJECT_REF" = "$URL_REF" ]; then
-                if [ "$VERBOSE" = "true" ]; then
-                    log_info "  Note: Project reference in env matches URL reference"
-                fi
-            else
-                if [ "$VERBOSE" = "true" ]; then
-                    log_info "  Note: Project reference in env ($PROJECT_REF) differs from URL reference ($URL_REF)"
-                    log_info "  This is acceptable - URL and database connection may use different references"
-                fi
-            fi
-        else
-            TESTS_TOTAL=$((TESTS_TOTAL + 1))
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            echo "❌ FAIL: URL format is invalid"
-            if [ "$VERBOSE" = "true" ]; then
-                echo "   URL should match pattern: https://*.supabase.co"
-                echo "   Actual URL: $URL"
-            fi
-        fi
-    else
-        TESTS_TOTAL=$((TESTS_TOTAL + 1))
-        TESTS_FAILED=$((TESTS_FAILED + 1))
-        echo "❌ FAIL: Could not extract valid project reference from URL"
-        if [ "$VERBOSE" = "true" ]; then
-            echo "   URL format might be incorrect: $URL"
-            echo "   Extracted value: $URL_REF"
-        fi
-    fi
-else
-    echo "⚠️  SKIP: URL format verification (missing data)"
 fi
 
 # Summary

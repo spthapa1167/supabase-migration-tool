@@ -862,11 +862,11 @@
                         </div>
                         <div>
                             <h2 class="text-2xl font-bold text-primary-900">Command Line Manual</h2>
-                            <p class="text-neutral-600 text-sm">Complete guide for using migration scripts from the command line</p>
+                            <p class="text-neutral-600 text-sm">Latest CLI workflow and command references</p>
                         </div>
                     </div>
-                    <div class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar">
-                        <iframe src="user_manual.html" class="w-full h-[800px] border-0 rounded-lg" frameborder="0" style="min-height: 800px;"></iframe>
+                    <div id="cliManualContainer" class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar text-sm text-neutral-700 leading-relaxed">
+                        <div class="text-center text-neutral-500">Loading CLI manual...</div>
                     </div>
                 </div>
             </div>
@@ -882,159 +882,11 @@
                         </div>
                         <div>
                             <h2 class="text-2xl font-bold text-primary-900">Web UI Manual</h2>
-                            <p class="text-neutral-600 text-sm">Complete guide for using the web-based migration interface</p>
+                            <p class="text-neutral-600 text-sm">Latest reference for operating the web application</p>
                         </div>
                     </div>
-                    <div class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar">
-                        <h3 class="text-2xl font-bold text-primary-900 mb-4">Web UI User Guide</h3>
-                        
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Overview</h4>
-                            <p class="text-neutral-700 mb-4">
-                                The Supabase Migration Tool Web UI provides a user-friendly interface for managing all aspects of Supabase migrations. 
-                                You can generate migration plans, run complete or component-specific migrations, and view detailed reports and logs.
-                            </p>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Getting Started</h4>
-                            <ol class="list-decimal list-inside space-y-2 text-neutral-700">
-                                <li>Enter your access key on the login page</li>
-                                <li>Once authenticated, you'll see the main dashboard</li>
-                                <li>Select your source and target environments</li>
-                                <li>Choose migration options and run migrations</li>
-                            </ol>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Tabs Overview</h4>
-                            
-                            <div class="space-y-4">
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">1. Migration Plan</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Generate a comprehensive comparison report between source and target environments. 
-                                        This shows what needs to be migrated, what's different, and provides a detailed action plan.
-                                    </p>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">2. Main Migration</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Run a complete migration with all components. Options include:
-                                    </p>
-                                    <ul class="list-disc list-inside ml-4 mt-2 text-sm text-neutral-600">
-                                        <li><strong>Include Data:</strong> Migrate database rows (--data)</li>
-                                        <li><strong>Auth Users:</strong> Migrate authentication users (--users)</li>
-                                        <li><strong>Include Files:</strong> Migrate bucket files (--files)</li>
-                                        <li><strong>Create Backup:</strong> Backup target before migration (--backup)</li>
-                                        <li><strong>Dry Run:</strong> Preview changes without applying (--dry-run)</li>
-                                    </ul>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">3. Component Migrations</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Run individual component migrations:
-                                    </p>
-                                    <ul class="list-disc list-inside ml-4 mt-2 text-sm text-neutral-600">
-                                        <li><strong>Database Migration:</strong> Schema, data, and auth users</li>
-                                        <li><strong>Storage Migration:</strong> Buckets and files</li>
-                                        <li><strong>Edge Functions:</strong> Deploy edge functions</li>
-                                        <li><strong>Secrets Migration:</strong> Migrate project secrets</li>
-                                    </ul>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">4. History & Reports</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        View past migrations and generated plans. Click "View Report" to see detailed HTML reports 
-                                        or "View Log" to see the complete migration log.
-                                    </p>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">5. CLI Manual</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        Complete documentation for using migration scripts from the command line.
-                                    </p>
-                                </div>
-
-                                <div class="bg-neutral-50 p-4 rounded-lg">
-                                    <h5 class="font-semibold text-primary-900 mb-2">6. UI Manual</h5>
-                                    <p class="text-neutral-700 text-sm">
-                                        This guide - complete documentation for using the web interface.
-                                    </p>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Features</h4>
-                            
-                            <div class="space-y-3">
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">Real-time Log Streaming:</strong>
-                                        <p class="text-neutral-700 text-sm">Watch migrations progress in real-time with live log updates</p>
-                                    </div>
-                                </div>
-
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">Active Job Indicator:</strong>
-                                        <p class="text-neutral-700 text-sm">See running jobs in the header and navigate to them directly</p>
-                                    </div>
-                                </div>
-
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">HTML Reports:</strong>
-                                        <p class="text-neutral-700 text-sm">Detailed HTML reports for every migration with statistics and change logs</p>
-                                    </div>
-                                </div>
-
-                                <div class="flex items-start space-x-3">
-                                    <svg class="w-5 h-5 text-accent-500 mt-0.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-                                    </svg>
-                                    <div>
-                                        <strong class="text-primary-900">Color-coded Logs:</strong>
-                                        <p class="text-neutral-700 text-sm">Success (green), errors (red), and warnings (yellow) are clearly highlighted</p>
-                                    </div>
-                                </div>
-                            </div>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Best Practices</h4>
-                            <ul class="list-disc list-inside space-y-2 text-neutral-700">
-                                <li>Always generate a migration plan first to understand what will be migrated</li>
-                                <li>Use dry-run mode to preview changes before applying them</li>
-                                <li>Create backups before running migrations on production environments</li>
-                                <li>Review migration reports after completion to verify success</li>
-                                <li>Check logs if a migration fails to identify the issue</li>
-                            </ul>
-                        </section>
-
-                        <section class="mb-8">
-                            <h4 class="text-xl font-semibold text-primary-800 mb-3">Troubleshooting</h4>
-                            <div class="bg-warning-50 border-2 border-warning-200 rounded-lg p-4">
-                                <p class="text-warning-800 text-sm">
-                                    <strong>If a migration fails:</strong> Check the log output for specific error messages. 
-                                    Common issues include missing environment variables, authentication problems, or network connectivity issues.
-                                </p>
-                            </div>
-                        </section>
+                    <div id="uiManualContainer" class="bg-white border-2 border-neutral-200 rounded-xl p-8 max-h-[800px] overflow-y-auto custom-scrollbar text-sm text-neutral-700 leading-relaxed">
+                        <div class="text-center text-neutral-500">Loading UI manual...</div>
                     </div>
                 </div>
             </div>
@@ -1171,54 +1023,7 @@
         </div>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <script src="ui.js"></script>
-    <script>
-        // Tab switching with Tailwind classes
-        function switchTab(tabName, clickedElement) {
-            // Hide all tabs
-            document.querySelectorAll('.tab-content').forEach(tab => {
-                tab.classList.add('hidden');
-                tab.classList.remove('animate-fade-in');
-            });
-            document.querySelectorAll('.tab-button').forEach(btn => {
-                    btn.classList.remove('active', 'bg-primary-600', 'text-white', 'shadow-md');
-                    btn.classList.add('text-neutral-600', 'hover:bg-neutral-100');
-            });
-
-            // Show selected tab
-            const selectedTab = document.getElementById(tabName);
-            if (selectedTab) {
-                selectedTab.classList.remove('hidden');
-                selectedTab.classList.add('animate-fade-in');
-            }
-
-            // Update button
-            if (clickedElement) {
-                clickedElement.classList.add('active', 'bg-primary-600', 'text-white', 'shadow-md');
-                clickedElement.classList.remove('text-neutral-600', 'hover:bg-neutral-100');
-            }
-
-            // Load data for history tab
-            if (tabName === 'history') {
-                setTimeout(() => {
-                    loadHistory();
-                    loadPlans();
-                }, 100);
-            }
-        }
-
-        // Loading spinner component
-        const loadingSpinnerHTML = `
-            <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-                <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-            </svg>
-        `;
-
-        // Update loading spinner
-        document.querySelectorAll('.loading-spinner').forEach(spinner => {
-            spinner.innerHTML = loadingSpinnerHTML;
-        });
-    </script>
 </body>
 </html>

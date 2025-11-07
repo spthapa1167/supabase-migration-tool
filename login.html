@@ -177,13 +177,6 @@
         const API_BASE = '';
         let authToken = null;
 
-        // Check if already authenticated
-        const storedToken = localStorage.getItem('migrationToolToken');
-        if (storedToken) {
-            // Verify token is still valid by trying to access the app
-            window.location.href = '/app?token=' + encodeURIComponent(storedToken);
-        }
-
         document.getElementById('loginForm').addEventListener('submit', async (e) => {
             e.preventDefault();
             
@@ -213,7 +206,7 @@
                     localStorage.setItem('migrationToolToken', authToken);
                     
                     // Redirect to app
-                    window.location.href = '/app?token=' + encodeURIComponent(authToken);
+                    window.location.href = '/app';
                 } else {
                     // Show error
                     errorMessage.textContent = data.error || 'Invalid access key';

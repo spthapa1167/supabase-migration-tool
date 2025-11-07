@@ -2,11 +2,42 @@
 
 const API_BASE = '';
 
+let appInfoData = null;
+let cliManualLoaded = false;
+let uiManualLoaded = false;
+
+// Persist token from query string (if present) and clean URL
+(() => {
+    const params = new URLSearchParams(window.location.search);
+    const tokenFromUrl = params.get('token');
+    if (tokenFromUrl) {
+        localStorage.setItem('migrationToolToken', tokenFromUrl);
+        params.delete('token');
+        const newQuery = params.toString();
+        const newUrl = window.location.pathname + (newQuery ? `?${newQuery}` : '') + window.location.hash;
+        window.history.replaceState({}, document.title, newUrl);
+    }
+})();
+
 // Get auth token from URL or localStorage
 function getAuthToken() {
-    const urlParams = new URLSearchParams(window.location.search);
-    const token = urlParams.get('token') || localStorage.getItem('migrationToolToken');
-    return token;
+    const storedToken = localStorage.getItem('migrationToolToken');
+    if (storedToken) {
+        return storedToken;
+    }
+
+    const params = new URLSearchParams(window.location.search);
+    const tokenFromUrl = params.get('token');
+    if (tokenFromUrl) {
+        localStorage.setItem('migrationToolToken', tokenFromUrl);
+        params.delete('token');
+        const newQuery = params.toString();
+        const newUrl = window.location.pathname + (newQuery ? `?${newQuery}` : '') + window.location.hash;
+        window.history.replaceState({}, document.title, newUrl);
+        return tokenFromUrl;
+    }
+
+    return null;
 }
 
 // Set auth token for API requests
@@ -62,6 +93,22 @@ function switchTab(tabName, clickedElement) {
     if (tabName === 'connection-test') {
         // Load environments immediately (no API call, hardcoded)
         loadEnvironmentsList();
+    }
+
+    if (tabName === 'cli-manual' && !cliManualLoaded) {
+        loadManualContent('cliManualContainer', 'MIGRATION_GUIDE.md').then(() => {
+            cliManualLoaded = true;
+        }).catch(() => {
+            cliManualLoaded = false;
+        });
+    }
+
+    if (tabName === 'ui-manual' && !uiManualLoaded) {
+        loadManualContent('uiManualContainer', 'WEB_UI_GUIDE.md').then(() => {
+            uiManualLoaded = true;
+        }).catch(() => {
+            uiManualLoaded = false;
+        });
     }
 }
 
@@ -131,8 +178,15 @@ function formatLogOutput(output) {
     lines.forEach(line => {
         if (!line.trim()) return;
         let className = 'text-slate-300';
-        if (line.includes('ERROR') || line.includes('✗') || line.includes('Failed')) {
-            className = 'text-error-400';
+        const lowered = line.toLowerCase();
+         if (line.includes('ERROR') || line.includes('✗') || line.includes('Failed')) {
+             className = 'text-error-400';
+        } else if (lowered.includes('retrieved') && lowered.includes(' via ')) {
+            className = 'text-success-400';
+        } else if (lowered.includes('returned no rows')) {
+            className = 'text-neutral-400';
+        } else if (lowered.includes('trying next endpoint')) {
+            className = 'text-warning-400';
         } else if (line.includes('SUCCESS') || line.includes('✓') || line.includes('Completed')) {
             className = 'text-success-400';
         } else if (line.includes('WARNING') || line.includes('⚠')) {
@@ -148,8 +202,16 @@ function addLogLine(container, text, type = 'stdout') {
     const logLine = document.createElement('div');
     logLine.className = 'font-mono text-sm mb-1';
     
+    const normalizedText = text.toLowerCase();
+    
     // Apply styling based on content
-    if (type === 'stderr' || text.includes('ERROR') || text.includes('✗') || text.includes('Failed')) {
+    if (normalizedText.includes('retrieved') && normalizedText.includes(' via ')) {
+        logLine.classList.add('text-success-400', 'font-semibold');
+    } else if (normalizedText.includes('returned no rows')) {
+        logLine.classList.add('text-neutral-400', 'italic');
+    } else if (normalizedText.includes('trying next endpoint')) {
+        logLine.classList.add('text-warning-400', 'italic');
+    } else if (type === 'stderr' || text.includes('ERROR') || text.includes('✗') || text.includes('Failed')) {
         logLine.classList.add('text-error-400');
     } else if (text.includes('SUCCESS') || text.includes('✓') || text.includes('Completed')) {
         logLine.classList.add('text-success-400');
@@ -202,64 +264,57 @@ async function loadAppInfo() {
             headers: getAuthHeaders()
         });
         if (!response.ok) {
-            console.error('Failed to load app info');
-            return;
+            throw new Error('Failed to load app info');
         }
         
-        const info = await response.json();
+        const data = await response.json();
+        appInfoData = data;
         
-        // Update app name in header
-        const appNameElement = document.getElementById('appName');
-        if (appNameElement && info.appName) {
-            appNameElement.textContent = info.appName;
-        }
-        
-        // Update environment project names
         const envInfoElement = document.getElementById('envInfo');
-        if (envInfoElement && info.environments) {
-            const envs = info.environments;
-            const envItems = [];
-            
-            // Production
-            if (envs.prod && envs.prod.projectName && envs.prod.projectName !== 'N/A') {
-                envItems.push(`
-                    <div class="flex items-center space-x-1">
-                        <span class="px-2 py-0.5 bg-error-100 text-error-700 rounded font-semibold text-xs">PROD</span>
-                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.prod.projectName)}</span>
-                    </div>
+        if (envInfoElement && data.environments) {
+            const envOrder = ['prod', 'test', 'dev'];
+            const envBadgeColors = {
+                prod: 'bg-error-100 text-error-700',
+                test: 'bg-warning-100 text-warning-700',
+                dev: 'bg-success-100 text-success-700'
+            };
+
+            const envBadges = [];
+
+            envOrder.forEach(key => {
+                const envData = data.environments[key];
+                if (!envData || !envData.projectName || envData.projectName === 'N/A') {
+                    return;
+                }
+
+                const badgeClass = envBadgeColors[key] || 'bg-neutral-100 text-neutral-700';
+                const projectName = escapeHtml(envData.projectName);
+                const projectRef = escapeHtml(envData.projectRef || 'N/A');
+                const poolerRegion = escapeHtml(envData.poolerRegion || 'aws-1-us-east-2');
+                const poolerPort = escapeHtml(envData.poolerPort || '6543');
+                const directHostRaw = envData.projectRef && envData.projectRef !== 'N/A'
+                    ? `db.${envData.projectRef}.supabase.co`
+                    : '';
+                const directHost = directHostRaw ? escapeHtml(directHostRaw) : '';
+
+                envBadges.push(`
+                    <span class="inline-flex items-center space-x-2 px-2.5 py-1 rounded-full text-xs font-semibold border border-neutral-200 bg-white/80">
+                        <span class="inline-flex items-center justify-center w-6 h-6 rounded-full ${badgeClass}">${key.toUpperCase()}</span>
+                        <span class="text-neutral-700">${projectName}</span>
+                    </span>
                 `);
-            }
-            
-            // Test/Staging
-            if (envs.test && envs.test.projectName && envs.test.projectName !== 'N/A') {
-                envItems.push(`
-                    <div class="flex items-center space-x-1">
-                        <span class="px-2 py-0.5 bg-warning-100 text-warning-700 rounded font-semibold text-xs">TEST</span>
-                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.test.projectName)}</span>
-                    </div>
-                `);
-            }
-            
-            // Development
-            if (envs.dev && envs.dev.projectName && envs.dev.projectName !== 'N/A') {
-                envItems.push(`
-                    <div class="flex items-center space-x-1">
-                        <span class="px-2 py-0.5 bg-success-100 text-success-700 rounded font-semibold text-xs">DEV</span>
-                        <span class="text-neutral-700 font-medium">${escapeHtml(envs.dev.projectName)}</span>
-                    </div>
-                `);
-            }
-            
-            if (envItems.length > 0) {
-                envInfoElement.innerHTML = envItems.join('<span class="text-neutral-300 mx-2">•</span>');
-            } else {
-                envInfoElement.innerHTML = '<span class="text-neutral-500 italic">No environment projects configured</span>';
+            });
+
+            if (envInfoElement) {
+                envInfoElement.innerHTML = envBadges.length
+                    ? envBadges.join('<span class="text-neutral-300">•</span>')
+                    : '<span class="text-neutral-500 italic">No environment projects configured</span>';
             }
         }
     } catch (error) {
         console.error('Error loading app info:', error);
     }
-}
+ }
 
 // Load environments list for connection test (hardcoded)
 function loadEnvironmentsList() {
@@ -352,8 +407,14 @@ async function testConnection(env) {
     
     // Summary card
     const summaryCard = document.createElement('div');
-    summaryCard.className = 'bg-gradient-to-r from-primary-50 to-primary-100 border-2 border-primary-200 rounded-xl p-6';
+    summaryCard.className = 'bg-gradient-to-r from-primary-50 to-primary-100 border-2 border-primary-200 rounded-xl p-6 mb-4';
     summaryCard.id = `testSummary_${env}`;
+    const envConfig = appInfoData?.environments?.[env] || {};
+    const poolerRegion = escapeHtml(envConfig.poolerRegion || 'aws-1-us-east-2');
+    const poolerPort = escapeHtml(envConfig.poolerPort || '6543');
+    const directHostRaw = envConfig.projectRef && envConfig.projectRef !== 'N/A' ? `db.${envConfig.projectRef}.supabase.co` : '';
+    const directHost = directHostRaw ? escapeHtml(directHostRaw) : '';
+    const configLine = directHost ? `Pooler ${poolerRegion}:${poolerPort} • Direct ${directHost}` : `Pooler ${poolerRegion}:${poolerPort}`;
     summaryCard.innerHTML = `
         <div class="flex items-center justify-between">
             <div class="flex items-center space-x-4">
@@ -363,8 +424,10 @@ async function testConnection(env) {
                     </svg>
                 </div>
                 <div>
-                    <h4 class="text-xl font-bold text-primary-900">${envName}</h4>
-                    <p class="text-sm text-primary-700 mt-1">Running connection tests...</p>
+                    <h4 class="text-xl font-bold text-primary-900">${envNames[env]}</h4>
+                    <p class="status-text text-sm text-primary-700 mt-1">Running connection tests...</p>
+                    <p class="config-detail text-xs text-primary-600 mt-1">${configLine}</p>
+                    <p class="connection-detail text-xs text-success-600 mt-1 hidden"></p>
                 </div>
             </div>
             <div class="text-right">
@@ -400,12 +463,6 @@ async function testConnection(env) {
     // Scroll to results
     testResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
     
-    let testStatus = 'running';
-    let passedCount = 0;
-    let failedCount = 0;
-    let totalCount = 0;
-    let skippedCount = 0;
-    
     // Use the shared test function
     await testConnectionForEnv(env, false);
     
@@ -425,13 +482,15 @@ function updateTestSummary(env, passed, failed, total) {
 }
 
 // Update test summary with final status
-function updateTestSummaryFinal(env, passed, failed, total, skipped, success) {
+function updateTestSummaryFinal(env, passed, failed, total, skipped, success, connectionDetail = '') {
     const summaryCard = document.getElementById(`testSummary_${env}`);
     if (!summaryCard) return;
     
     // Update counts
     updateTestSummary(env, passed, failed, total);
-    
+    const statusText = summaryCard.querySelector('.status-text');
+    const connectionDetailEl = summaryCard.querySelector('.connection-detail');
+     
     // Update card styling based on result
     if (success && failed === 0) {
         summaryCard.className = 'bg-gradient-to-r from-success-50 to-success-100 border-2 border-success-200 rounded-xl p-6';
@@ -443,10 +502,18 @@ function updateTestSummaryFinal(env, passed, failed, total, skipped, success) {
                 </svg>
             `;
         }
-        const statusText = summaryCard.querySelector('.text-primary-700');
         if (statusText) {
             statusText.textContent = 'All tests passed!';
-            statusText.className = 'text-sm text-success-700 mt-1 font-semibold';
+            statusText.className = 'status-text text-sm text-success-700 mt-1 font-semibold';
+        }
+        if (connectionDetailEl) {
+            if (connectionDetail) {
+                connectionDetailEl.textContent = `Connected via ${connectionDetail}`;
+                connectionDetailEl.className = 'connection-detail text-xs text-success-600 mt-1';
+            } else {
+                connectionDetailEl.textContent = '';
+                connectionDetailEl.className = 'connection-detail text-xs text-success-600 mt-1 hidden';
+            }
         }
     } else if (failed > 0) {
         summaryCard.className = 'bg-gradient-to-r from-error-50 to-error-100 border-2 border-error-200 rounded-xl p-6';
@@ -458,10 +525,42 @@ function updateTestSummaryFinal(env, passed, failed, total, skipped, success) {
                 </svg>
             `;
         }
-        const statusText = summaryCard.querySelector('.text-primary-700');
         if (statusText) {
             statusText.textContent = `${failed} test(s) failed`;
-            statusText.className = 'text-sm text-error-700 mt-1 font-semibold';
+            statusText.className = 'status-text text-sm text-error-700 mt-1 font-semibold';
+        }
+        if (connectionDetailEl) {
+            if (connectionDetail) {
+                connectionDetailEl.textContent = connectionDetail;
+                connectionDetailEl.className = 'connection-detail text-xs text-error-600 mt-1';
+            } else {
+                connectionDetailEl.textContent = '';
+                connectionDetailEl.className = 'connection-detail text-xs text-error-600 mt-1 hidden';
+            }
+        }
+    } else {
+        // Neutral outcome (no failures but not marked success)
+        summaryCard.className = 'bg-gradient-to-r from-warning-50 to-warning-100 border-2 border-warning-200 rounded-xl p-6';
+        const iconContainer = summaryCard.querySelector('.w-16');
+        if (iconContainer) {
+            iconContainer.innerHTML = `
+                <svg class="w-8 h-8 text-warning-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path>
+                </svg>
+            `;
+        }
+        if (statusText) {
+            statusText.textContent = 'Tests finished with warnings';
+            statusText.className = 'status-text text-sm text-warning-700 mt-1 font-semibold';
+        }
+        if (connectionDetailEl) {
+            if (connectionDetail) {
+                connectionDetailEl.textContent = connectionDetail;
+                connectionDetailEl.className = 'connection-detail text-xs text-warning-600 mt-1';
+            } else {
+                connectionDetailEl.textContent = '';
+                connectionDetailEl.className = 'connection-detail text-xs text-warning-600 mt-1 hidden';
+            }
         }
     }
 }
@@ -564,13 +663,23 @@ async function testConnectionForEnv(env, isAllTests = false) {
     };
     const envName = envNames[env] || env;
     
+    const envConfig = appInfoData?.environments?.[env] || {};
+    const poolerRegion = escapeHtml(envConfig.poolerRegion || 'aws-1-us-east-2');
+    const poolerPort = escapeHtml(envConfig.poolerPort || '6543');
+    const directHostRaw = envConfig.projectRef && envConfig.projectRef !== 'N/A' ? `db.${envConfig.projectRef}.supabase.co` : '';
+    const directHost = directHostRaw ? escapeHtml(directHostRaw) : '';
+    const configLine = directHost ? `Pooler ${poolerRegion}:${poolerPort} • Direct ${directHost}` : `Pooler ${poolerRegion}:${poolerPort}`;
+    
     const logContainer = document.getElementById(`connectionTestLog_${env}`);
     if (!logContainer) return;
     
+    const TOTAL_TESTS = 13;
     let passedCount = 0;
     let failedCount = 0;
     let totalCount = 0;
     let skippedCount = 0;
+    let lastConnectionLabel = '';
+    let lastFailureDetail = '';
     
     try {
         const response = await fetch(`${API_BASE}/api/connection-test`, {
@@ -622,6 +731,10 @@ async function testConnectionForEnv(env, isAllTests = false) {
                                     passedCount++;
                                     totalCount++;
                                     updateTestSummary(env, passedCount, failedCount, totalCount);
+                                    const match = cleanText.match(/Database connectivity \(([^)]+)\)/i);
+                                    if (match) {
+                                        lastConnectionLabel = match[1];
+                                    }
                                 }
                             } else if (cleanText.includes('❌') || cleanText.includes('FAIL:') || cleanText.match(/FAIL:/i)) {
                                 logLine.className += ' text-error-400 font-semibold';
@@ -629,6 +742,7 @@ async function testConnectionForEnv(env, isAllTests = false) {
                                     failedCount++;
                                     totalCount++;
                                     updateTestSummary(env, passedCount, failedCount, totalCount);
+                                    lastFailureDetail = cleanText;
                                 }
                             } else if (cleanText.includes('⚠️') || cleanText.includes('SKIP:') || cleanText.match(/SKIP:/i)) {
                                 logLine.className += ' text-warning-400';
@@ -661,7 +775,14 @@ async function testConnectionForEnv(env, isAllTests = false) {
                             });
                         } else if (data.type === 'complete') {
                             const success = data.status === 'completed' && failedCount === 0;
-                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, success);
+                            if (totalCount < TOTAL_TESTS) {
+                                totalCount = TOTAL_TESTS;
+                            }
+                            if (passedCount > totalCount) {
+                                passedCount = totalCount;
+                            }
+                            const connectionDetail = success ? lastConnectionLabel : lastFailureDetail;
+                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, success, connectionDetail);
                             
                             // Add final summary to log
                             const summaryLine = document.createElement('div');
@@ -685,6 +806,7 @@ async function testConnectionForEnv(env, isAllTests = false) {
                                         ${passedCount} passed, ${failedCount} failed${skippedCount > 0 ? `, ${skippedCount} skipped` : ''}
                                     </div>
                                 </div>
+                                ${connectionDetail ? `<div class="mt-2 text-xs ${success ? 'text-success-600' : 'text-error-600'}">${escapeHtml(connectionDetail)}</div>` : ''}
                             `;
                             logContainer.appendChild(summaryLine);
                         } else if (data.type === 'error') {
@@ -699,7 +821,11 @@ async function testConnectionForEnv(env, isAllTests = false) {
                                 </div>
                             `;
                             logContainer.appendChild(errorLine);
-                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false);
+                            lastFailureDetail = data.error;
+                            if (totalCount < TOTAL_TESTS) {
+                                totalCount = TOTAL_TESTS;
+                            }
+                            updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false, lastFailureDetail);
                         }
                     } catch (e) {
                         console.error('Error parsing SSE data:', e);
@@ -720,7 +846,11 @@ async function testConnectionForEnv(env, isAllTests = false) {
             </div>
         `;
         logContainer.appendChild(errorDiv);
-        updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false);
+        lastFailureDetail = error.message;
+        if (totalCount < TOTAL_TESTS) {
+            totalCount = TOTAL_TESTS;
+        }
+        updateTestSummaryFinal(env, passedCount, failedCount, totalCount, skippedCount, false, lastFailureDetail);
     }
 }
 
@@ -1877,3 +2007,26 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 });
+
+async function loadManualContent(containerId, sourcePath) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
+
+    try {
+        const response = await fetch(sourcePath);
+        if (!response.ok) {
+            throw new Error(`Unable to load ${sourcePath}`);
+        }
+        const markdown = await response.text();
+        let htmlContent = '';
+        if (window.marked) {
+            htmlContent = window.marked.parse(markdown);
+        } else {
+            htmlContent = `<pre class="whitespace-pre-wrap">${escapeHtml(markdown)}</pre>`;
+        }
+        container.innerHTML = `<article class="space-y-4 prose prose-slate max-w-none">${htmlContent}</article>`;
+    } catch (error) {
+        container.innerHTML = `<div class="text-error-600 text-center">${escapeHtml(error.message)}</div>`;
+        throw error;
+    }
+}

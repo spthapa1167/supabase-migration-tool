@@ -323,57 +323,14 @@ step_validate_env_file() {
     log_info "   All required variables are present"
     echo ""
     
-    if ! prompt_proceed "Environment File Validation Complete" "Environment file looks good. Continue to connection validation?"; then
+    if ! prompt_proceed "Environment File Validation Complete" "Environment file looks good. Continue to difference analysis?"; then
         return 1
     fi
     
     return 0
 }
 
-# Step 2: Validate connections
-step_validate_connections() {
-    local source=$1
-    local target=$2
-    
-    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_info "  STEP 2/4: Validating Project Connections"
-    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    echo ""
-    
-    if [ "$DRY_RUN" = "true" ]; then
-        echo -e "${YELLOW}[DRY RUN] Would validate connections to source and target projects${NC}"
-        echo ""
-        return 0
-    fi
-    
-    # Check if validate_env.sh exists
-    if [ ! -f "$PROJECT_ROOT/scripts/utils/validate_env.sh" ]; then
-        log_warning "Validation script not found: scripts/utils/validate_env.sh"
-        log_info "Skipping connection validation"
-        return 0
-    fi
-    
-    log_info "Running connection validation..."
-    echo ""
-    
-    # Run validation script
-    if "$PROJECT_ROOT/scripts/utils/validate_env.sh" --env-file "$ENV_FILE" 2>&1; then
-        log_success "✅ Connection validation passed"
-        echo ""
-        
-        if ! prompt_proceed "Connection Validation Complete" "Both projects are accessible. Continue to diff comparison?"; then
-            return 1
-        fi
-        
-        return 0
-    else
-        log_error "❌ Connection validation failed"
-        log_error "Please fix the connection issues before proceeding"
-        return 1
-    fi
-}
-
-# Step 3: Run diff comparison
+# Step 2: Run diff comparison (pass migration_dir to save schemas)
 step_diff_comparison() {
     local source=$1
     local target=$2
@@ -1159,366 +1116,6 @@ EOF
     fi
 }
 
-# Capture migration snapshot (before or after)
-capture_migration_snapshot() {
-    local source=$1
-    local target=$2
-    local migration_dir=$3
-    local snapshot_type=$4  # "before" or "after"
-    
-    log_info "Capturing $snapshot_type migration snapshot for source and target..."
-    
-    # Ensure migration directory exists
-    if [ ! -d "$migration_dir" ]; then
-        mkdir -p "$migration_dir" || {
-            log_warning "Cannot create migration directory: $migration_dir"
-            return 1
-        }
-    fi
-    
-    # Source required utilities if not already sourced
-    if ! command -v get_project_ref >/dev/null 2>&1; then
-        if [ -f "$PROJECT_ROOT/lib/supabase_utils.sh" ]; then
-            source "$PROJECT_ROOT/lib/supabase_utils.sh"
-        else
-            log_error "Cannot find supabase_utils.sh"
-            return 1
-        fi
-    fi
-    
-    # Get project refs and passwords
-    local source_ref=$(get_project_ref "$source")
-    local target_ref=$(get_project_ref "$target")
-    local source_password=$(get_db_password "$source")
-    local target_password=$(get_db_password "$target")
-    
-    if [ -z "$source_ref" ] || [ -z "$target_ref" ] || [ -z "$source_password" ] || [ -z "$target_password" ]; then
-        log_error "Missing required parameters for snapshot: source_ref=$source_ref, target_ref=$target_ref"
-        return 1
-    fi
-    
-    # Create snapshot file
-    local snapshot_file="$migration_dir/snapshot_${snapshot_type}.json"
-    
-    # Count database objects directly (no external dependency needed)
-    
-    # Query function helper (same as in html_generator.sh)
-    query_database_counts() {
-        local project_ref=$1
-        local password=$2
-        local pooler_host=$3
-        
-        if [ -z "$project_ref" ] || [ -z "$password" ]; then
-            echo "0 0 0 0 0 0 0 0 0"
-            return 0
-        fi
-        
-        local tables=0 views=0 functions=0 sequences=0 indexes=0 policies=0 triggers=0 types=0 enums=0
-        
-        if [ -n "$pooler_host" ]; then
-            # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-            tables=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            views=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            functions=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            sequences=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            indexes=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            policies=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            triggers=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "")
-            types=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "")
-            enums=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "")
-        fi
-        
-        # Always try direct connection as well to ensure we get counts
-        if [ -z "$pooler_host" ] || [ -z "$tables" ] || [ "$tables" = "" ] || [ "$tables" = "0" ]; then
-            local direct_host="db.${project_ref}.supabase.co"
-            log_info "Querying via direct connection for $project_ref..."
-            local direct_tables=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            if [ -n "$direct_tables" ] && [ "$direct_tables" != "" ]; then
-                tables="$direct_tables"
-                views=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                functions=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                sequences=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                indexes=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                policies=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                triggers=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                types=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-                enums=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' \n\r' || echo "0")
-            fi
-        fi
-        
-        # Ensure all values are set (default to 0 if empty)
-        tables=${tables:-0}
-        views=${views:-0}
-        functions=${functions:-0}
-        sequences=${sequences:-0}
-        indexes=${indexes:-0}
-        policies=${policies:-0}
-        triggers=${triggers:-0}
-        types=${types:-0}
-        enums=${enums:-0}
-        
-        echo "$tables $views $functions $sequences $indexes $policies $triggers $types $enums"
-    }
-    
-    query_auth_users_count() {
-        local project_ref=$1
-        local password=$2
-        local pooler_host=$3
-        
-        if [ -z "$project_ref" ] || [ -z "$password" ]; then
-            echo "0"
-            return 0
-        fi
-        
-        local auth_users=0
-        
-        if [ -n "$pooler_host" ]; then
-            # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-            auth_users=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null | tr -d ' ' || echo "0")
-        fi
-        
-        if [ -z "$pooler_host" ] || [ "$auth_users" = "" ] || [ "$auth_users" = "0" ]; then
-            local direct_host="db.${project_ref}.supabase.co"
-            auth_users=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null | tr -d ' ' || echo "0")
-        fi
-        
-        echo "$auth_users"
-    }
-    
-    query_edge_functions_count() {
-        local project_ref=$1
-        
-        if [ -z "$project_ref" ] || [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
-            echo "0"
-            return 0
-        fi
-        
-        local temp_json=$(mktemp)
-        local count=0
-        
-        if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-            "https://api.supabase.com/v1/projects/${project_ref}/functions" \
-            -o "$temp_json" 2>/dev/null; then
-            if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then
-                count=$(jq '. | length' "$temp_json" 2>/dev/null || echo "0")
-            fi
-        fi
-        
-        rm -f "$temp_json"
-        echo "$count"
-    }
-    
-    query_storage_buckets_count() {
-        local project_ref=$1
-        local password=$2
-        local pooler_host=$3
-        
-        if [ -z "$project_ref" ] || [ -z "$password" ]; then
-            echo "0"
-            return 0
-        fi
-        
-        local buckets=0
-        
-        if [ -n "$pooler_host" ]; then
-            # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-            buckets=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM storage.buckets;" 2>/dev/null | tr -d ' ' || echo "0")
-        fi
-        
-        if [ -z "$pooler_host" ] || [ "$buckets" = "" ]; then
-            local direct_host="db.${project_ref}.supabase.co"
-            buckets=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -c "SELECT COUNT(*) FROM storage.buckets;" 2>/dev/null | tr -d ' ' || echo "0")
-        fi
-        
-        echo "$buckets"
-    }
-    
-    query_secrets_count() {
-        local project_ref=$1
-        
-        if [ -z "$project_ref" ] || [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
-            echo "0"
-            return 0
-        fi
-        
-        local temp_json=$(mktemp)
-        local count=0
-        
-        if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-            "https://api.supabase.com/v1/projects/${project_ref}/secrets" \
-            -o "$temp_json" 2>/dev/null; then
-            if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then
-                count=$(jq '. | length' "$temp_json" 2>/dev/null || echo "0")
-            fi
-        fi
-        
-        rm -f "$temp_json"
-        echo "$count"
-    }
-    
-    # Get source counts
-    local source_pooler=$(get_pooler_host "$source_ref")
-    log_info "Querying source database counts for snapshot..."
-    local source_db_counts=$(query_database_counts "$source_ref" "$source_password" "$source_pooler")
-    log_info "Source DB counts result: $source_db_counts"
-    local source_tables=$(echo "$source_db_counts" | awk '{print $1}')
-    local source_views=$(echo "$source_db_counts" | awk '{print $2}')
-    local source_functions=$(echo "$source_db_counts" | awk '{print $3}')
-    local source_sequences=$(echo "$source_db_counts" | awk '{print $4}')
-    local source_indexes=$(echo "$source_db_counts" | awk '{print $5}')
-    local source_policies=$(echo "$source_db_counts" | awk '{print $6}')
-    local source_triggers=$(echo "$source_db_counts" | awk '{print $7}')
-    local source_types=$(echo "$source_db_counts" | awk '{print $8}')
-    local source_enums=$(echo "$source_db_counts" | awk '{print $9}')
-    log_info "Querying source auth users, edge functions, buckets, secrets..."
-    local source_auth_users=$(query_auth_users_count "$source_ref" "$source_password" "$source_pooler")
-    local source_edge_functions=$(query_edge_functions_count "$source_ref")
-    local source_buckets=$(query_storage_buckets_count "$source_ref" "$source_password" "$source_pooler")
-    local source_secrets=$(query_secrets_count "$source_ref")
-    log_info "Source counts: tables=$source_tables, buckets=$source_buckets, edge_functions=$source_edge_functions"
-    
-    # Get target counts
-    local target_pooler=$(get_pooler_host "$target_ref")
-    log_info "Querying target database counts for snapshot..."
-    local target_db_counts=$(query_database_counts "$target_ref" "$target_password" "$target_pooler")
-    log_info "Target DB counts result: $target_db_counts"
-    local target_tables=$(echo "$target_db_counts" | awk '{print $1}')
-    local target_views=$(echo "$target_db_counts" | awk '{print $2}')
-    local target_functions=$(echo "$target_db_counts" | awk '{print $3}')
-    local target_sequences=$(echo "$target_db_counts" | awk '{print $4}')
-    local target_indexes=$(echo "$target_db_counts" | awk '{print $5}')
-    local target_policies=$(echo "$target_db_counts" | awk '{print $6}')
-    local target_triggers=$(echo "$target_db_counts" | awk '{print $7}')
-    local target_types=$(echo "$target_db_counts" | awk '{print $8}')
-    local target_enums=$(echo "$target_db_counts" | awk '{print $9}')
-    log_info "Querying target auth users, edge functions, buckets, secrets..."
-    local target_auth_users=$(query_auth_users_count "$target_ref" "$target_password" "$target_pooler")
-    local target_edge_functions=$(query_edge_functions_count "$target_ref")
-    local target_buckets=$(query_storage_buckets_count "$target_ref" "$target_password" "$target_pooler")
-    local target_secrets=$(query_secrets_count "$target_ref")
-    log_info "Target counts: tables=$target_tables, buckets=$target_buckets, edge_functions=$target_edge_functions"
-    
-    # Save to JSON file
-    if command -v jq >/dev/null 2>&1; then
-        jq -n \
-            --arg source_env "$source" \
-            --arg target_env "$target" \
-            --arg source_ref "$source_ref" \
-            --arg target_ref "$target_ref" \
-            --argjson source_tables "$source_tables" \
-            --argjson source_views "$source_views" \
-            --argjson source_functions "$source_functions" \
-            --argjson source_sequences "$source_sequences" \
-            --argjson source_indexes "$source_indexes" \
-            --argjson source_policies "$source_policies" \
-            --argjson source_triggers "$source_triggers" \
-            --argjson source_types "$source_types" \
-            --argjson source_enums "$source_enums" \
-            --argjson source_auth_users "$source_auth_users" \
-            --argjson source_edge_functions "$source_edge_functions" \
-            --argjson source_buckets "$source_buckets" \
-            --argjson source_secrets "$source_secrets" \
-            --argjson target_tables "$target_tables" \
-            --argjson target_views "$target_views" \
-            --argjson target_functions "$target_functions" \
-            --argjson target_sequences "$target_sequences" \
-            --argjson target_indexes "$target_indexes" \
-            --argjson target_policies "$target_policies" \
-            --argjson target_triggers "$target_triggers" \
-            --argjson target_types "$target_types" \
-            --argjson target_enums "$target_enums" \
-            --argjson target_auth_users "$target_auth_users" \
-            --argjson target_edge_functions "$target_edge_functions" \
-            --argjson target_buckets "$target_buckets" \
-            --argjson target_secrets "$target_secrets" \
-            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            '{
-                snapshot_type: $snapshot_type,
-                timestamp: $timestamp,
-                source: {
-                    env: $source_env,
-                    ref: $source_ref,
-                    counts: {
-                        tables: $source_tables,
-                        views: $source_views,
-                        functions: $source_functions,
-                        sequences: $source_sequences,
-                        indexes: $source_indexes,
-                        policies: $source_policies,
-                        triggers: $source_triggers,
-                        types: $source_types,
-                        enums: $source_enums,
-                        auth_users: $source_auth_users,
-                        edge_functions: $source_edge_functions,
-                        buckets: $source_buckets,
-                        secrets: $source_secrets
-                    }
-                },
-                target: {
-                    env: $target_env,
-                    ref: $target_ref,
-                    counts: {
-                        tables: $target_tables,
-                        views: $target_views,
-                        functions: $target_functions,
-                        sequences: $target_sequences,
-                        indexes: $target_indexes,
-                        policies: $target_policies,
-                        triggers: $target_triggers,
-                        types: $target_types,
-                        enums: $target_enums,
-                        auth_users: $target_auth_users,
-                        edge_functions: $target_edge_functions,
-                        buckets: $target_buckets,
-                        secrets: $target_secrets
-                    }
-                }
-            }' > "$snapshot_file" 2>/dev/null || {
-            log_warning "Failed to create JSON snapshot, creating simple text file..."
-            cat > "$snapshot_file" << EOF
-# Migration Snapshot: $snapshot_type
-Timestamp: $(date)
-
-Source ($source_env):
-  Tables: $source_tables
-  Views: $source_views
-  Functions: $source_functions
-  Sequences: $source_sequences
-  Indexes: $source_indexes
-  Policies: $source_policies
-  Triggers: $source_triggers
-  Types: $source_types
-  Enums: $source_enums
-  Auth Users: $source_auth_users
-  Edge Functions: $source_edge_functions
-  Buckets: $source_buckets
-  Secrets: $source_secrets
-
-Target ($target_env):
-  Tables: $target_tables
-  Views: $target_views
-  Functions: $target_functions
-  Sequences: $target_sequences
-  Indexes: $target_indexes
-  Policies: $target_policies
-  Triggers: $target_triggers
-  Types: $target_types
-  Enums: $target_enums
-  Auth Users: $target_auth_users
-  Edge Functions: $target_edge_functions
-  Buckets: $target_buckets
-  Secrets: $target_secrets
-EOF
-        }
-        
-        log_info "Snapshot saved: $snapshot_file"
-        return 0
-    else
-        log_warning "jq not available, skipping snapshot creation"
-        return 1
-    fi
-}
-
 # Create migration directory with descriptive name
 create_migration_dir() {
     local source_env=${1:-$SOURCE_ENV}
@@ -1555,19 +1152,7 @@ perform_migration() {
         return 1
     fi
     
-    # Step 2: Validate connections
-    if ! step_validate_connections "$source" "$target"; then
-        log_error "Connection validation failed or cancelled"
-        return 1
-    fi
-    
-    # Step 3: Capture BEFORE migration counts (snapshot)
-    log_info "Capturing BEFORE migration snapshot (object counts)..."
-    capture_migration_snapshot "$source" "$target" "$migration_dir" "before" || {
-        log_warning "Failed to capture before migration snapshot, continuing..."
-    }
-    
-    # Step 4: Run diff comparison (pass migration_dir to save schemas)
+    # Step 2: Run diff comparison (pass migration_dir to save schemas)
     local diff_result
     step_diff_comparison "$source" "$target" "$migration_dir"
     diff_result=$?
@@ -1592,9 +1177,9 @@ perform_migration() {
         return 0
     fi
     
-    # Step 4: Actual migration
+    # Step 3: Actual migration
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_info "  STEP 4/4: Executing Migration"
+    log_info "  STEP 3/3: Executing Migration"
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     log_info "Migration: $source → $target ($MODE mode)"
@@ -1829,14 +1414,8 @@ perform_migration() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Generating result.md and result.html files..." >> "$actual_migration_dir/migration.log" 2>/dev/null || true
     
     if [ $exit_code -eq 0 ]; then
-        # IMPORTANT: Wait a moment to ensure migration is fully complete before querying counts
-        log_info "Migration completed successfully. Capturing AFTER migration snapshot (object counts)..."
+        # Give Supabase a moment to settle before generating reports
         sleep 2
-        
-        # Capture AFTER migration counts (snapshot)
-        capture_migration_snapshot "$source" "$target" "$actual_migration_dir" "after" || {
-            log_warning "Failed to capture after migration snapshot, continuing..."
-        }
         
         # Generate result files - ensure they're created even if function fails partially
         # This queries target counts AFTER migration completes for accuracy

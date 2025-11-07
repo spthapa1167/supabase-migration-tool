@@ -81,6 +81,10 @@ SOURCE_REF=$(get_project_ref "$SOURCE_ENV")
 TARGET_REF=$(get_project_ref "$TARGET_ENV")
 SOURCE_PASSWORD=$(get_db_password "$SOURCE_ENV")
 TARGET_PASSWORD=$(get_db_password "$TARGET_ENV")
+SOURCE_POOLER_REGION=$(get_pooler_region_for_env "$SOURCE_ENV")
+TARGET_POOLER_REGION=$(get_pooler_region_for_env "$TARGET_ENV")
+SOURCE_POOLER_PORT=$(get_pooler_port_for_env "$SOURCE_ENV")
+TARGET_POOLER_PORT=$(get_pooler_port_for_env "$TARGET_ENV")
 
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
@@ -98,98 +102,136 @@ log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Output: $HTML_FILE"
 log_info ""
 
+# Helper function to count lines in file (excluding empty lines)
+count_items() {
+    local file=$1
+    if [ -f "$file" ]; then
+        grep -v '^[[:space:]]*$' "$file" | wc -l | tr -d ' '
+    else
+        echo "0"
+    fi
+}
+
+# Helper function to get file contents as array
+get_file_contents() {
+    local file=$1
+    if [ -f "$file" ] && [ -s "$file" ]; then
+        cat "$file"
+    else
+        echo ""
+    fi
+}
+
+# Helper to run a psql query with automatic fallback to direct connection
+run_psql_with_fallback() {
+    local output_path=$1
+    local description=$2
+    local ref=$3
+    local password=$4
+    local pooler_region=$5
+    local pooler_port=$6
+    local query=$7
+    shift 7
+    local psql_extra_flags=()
+    if [ $# -gt 0 ]; then
+        psql_extra_flags=("$@")
+    fi
+
+    local tmp_file="${output_path}.tmp"
+    local tmp_err="${output_path}.err"
+    rm -f "$tmp_file"
+    rm -f "$tmp_err"
+
+    local success=false
+    local attempt_label=""
+
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            ${psql_extra_flags[@]+"${psql_extra_flags[@]}"} \
+            -c "$query" \
+            >"$tmp_file" 2>"$tmp_err"; then
+            success=true
+            attempt_label="$label"
+            break
+        else
+            status=$?
+            if [ -s "$tmp_err" ]; then
+                log_warning "$description for $ref failed via $label: $(head -1 "$tmp_err")"
+            else
+                log_warning "$description for $ref failed via $label (psql exited with status $status)"
+            fi
+            log_warning "Trying next endpoint..."
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    if $success; then
+        mv "$tmp_file" "$output_path"
+        rm -f "$tmp_err"
+        if [ -s "$output_path" ]; then
+            log_info "Retrieved $description for $ref via $attempt_label"
+        else
+            log_info "$description for $ref via $attempt_label returned no rows"
+        fi
+    else
+        : > "$output_path"
+        log_warning "Unable to retrieve $description for $ref after all connection attempts"
+        rm -f "$tmp_file" "$tmp_err"
+    fi
+}
+
 # Function to get database schema information
 get_db_schema_info() {
     local env=$1
     local ref=$2
     local password=$3
-    local output_file=$4
+    local pooler_region=$4
+    local pooler_port=$5
+    local output_file=$6
     
     log_info "Collecting database schema information from $env..."
     
-    # Get pooler host using environment name (more reliable)
-    POOLER_HOST=$(get_pooler_host_for_env "$env" 2>/dev/null || get_pooler_host "$ref")
-    if [ -z "$POOLER_HOST" ]; then
-        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
-    fi
+    # Tables
+    local tables_query="SELECT schemaname||'.'||tablename FROM pg_tables WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, tablename;"
+    run_psql_with_fallback "$output_file.tables" "table list" "$ref" "$password" "$pooler_region" "$pooler_port" "$tables_query"
     
-    # Get tables
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U postgres.${ref} \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||tablename FROM pg_tables WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, tablename;" \
-        > "$output_file.tables" 2>/dev/null || echo "" > "$output_file.tables"
+    # Views
+    local views_query="SELECT schemaname||'.'||viewname FROM pg_views WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, viewname;"
+    run_psql_with_fallback "$output_file.views" "view list" "$ref" "$password" "$pooler_region" "$pooler_port" "$views_query"
     
-    # Get views
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||viewname FROM pg_views WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, viewname;" \
-        > "$output_file.views" 2>/dev/null || echo "" > "$output_file.views"
+    # Functions
+    local functions_query="SELECT n.nspname||'.'||p.proname||'('||pg_get_function_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname IN ('public', 'storage', 'auth') ORDER BY n.nspname, p.proname;"
+    run_psql_with_fallback "$output_file.db_functions" "database functions list" "$ref" "$password" "$pooler_region" "$pooler_port" "$functions_query"
     
-    # Get database functions (stored in .db_functions to avoid conflict with edge functions)
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT n.nspname||'.'||p.proname||'('||pg_get_function_arguments(p.oid)||')' FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname IN ('public', 'storage', 'auth') ORDER BY n.nspname, p.proname;" \
-        > "$output_file.db_functions" 2>/dev/null || echo "" > "$output_file.db_functions"
+    # Triggers
+    local triggers_query="SELECT n.nspname||'.'||c.relname||'.'||t.tgname FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname IN ('public', 'storage', 'auth') AND t.tgisinternal = false ORDER BY n.nspname, c.relname, t.tgname;"
+    run_psql_with_fallback "$output_file.triggers" "trigger list" "$ref" "$password" "$pooler_region" "$pooler_port" "$triggers_query"
     
-    # Get triggers
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT tgname FROM pg_trigger WHERE tgisinternal = false ORDER BY tgname;" \
-        > "$output_file.triggers" 2>/dev/null || echo "" > "$output_file.triggers"
+    # Sequences
+    local sequences_query="SELECT schemaname||'.'||sequencename FROM pg_sequences WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, sequencename;"
+    run_psql_with_fallback "$output_file.sequences" "sequence list" "$ref" "$password" "$pooler_region" "$pooler_port" "$sequences_query"
     
-    # Get sequences
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||sequencename FROM pg_sequences WHERE schemaname IN ('public', 'storage', 'auth') ORDER BY schemaname, sequencename;" \
-        > "$output_file.sequences" 2>/dev/null || echo "" > "$output_file.sequences"
-    
-    # Get table row counts (using approximate statistics - faster than exact COUNT)
-    # Note: n_live_tup is approximate but much faster than COUNT(*) for large tables
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U postgres.${ref} \
-        -d postgres \
-        -t -A \
-        -c "
+    # Row counts (approximate via statistics)
+    local row_counts_query="
         SELECT 
             schemaname||'.'||relname as table_name,
             COALESCE(n_live_tup::text, '0') as row_count
         FROM pg_stat_user_tables 
         WHERE schemaname IN ('public', 'storage', 'auth')
         ORDER BY schemaname, relname;
-        " \
-        > "$output_file.row_counts" 2>/dev/null || echo "" > "$output_file.row_counts"
+    "
+    run_psql_with_fallback "$output_file.row_counts" "table row counts" "$ref" "$password" "$pooler_region" "$pooler_port" "$row_counts_query"
     
-    # Get RLS policies
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U postgres.${ref} \
-        -d postgres \
-        -t -A \
-        -c "SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname IN ('public', 'storage') ORDER BY schemaname, tablename, policyname;" \
-        > "$output_file.policies" 2>/dev/null || echo "" > "$output_file.policies"
+    # RLS policies
+    local policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname IN ('public', 'storage') ORDER BY schemaname, tablename, policyname;"
+    run_psql_with_fallback "$output_file.policies" "RLS policy list" "$ref" "$password" "$pooler_region" "$pooler_port" "$policies_query"
+    
+    rm -f "$output_file.triggers.tmp" "$output_file.sequences.tmp" "$output_file.tables.tmp" "$output_file.views.tmp" "$output_file.db_functions.tmp" "$output_file.row_counts.tmp" "$output_file.policies.tmp"
     
     log_success "Database schema information collected from $env"
 }
@@ -199,25 +241,15 @@ get_storage_buckets_info() {
     local env=$1
     local ref=$2
     local password=$3
-    local output_file=$4
+    local pooler_region=$4
+    local pooler_port=$5
+    local output_file=$6
     
     log_info "Collecting storage buckets information from $env..."
     
-    # Get pooler host using environment name (more reliable)
-    POOLER_HOST=$(get_pooler_host_for_env "$env" 2>/dev/null || get_pooler_host "$ref")
-    if [ -z "$POOLER_HOST" ]; then
-        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
-    fi
-    
     # Get buckets with file counts
     # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-    PGPASSWORD="$password" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${ref}" \
-        -d postgres \
-        -t -A \
-        -c "
+    local buckets_query="
         SELECT 
             b.name,
             b.public::text,
@@ -230,8 +262,9 @@ get_storage_buckets_info() {
             ), '0') as file_count
         FROM storage.buckets b
         ORDER BY b.name;
-        " \
-        > "$output_file.buckets" 2>/dev/null || echo "" > "$output_file.buckets"
+    "
+    run_psql_with_fallback "$output_file.buckets" "storage buckets list" "$ref" "$password" "$pooler_region" "$pooler_port" "$buckets_query"
+    rm -f "$output_file.buckets.tmp"
     
     log_success "Storage buckets information collected from $env"
 }
@@ -311,8 +344,8 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 log_info ""
 
 SOURCE_INFO="$TEMP_DIR/source"
-get_db_schema_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_INFO"
-get_storage_buckets_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_INFO"
+get_db_schema_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$SOURCE_INFO"
+get_storage_buckets_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$SOURCE_INFO"
 get_edge_functions_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_INFO"
 get_secrets_info "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_INFO"
 
@@ -323,8 +356,8 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 log_info ""
 
 TARGET_INFO="$TEMP_DIR/target"
-get_db_schema_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_INFO"
-get_storage_buckets_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_INFO"
+get_db_schema_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$TARGET_INFO"
+get_storage_buckets_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$TARGET_INFO"
 get_edge_functions_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_INFO"
 get_secrets_info "$TARGET_ENV" "$TARGET_REF" "$TARGET_INFO"
 
@@ -333,26 +366,6 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 log_info "  Generating HTML Report"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
-
-# Helper function to count lines in file (excluding empty lines)
-count_items() {
-    local file=$1
-    if [ -f "$file" ]; then
-        grep -v '^[[:space:]]*$' "$file" | wc -l | tr -d ' '
-    else
-        echo "0"
-    fi
-}
-
-# Helper function to get file contents as array
-get_file_contents() {
-    local file=$1
-    if [ -f "$file" ] && [ -s "$file" ]; then
-        cat "$file"
-    else
-        echo ""
-    fi
-}
 
 # Generate HTML report
 cat > "$HTML_FILE" << 'HTML_EOF'
@@ -1310,6 +1323,8 @@ TABLES_TO_MIGRATE=""
 TABLES_TO_REMOVE=""
 VIEWS_TO_MIGRATE=""
 FUNCTIONS_TO_MIGRATE=""
+POLICIES_TO_MIGRATE=""
+POLICIES_TO_REMOVE=""
 SECRETS_TO_MIGRATE=""
 BUCKETS_TO_MIGRATE=""
 BUCKETS_TO_REMOVE=""
