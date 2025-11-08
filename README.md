@@ -127,7 +127,7 @@ The tool provides three types of duplication:
 ./scripts/duplicate_complete.sh <source> <target> [--backup]  # All components
 ./scripts/duplicate_full.sh <source> <target> [--backup]       # Database only
 ./scripts/duplicate_schema.sh <source> <target> [--backup]    # Schema only
-# Valid environments: prod, test, dev
+# Valid environments: prod, test, dev, backup
 ```
 
 ### Migration-Based Sync (Alternative)

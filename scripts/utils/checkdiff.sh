@@ -33,8 +33,8 @@ Usage: $0 <source_env> <target_env> [--env-file <file>]
 Compare database schemas and configuration between two Supabase environments.
 
 Arguments:
-  source_env    Source environment (prod, test, dev)
-  target_env    Target environment (prod, test, dev)
+  source_env    Source environment (prod, test, dev, backup)
+  target_env    Target environment (prod, test, dev, backup)
   --env-file    Path to environment file (default: .env.local)
 
 Examples:

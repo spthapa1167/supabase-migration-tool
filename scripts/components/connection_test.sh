@@ -31,7 +31,7 @@ Usage: $0 <env> [--verbose]
 Tests connection and validates Supabase properties for a given environment.
 
 Arguments:
-  env         Environment to test (dev, test, prod)
+  env         Environment to test (dev, test, prod, backup)
   --verbose   Show detailed output
   --help      Show this help message
 
@@ -73,17 +73,20 @@ if [ $LOAD_ENV_EXIT_CODE -ne 0 ]; then
     exit 1
 fi
 
+log_script_context "$(basename "$0")" "$TEST_ENV"
+
 # Validate environment name (check if it's a valid environment)
 # Note: validate_environments requires different source/target, so we validate manually
-valid_envs="prod test dev production staging develop main"
-if ! echo "$valid_envs" | grep -q "\b${TEST_ENV}\b"; then
+valid_envs="prod test dev backup production staging develop main bkp bkup"
+env_check=$(printf '%s' "$TEST_ENV" | tr '[:upper:]' '[:lower:]')
+if ! echo "$valid_envs" | grep -q "\b${env_check}\b"; then
     log_error "Invalid environment: $TEST_ENV"
-    log_info "Valid environments: prod, test, dev"
+    log_info "Valid environments: prod, test, dev, backup"
     exit 1
 fi
 
 # Get environment-specific variables
-case $TEST_ENV in
+case $env_check in
     prod|production|main)
         ENV_PREFIX="PROD"
         ENV_NAME="Production"
@@ -95,6 +98,10 @@ case $TEST_ENV in
     dev|develop)
         ENV_PREFIX="DEV"
         ENV_NAME="Development"
+        ;;
+    backup|bkup|bkp)
+        ENV_PREFIX="BACKUP"
+        ENV_NAME="Backup"
         ;;
     *)
         log_error "Unknown environment: $TEST_ENV"

@@ -102,12 +102,14 @@ function getSupabaseConfig(projectRef) {
     const prodRef = process.env.SUPABASE_PROD_PROJECT_REF || '';
     const testRef = process.env.SUPABASE_TEST_PROJECT_REF || '';
     const devRef = process.env.SUPABASE_DEV_PROJECT_REF || '';
+    const backupRef = process.env.SUPABASE_BACKUP_PROJECT_REF || '';
     
     // Debug: Show what we're comparing
     logInfo(`Matching project ref: ${projectRef}`);
     logInfo(`  PROD ref: ${prodRef || 'NOT SET'} ${prodRef === projectRef ? '✓ MATCH' : ''}`);
     logInfo(`  TEST ref: ${testRef || 'NOT SET'} ${testRef === projectRef ? '✓ MATCH' : ''}`);
     logInfo(`  DEV ref: ${devRef || 'NOT SET'} ${devRef === projectRef ? '✓ MATCH' : ''}`);
+    logInfo(`  BACKUP ref: ${backupRef || 'NOT SET'} ${backupRef === projectRef ? '✓ MATCH' : ''}`);
     
     if (prodRef === projectRef) {
         envName = 'PROD';
@@ -115,6 +117,8 @@ function getSupabaseConfig(projectRef) {
         envName = 'TEST';
     } else if (devRef === projectRef) {
         envName = 'DEV';
+    } else if (backupRef === projectRef) {
+        envName = 'BACKUP';
     }
     
     // Debug: Log which environment was detected
@@ -142,7 +146,7 @@ function getSupabaseConfig(projectRef) {
         anonKey = process.env[anonKeyKey] || '';
         logInfo(`  Checking ${anonKeyKey}: ${anonKey ? 'FOUND' : 'NOT SET'}`);
         
-        // Service Role Key: SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, SUPABASE_DEV_SERVICE_ROLE_KEY
+        // Service Role Key: SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, SUPABASE_DEV_SERVICE_ROLE_KEY, SUPABASE_BACKUP_SERVICE_ROLE_KEY
         const serviceKeyKey = `SUPABASE_${envName}_SERVICE_ROLE_KEY`;
         
         logInfo(`  Checking ${serviceKeyKey}: ${process.env[serviceKeyKey] ? 'FOUND (length: ' + process.env[serviceKeyKey].length + ')' : 'NOT SET'}`);
@@ -211,10 +215,10 @@ if (!SOURCE_REF || !TARGET_REF || !MIGRATION_DIR) {
     console.error(`Usage: node utils/storage-migration.js <source_ref> <target_ref> <migration_dir> [--include-files|--exclude-files]`);
     console.error('');
     console.error('Environment variables required in .env.local:');
-    console.error('  - SUPABASE_PROD_PROJECT_REF, SUPABASE_TEST_PROJECT_REF, SUPABASE_DEV_PROJECT_REF');
-    console.error('  - SUPABASE_PROD_URL, SUPABASE_TEST_URL, SUPABASE_DEV_URL (or auto-constructed)');
-    console.error('  - SUPABASE_PROD_ANON_KEY, SUPABASE_TEST_ANON_KEY, SUPABASE_DEV_ANON_KEY');
-    console.error('  - SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, SUPABASE_DEV_SERVICE_ROLE_KEY');
+    console.error('  - SUPABASE_PROD_PROJECT_REF, SUPABASE_TEST_PROJECT_REF, SUPABASE_DEV_PROJECT_REF, SUPABASE_BACKUP_PROJECT_REF');
+    console.error('  - SUPABASE_PROD_URL, SUPABASE_TEST_URL, SUPABASE_DEV_URL, SUPABASE_BACKUP_URL (or auto-constructed)');
+    console.error('  - SUPABASE_PROD_ANON_KEY, SUPABASE_TEST_ANON_KEY, SUPABASE_DEV_ANON_KEY, SUPABASE_BACKUP_ANON_KEY');
+    console.error('  - SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, SUPABASE_DEV_SERVICE_ROLE_KEY, SUPABASE_BACKUP_SERVICE_ROLE_KEY');
     console.error('');
     console.error('Note: URLs are automatically constructed from project refs as https://<project_ref>.supabase.co if not specified');
     process.exit(1);
@@ -249,7 +253,7 @@ logSeparator();
 if (!sourceConfig.serviceKey || !targetConfig.serviceKey) {
     logError('Service role keys not found in environment variables');
     logError('Please ensure service role keys are set in .env.local:');
-    logError('  - SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, SUPABASE_DEV_SERVICE_ROLE_KEY');
+    logError('  - SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, SUPABASE_DEV_SERVICE_ROLE_KEY, SUPABASE_BACKUP_SERVICE_ROLE_KEY');
     logError('  - OR SUPABASE_SERVICE_ROLE_KEY (generic fallback)');
     process.exit(1);
 }
@@ -337,7 +341,7 @@ async function getBuckets(adminClient, projectName, projectUrl, serviceKey, envN
             if (envName) {
                 logError(`  1. The service role key in .env.local matches the project (SUPABASE_${envName}_SERVICE_ROLE_KEY)`);
             } else {
-                logError(`  1. The service role key in .env.local is set correctly (SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, or SUPABASE_DEV_SERVICE_ROLE_KEY)`);
+                logError(`  1. The service role key in .env.local is set correctly (SUPABASE_PROD_SERVICE_ROLE_KEY, SUPABASE_TEST_SERVICE_ROLE_KEY, SUPABASE_DEV_SERVICE_ROLE_KEY, or SUPABASE_BACKUP_SERVICE_ROLE_KEY)`);
             }
             logError(`  2. The URL matches the project ref (https://<project_ref>.supabase.co)`);
             logError(`  3. The service role key is a valid JWT token (starts with "eyJ")`);

@@ -307,6 +307,13 @@ app.get('/api/info', (req, res) => {
                 projectRef: process.env.SUPABASE_DEV_PROJECT_REF || 'N/A',
                 poolerRegion: process.env.SUPABASE_DEV_POOLER_REGION || 'aws-1-us-east-2',
                 poolerPort: process.env.SUPABASE_DEV_POOLER_PORT || '6543'
+            },
+            backup: {
+                name: 'Backup',
+                projectName: process.env.SUPABASE_BACKUP_PROJECT_NAME || 'N/A',
+                projectRef: process.env.SUPABASE_BACKUP_PROJECT_REF || 'N/A',
+                poolerRegion: process.env.SUPABASE_BACKUP_POOLER_REGION || 'aws-1-us-east-2',
+                poolerPort: process.env.SUPABASE_BACKUP_POOLER_PORT || '6543'
             }
         },
         scripts: {
