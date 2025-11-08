@@ -74,10 +74,143 @@ load_env() {
     return 0
 }
 
+# Normalize environment aliases to uppercase keys (PROD, TEST, DEV, BACKUP)
+normalize_env_key() {
+    local env="${1:-}"
+    if [ -z "$env" ]; then
+        echo ""
+        return 0
+    fi
+    env=$(echo "$env" | tr '[:upper:]' '[:lower:]')
+    case "$env" in
+        prod|production|main)
+            echo "PROD"
+            ;;
+        test|staging)
+            echo "TEST"
+            ;;
+        dev|develop)
+            echo "DEV"
+            ;;
+        backup|bkup|bkp)
+            echo "BACKUP"
+            ;;
+        *)
+            echo ""
+            ;;
+    esac
+    return 0
+}
+
+# Get the friendly project name for a given environment (returns empty string if unset)
+get_env_project_name() {
+    local env="${1:-}"
+    local key
+    key=$(normalize_env_key "$env")
+    if [ -z "$key" ]; then
+        echo ""
+        return 0
+    fi
+    local primary_var="SUPABASE_${key}_PROJECT_NAME"
+    local legacy_var="SUPABSE_${key}_PROJECT_NAME"
+    local value="${!primary_var:-${!legacy_var:-}}"
+    echo "$value"
+    return 0
+}
+
+# Get the project reference for a given environment (returns empty string if unset)
+get_env_project_ref() {
+    local env="${1:-}"
+    local key
+    key=$(normalize_env_key "$env")
+    if [ -z "$key" ]; then
+        echo ""
+        return 0
+    fi
+    local primary_var="SUPABASE_${key}_PROJECT_REF"
+    local legacy_var="SUPABSE_${key}_PROJECT_REF"
+    local value="${!primary_var:-${!legacy_var:-}}"
+    echo "$value"
+    return 0
+}
+
+# Get the Supabase app name (supports legacy misspelling)
+get_supabase_app_name() {
+    local app_name="${SUPABSE_APP_NAME:-${SUPABASE_APP_NAME:-}}"
+    echo "$app_name"
+    return 0
+}
+
+# Log contextual information about the script, app, and related environments
+log_script_context() {
+    local script_label="${1:-unknown-script}"
+    shift || true
+
+    # Prevent duplicate logging for the same script during a single run
+    local logged_list="${SCRIPT_CONTEXT_LOGGED_LIST:-}"
+    if [[ ":${logged_list}:" == *":${script_label}:"* ]]; then
+        return 0
+    fi
+    if [ -z "$logged_list" ]; then
+        SCRIPT_CONTEXT_LOGGED_LIST="$script_label"
+    else
+        SCRIPT_CONTEXT_LOGGED_LIST="${logged_list}:${script_label}"
+    fi
+
+    local app_name
+    app_name=$(get_supabase_app_name)
+
+    if [ -n "$app_name" ]; then
+        log_info "Context :: ${script_label} | App: ${app_name}"
+    else
+        log_info "Context :: ${script_label} | App: (set SUPABSE_APP_NAME)"
+    fi
+
+    local processed=":"
+    while [ $# -gt 0 ]; do
+        local env="$1"
+        shift || true
+        [ -z "$env" ] && continue
+        local env_key
+        env_key=$(printf '%s' "$env" | tr '[:upper:]' '[:lower:]')
+        if [[ "$processed" == *":$env_key:"* ]]; then
+            continue
+        fi
+        processed="${processed}${env_key}:"
+
+        local key_upper
+        key_upper=$(normalize_env_key "$env")
+        local project_name
+        project_name=$(get_env_project_name "$env")
+        local project_ref
+        project_ref=$(get_env_project_ref "$env")
+
+        if [ -n "$project_name" ] || [ -n "$project_ref" ]; then
+            if [ -n "$project_name" ] && [ -n "$project_ref" ]; then
+                log_info "  Env ${env}: ${project_name} (ref: ${project_ref})"
+            elif [ -n "$project_name" ]; then
+                log_info "  Env ${env}: ${project_name} (ref: not set)"
+            else
+                log_info "  Env ${env}: (name not set) (ref: ${project_ref})"
+            fi
+        else
+            if [ -n "$key_upper" ]; then
+                log_warning "  Env ${env}: project metadata missing (set SUPABASE_${key_upper}_PROJECT_NAME / _PROJECT_REF)"
+            else
+                log_warning "  Env ${env}: project metadata missing (unrecognized environment alias)"
+            fi
+        fi
+    done
+
+    return 0
+}
+
 # Get project reference by name
 get_project_ref() {
     local env_name=$1
-    case $env_name in
+    local env_lc
+    env_lc=$(printf '%s' "$env_name" | tr '[:upper:]' '[:lower:]')
+    case $env_lc in
         prod|production|main)
             echo "$SUPABASE_PROD_PROJECT_REF"
             ;;
@@ -87,9 +220,12 @@ get_project_ref() {
         dev|develop)
             echo "$SUPABASE_DEV_PROJECT_REF"
             ;;
+        backup|bkup|bkp)
+            echo "$SUPABASE_BACKUP_PROJECT_REF"
+            ;;
         *)
             log_error "Unknown environment: $env_name"
-            log_info "Valid environments: prod, test, dev"
+            log_info "Valid environments: prod, test, dev, backup"
             exit 1
             ;;
     esac
@@ -98,7 +234,9 @@ get_project_ref() {
 # Get database password by environment name
 get_db_password() {
     local env_name=$1
-    case $env_name in
+    local env_lc
+    env_lc=$(printf '%s' "$env_name" | tr '[:upper:]' '[:lower:]')
+    case $env_lc in
         prod|production|main)
             echo "$SUPABASE_PROD_DB_PASSWORD"
             ;;
@@ -107,6 +245,9 @@ get_db_password() {
             ;;
         dev|develop)
             echo "$SUPABASE_DEV_DB_PASSWORD"
+            ;;
+        backup|bkup|bkp)
+            echo "$SUPABASE_BACKUP_DB_PASSWORD"
             ;;
         *)
             log_error "Unknown environment: $env_name"
@@ -120,9 +261,11 @@ get_db_password() {
 # Format: {POOLER_REGION}.pooler.supabase.com
 get_pooler_host_for_env() {
     local env_name=$1
+    local env_lc
+    env_lc=$(printf '%s' "$env_name" | tr '[:upper:]' '[:lower:]')
     
     # Normalize environment name
-    case $env_name in
+    case $env_lc in
         prod|production|main)
             env_name="PROD"
             ;;
@@ -131,6 +274,9 @@ get_pooler_host_for_env() {
             ;;
         dev|develop)
             env_name="DEV"
+            ;;
+        backup|bkup|bkp)
+            env_name="BACKUP"
             ;;
         *)
             # If it's not a recognized env name, return empty
@@ -173,6 +319,9 @@ get_pooler_host() {
     elif [ "$project_ref_or_env" = "$SUPABASE_DEV_PROJECT_REF" ] && [ -n "${SUPABASE_DEV_POOLER_REGION:-}" ]; then
         echo "${SUPABASE_DEV_POOLER_REGION}.pooler.supabase.com"
         return 0
+    elif [ "$project_ref_or_env" = "$SUPABASE_BACKUP_PROJECT_REF" ] && [ -n "${SUPABASE_BACKUP_POOLER_REGION:-}" ]; then
+        echo "${SUPABASE_BACKUP_POOLER_REGION}.pooler.supabase.com"
+        return 0
     fi
     
     # Try to get pooler URL from Supabase API if available (only if it looks like a project_ref)
@@ -208,7 +357,9 @@ get_pooler_host() {
 # Retrieve pooler region for an environment (falls back to default shared region)
 get_pooler_region_for_env() {
     local env_name=$1
-    case $env_name in
+    local env_lc
+    env_lc=$(printf '%s' "$env_name" | tr '[:upper:]' '[:lower:]')
+    case $env_lc in
         prod|production|main)
             echo "${SUPABASE_PROD_POOLER_REGION:-aws-1-us-east-2}"
             ;;
@@ -217,6 +368,9 @@ get_pooler_region_for_env() {
             ;;
         dev|develop)
             echo "${SUPABASE_DEV_POOLER_REGION:-aws-1-us-east-2}"
+            ;;
+        backup|bkup|bkp)
+            echo "${SUPABASE_BACKUP_POOLER_REGION:-aws-1-us-east-2}"
             ;;
         *)
             echo "aws-1-us-east-2"
@@ -227,7 +381,9 @@ get_pooler_region_for_env() {
 # Retrieve pooler port for an environment (defaults to 6543)
 get_pooler_port_for_env() {
     local env_name=$1
-    case $env_name in
+    local env_lc
+    env_lc=$(printf '%s' "$env_name" | tr '[:upper:]' '[:lower:]')
+    case $env_lc in
         prod|production|main)
             echo "${SUPABASE_PROD_POOLER_PORT:-6543}"
             ;;
@@ -236,6 +392,9 @@ get_pooler_port_for_env() {
             ;;
         dev|develop)
             echo "${SUPABASE_DEV_POOLER_PORT:-6543}"
+            ;;
+        backup|bkup|bkp)
+            echo "${SUPABASE_BACKUP_POOLER_PORT:-6543}"
             ;;
         *)
             echo "6543"
@@ -558,19 +717,23 @@ cleanup_old_backups() {
 validate_environments() {
     local source=$1
     local target=$2
+    local source_lc
+    local target_lc
+    source_lc=$(printf '%s' "$source" | tr '[:upper:]' '[:lower:]')
+    target_lc=$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]')
     
-    if [ "$source" = "$target" ]; then
+    if [ "$source_lc" = "$target_lc" ]; then
         log_error "Source and target environments cannot be the same!"
         exit 1
     fi
     
-    local valid_envs="prod test dev production staging develop main"
-    if ! echo "$valid_envs" | grep -q "\b${source}\b"; then
+    local valid_envs="prod test dev backup production staging develop main bkup bkp"
+    if ! echo "$valid_envs" | grep -q "\b${source_lc}\b"; then
         log_error "Invalid source environment: $source"
         exit 1
     fi
     
-    if ! echo "$valid_envs" | grep -q "\b${target}\b"; then
+    if ! echo "$valid_envs" | grep -q "\b${target_lc}\b"; then
         log_error "Invalid target environment: $target"
         exit 1
     fi

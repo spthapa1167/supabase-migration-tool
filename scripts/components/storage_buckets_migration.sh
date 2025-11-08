@@ -31,8 +31,8 @@ Default Behavior:
   Use --file or --files flag to include file migration.
 
 Arguments:
-  source_env     Source environment (prod, test, dev)
-  target_env     Target environment (prod, test, dev)
+  source_env     Source environment (prod, test, dev, backup)
+  target_env     Target environment (prod, test, dev, backup)
   migration_dir  Directory to store migration files (optional, auto-generated if not provided)
   --file, --files  Include file migration (migrates buckets + files)
   --include-files  Include file migration (same as --file/--files)
@@ -98,6 +98,8 @@ fi
 # Load environment
 load_env
 validate_environments "$SOURCE_ENV" "$TARGET_ENV"
+
+log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
 
 # Get project references and passwords
 SOURCE_REF=$(get_project_ref "$SOURCE_ENV")

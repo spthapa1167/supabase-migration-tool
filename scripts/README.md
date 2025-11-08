@@ -126,7 +126,7 @@ Creates a new organized migration folder with all related files.
 ./scripts/migration_apply.sh <migration_name> <environment> [--dry-run]
 ```
 
-Applies a migration to the specified environment (prod, test, dev).
+Applies a migration to the specified environment (prod, test, dev, backup).
 
 ### Rollback Migration
 

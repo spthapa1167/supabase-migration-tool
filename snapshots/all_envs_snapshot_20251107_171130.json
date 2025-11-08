@@ -1,0 +1,72 @@
+{
+  "timestamp": "2025-11-07 17:11:30",
+  "generatedAt": 1762557106,
+  "environments": {
+    "dev": {
+      "env": "dev",
+      "name": "Development",
+      "projectRef": "vaqvfqsolsoyolywmlfs",
+      "projectName": "LMS_DEV",
+      "timestamp": "2025-11-07T23:11:35Z",
+      "counts": {
+        "tables": 59,
+        "views": 2,
+        "functions": 57,
+        "sequences": 1,
+        "indexes": 183,
+        "policies": 117,
+        "triggers": 33,
+        "types": 61,
+        "enums": 13,
+        "authUsers": 8,
+        "edgeFunctions": 10,
+        "buckets": 2,
+        "secrets": 7
+      }
+    },
+    "test": {
+      "env": "test",
+      "name": "Test/Staging",
+      "projectRef": "qlzfbxogvgpoqdjwealf",
+      "projectName": "LMS_Test",
+      "timestamp": "2025-11-07T23:11:41Z",
+      "counts": {
+        "tables": 59,
+        "views": 2,
+        "functions": 57,
+        "sequences": 1,
+        "indexes": 183,
+        "policies": 117,
+        "triggers": 33,
+        "types": 61,
+        "enums": 13,
+        "authUsers": 8,
+        "edgeFunctions": 9,
+        "buckets": 2,
+        "secrets": 6
+      }
+    },
+    "prod": {
+      "env": "prod",
+      "name": "Production",
+      "projectRef": "hvpvysxziiferzhshhkm",
+      "projectName": "LMS_Prod",
+      "timestamp": "2025-11-07T23:11:46Z",
+      "counts": {
+        "tables": 59,
+        "views": 2,
+        "functions": 57,
+        "sequences": 1,
+        "indexes": 183,
+        "policies": 117,
+        "triggers": 33,
+        "types": 61,
+        "enums": 13,
+        "authUsers": 8,
+        "edgeFunctions": 10,
+        "buckets": 2,
+        "secrets": 7
+      }
+    }
+  }
+}

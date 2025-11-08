@@ -69,6 +69,8 @@ if [ $LOAD_ENV_EXIT_CODE -ne 0 ]; then
 fi
 set -u
 
+log_script_context "$(basename "$0")" "prod" "test" "dev"
+
 if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
     log_error "SUPABASE_ACCESS_TOKEN not set in .env.local"
     exit 1
@@ -216,6 +218,104 @@ query_storage_buckets_count() {
     echo "${buckets:-0}"
 }
 
+query_table_row_counts() {
+    local project_ref=$1
+    local password=$2
+    local pooler_host=$3
+
+    if [ -z "$project_ref" ] || [ -z "$password" ]; then
+        echo "[]"
+        return 0
+    fi
+
+    local sql="WITH counted AS (
+        SELECT table_schema,
+               table_name,
+               COALESCE(
+                   (xpath('/row/cnt/text()', query_to_xml(format('SELECT COUNT(*) AS cnt FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint,
+                   0
+               ) AS row_count
+        FROM information_schema.tables
+        WHERE table_schema IN ('public','storage','auth')
+          AND table_type = 'BASE TABLE'
+    )
+    SELECT COALESCE(
+        json_agg(
+            json_build_object(
+                'schema', table_schema,
+                'table', table_name,
+                'rows', row_count
+            )
+            ORDER BY table_schema, table_name
+        ),
+        '[]'::json
+    )
+    FROM counted;"
+
+    local result=""
+    if [ -n "$pooler_host" ]; then
+        result=$(PGPASSWORD="$password" PGSSLMODE=require psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -F '' -c "$sql" 2>/dev/null | tr -d '\n\r')
+    fi
+
+    if [ -z "$result" ]; then
+        local direct_host="db.${project_ref}.supabase.co"
+        result=$(PGPASSWORD="$password" PGSSLMODE=require psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -F '' -c "$sql" 2>/dev/null | tr -d '\n\r')
+    fi
+
+    if [ -z "$result" ]; then
+        log_warning "Unable to retrieve table row counts for project $project_ref"
+        result="[]"
+    fi
+
+    echo "${result:-[]}"
+}
+
+query_storage_object_counts() {
+    local project_ref=$1
+    local password=$2
+    local pooler_host=$3
+
+    if [ -z "$project_ref" ] || [ -z "$password" ]; then
+        echo "[]"
+        return 0
+    fi
+
+    local sql="WITH objects AS (
+        SELECT bucket_id,
+               COUNT(*) AS object_count
+        FROM storage.objects
+        GROUP BY bucket_id
+    )
+    SELECT COALESCE(
+        json_agg(
+            json_build_object(
+                'bucket', bucket_id,
+                'objects', object_count
+            )
+            ORDER BY bucket_id
+        ),
+        '[]'::json
+    )
+    FROM objects;"
+
+    local result=""
+    if [ -n "$pooler_host" ]; then
+        result=$(PGPASSWORD="$password" PGSSLMODE=require psql -h "$pooler_host" -p 6543 -U "postgres.${project_ref}" -d postgres -t -A -F '' -c "$sql" 2>/dev/null | tr -d '\n\r')
+    fi
+
+    if [ -z "$result" ]; then
+        local direct_host="db.${project_ref}.supabase.co"
+        result=$(PGPASSWORD="$password" PGSSLMODE=require psql -h "$direct_host" -p 5432 -U "postgres.${project_ref}" -d postgres -t -A -F '' -c "$sql" 2>/dev/null | tr -d '\n\r')
+    fi
+
+    if [ -z "$result" ]; then
+        log_warning "Unable to retrieve storage object counts for project $project_ref"
+        result="[]"
+    fi
+
+    echo "${result:-[]}"
+}
+
 query_secrets_count() {
     local project_ref=$1
     
@@ -260,6 +360,9 @@ collect_env_snapshot() {
         dev)
             project_name="${SUPABASE_DEV_PROJECT_NAME:-}"
             ;;
+        backup)
+            project_name="${SUPABASE_BACKUP_PROJECT_NAME:-}"
+            ;;
     esac
     local password=$(get_db_password "$env")
     local pooler_host=$(get_pooler_host_for_env "$env" 2>/dev/null || get_pooler_host "$project_ref")
@@ -267,7 +370,7 @@ collect_env_snapshot() {
     if [ -z "$project_ref" ] || [ -z "$password" ]; then
         log_warning "  Skipping $env_name: Missing project_ref or password"
         # Return empty but valid JSON structure
-        echo "{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"\",\"projectName\":\"\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":0,\"views\":0,\"functions\":0,\"sequences\":0,\"indexes\":0,\"policies\":0,\"triggers\":0,\"types\":0,\"enums\":0,\"authUsers\":0,\"edgeFunctions\":0,\"buckets\":0,\"secrets\":0}}"
+        echo "{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"\",\"projectName\":\"\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":0,\"views\":0,\"functions\":0,\"sequences\":0,\"indexes\":0,\"policies\":0,\"triggers\":0,\"types\":0,\"enums\":0,\"authUsers\":0,\"edgeFunctions\":0,\"buckets\":0,\"secrets\":0,\"totalRows\":0,\"storageObjects\":0},\"tableRows\":[],\"storageBucketObjects\":[]}"
         return 0
     fi
     
@@ -295,11 +398,27 @@ collect_env_snapshot() {
     log_info "  Querying secrets..."
     local secrets=$(query_secrets_count "$project_ref")
     
+    # Collect table row counts
+    log_info "  Gathering table row counts..."
+    local table_rows=$(query_table_row_counts "$project_ref" "$password" "$pooler_host")
+    
+    # Collect storage object counts
+    log_info "  Gathering storage object counts..."
+    local storage_objects=$(query_storage_object_counts "$project_ref" "$password" "$pooler_host")
+    
     # Ensure all numeric values are valid (default to 0 if empty)
     auth_users=${auth_users:-0}
     edge_functions=${edge_functions:-0}
     buckets=${buckets:-0}
     secrets=${secrets:-0}
+    table_rows=$(echo "${table_rows:-[]}" | tr -d '\n\r')
+    storage_objects=$(echo "${storage_objects:-[]}" | tr -d '\n\r')
+    if [ -z "$table_rows" ]; then
+        table_rows="[]"
+    fi
+    if [ -z "$storage_objects" ]; then
+        storage_objects="[]"
+    fi
     
     # Ensure db_counts is valid JSON
     if ! echo "$db_counts" | jq empty 2>/dev/null; then
@@ -319,6 +438,8 @@ collect_env_snapshot() {
             --argjson edge "$((edge_functions))" \
             --argjson bucket "$((buckets))" \
             --argjson secret "$((secrets))" \
+            --argjson tableRows "$table_rows" \
+            --argjson storageObjects "$storage_objects" \
             --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             '{
                 env: $env,
@@ -339,8 +460,12 @@ collect_env_snapshot() {
                     authUsers: $auth,
                     edgeFunctions: $edge,
                     buckets: $bucket,
-                    secrets: $secret
-                }
+                    secrets: $secret,
+                    totalRows: ($tableRows | map(.rows) | add // 0),
+                    storageObjects: ($storageObjects | map(.objects) | add // 0)
+                },
+                tableRows: $tableRows,
+                storageBucketObjects: $storageObjects
             }' 2>/dev/null)
         
         # If jq failed, use fallback
@@ -362,8 +487,10 @@ collect_env_snapshot() {
         local triggers=$(echo "$db_counts" | grep -o '"triggers":[0-9]*' | cut -d: -f2 || echo "0")
         local types=$(echo "$db_counts" | grep -o '"types":[0-9]*' | cut -d: -f2 || echo "0")
         local enums=$(echo "$db_counts" | grep -o '"enums":[0-9]*' | cut -d: -f2 || echo "0")
-        
-        snapshot_json="{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"$project_ref\",\"projectName\":\"$project_name\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":$tables,\"views\":$views,\"functions\":$functions,\"sequences\":$sequences,\"indexes\":$indexes,\"policies\":$policies,\"triggers\":$triggers,\"types\":$types,\"enums\":$enums,\"authUsers\":$auth_users,\"edgeFunctions\":$edge_functions,\"buckets\":$buckets,\"secrets\":$secrets}}"
+        local total_rows=0
+        local storage_total=0
+
+        snapshot_json="{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"$project_ref\",\"projectName\":\"$project_name\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":$tables,\"views\":$views,\"functions\":$functions,\"sequences\":$sequences,\"indexes\":$indexes,\"policies\":$policies,\"triggers\":$triggers,\"types\":$types,\"enums\":$enums,\"authUsers\":$auth_users,\"edgeFunctions\":$edge_functions,\"buckets\":$buckets,\"secrets\":$secrets,\"totalRows\":$total_rows,\"storageObjects\":$storage_total},\"tableRows\":$table_rows,\"storageBucketObjects\":$storage_objects}"
     fi
     
     echo "$snapshot_json"
@@ -382,6 +509,9 @@ log_info ""
 PROD_SNAPSHOT=$(collect_env_snapshot "prod" "Production")
 log_info ""
 
+BACKUP_SNAPSHOT=$(collect_env_snapshot "backup" "Backup")
+log_info ""
+
 # Combine all snapshots into final JSON
 log_info "Generating final snapshot file..."
 
@@ -390,15 +520,19 @@ if command -v jq >/dev/null 2>&1; then
     # Validate each snapshot
     if ! echo "$DEV_SNAPSHOT" | jq empty 2>/dev/null; then
         log_warning "DEV_SNAPSHOT is invalid JSON, using empty object"
-        DEV_SNAPSHOT='{"env":"dev","name":"Development","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0}}'
+        DEV_SNAPSHOT='{"env":"dev","name":"Development","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
     fi
     if ! echo "$TEST_SNAPSHOT" | jq empty 2>/dev/null; then
         log_warning "TEST_SNAPSHOT is invalid JSON, using empty object"
-        TEST_SNAPSHOT='{"env":"test","name":"Test/Staging","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0}}'
+        TEST_SNAPSHOT='{"env":"test","name":"Test/Staging","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
     fi
     if ! echo "$PROD_SNAPSHOT" | jq empty 2>/dev/null; then
         log_warning "PROD_SNAPSHOT is invalid JSON, using empty object"
-        PROD_SNAPSHOT='{"env":"prod","name":"Production","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0}}'
+        PROD_SNAPSHOT='{"env":"prod","name":"Production","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
+    fi
+    if ! echo "$BACKUP_SNAPSHOT" | jq empty 2>/dev/null; then
+        log_warning "BACKUP_SNAPSHOT is invalid JSON, using empty object"
+        BACKUP_SNAPSHOT='{"env":"backup","name":"Backup","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
     fi
     
     # Use jq to safely combine the JSON objects
@@ -406,9 +540,11 @@ if command -v jq >/dev/null 2>&1; then
     temp_dev=$(mktemp)
     temp_test=$(mktemp)
     temp_prod=$(mktemp)
+    temp_backup=$(mktemp)
     echo "$DEV_SNAPSHOT" > "$temp_dev"
     echo "$TEST_SNAPSHOT" > "$temp_test"
     echo "$PROD_SNAPSHOT" > "$temp_prod"
+    echo "$BACKUP_SNAPSHOT" > "$temp_backup"
     
     jq -n \
         --arg timestamp "$TIMESTAMP" \
@@ -416,18 +552,20 @@ if command -v jq >/dev/null 2>&1; then
         --slurpfile dev "$temp_dev" \
         --slurpfile test "$temp_test" \
         --slurpfile prod "$temp_prod" \
+        --slurpfile backup "$temp_backup" \
         '{
             timestamp: $timestamp,
             generatedAt: $generatedAt,
             environments: {
                 dev: $dev[0],
                 test: $test[0],
-                prod: $prod[0]
+                prod: $prod[0],
+                backup: $backup[0]
             }
         }' > "$SNAPSHOT_FILE"
     
     # Clean up temp files
-    rm -f "$temp_dev" "$temp_test" "$temp_prod"
+    rm -f "$temp_dev" "$temp_test" "$temp_prod" "$temp_backup"
 else
     # Fallback without jq
     cat > "$SNAPSHOT_FILE" << EOF
@@ -437,7 +575,8 @@ else
     "environments": {
         "dev": $DEV_SNAPSHOT,
         "test": $TEST_SNAPSHOT,
-        "prod": $PROD_SNAPSHOT
+        "prod": $PROD_SNAPSHOT,
+        "backup": $BACKUP_SNAPSHOT
     }
 }
 EOF
@@ -454,23 +593,25 @@ log_info ""
 if command -v jq >/dev/null 2>&1; then
     log_info "Summary:"
     echo ""
-    echo "Environment | Tables | Views | Functions | Auth Users | Edge Functions | Buckets | Secrets"
-    echo "------------|--------|-------|-----------|------------|----------------|---------|--------"
+    echo "Environment | Tables | Rows | Views | Functions | Auth Users | Edge Functions | Buckets | Objects | Secrets"
+    echo "------------|--------|------|-------|-----------|------------|----------------|---------|---------|--------"
     
-    for env in dev test prod; do
+    for env in dev test prod backup; do
         env_data=$(jq -r ".environments.$env" "$SNAPSHOT_FILE" 2>/dev/null)
         if [ "$env_data" != "null" ] && [ -n "$env_data" ]; then
             name=$(echo "$env_data" | jq -r '.name // "N/A"')
             tables=$(echo "$env_data" | jq -r '.counts.tables // 0')
+            rows=$(echo "$env_data" | jq -r '[.tableRows[]?.rows] | add // 0')
             views=$(echo "$env_data" | jq -r '.counts.views // 0')
             functions=$(echo "$env_data" | jq -r '.counts.functions // 0')
             auth=$(echo "$env_data" | jq -r '.counts.authUsers // 0')
             edge=$(echo "$env_data" | jq -r '.counts.edgeFunctions // 0')
             buckets=$(echo "$env_data" | jq -r '.counts.buckets // 0')
+            objects=$(echo "$env_data" | jq -r '[.storageBucketObjects[]?.objects] | add // 0')
             secrets=$(echo "$env_data" | jq -r '.counts.secrets // 0')
-            printf "%-12s| %-7s| %-5s| %-9s| %-10s| %-14s| %-7s| %-7s\n" "$name" "$tables" "$views" "$functions" "$auth" "$edge" "$buckets" "$secrets"
+            printf "%-12s| %-7s| %-5s| %-5s| %-9s| %-10s| %-14s| %-7s| %-8s| %-7s\n" "$name" "$tables" "$rows" "$views" "$functions" "$auth" "$edge" "$buckets" "$objects" "$secrets"
         else
-            printf "%-12s| %-7s| %-5s| %-9s| %-10s| %-14s| %-7s| %-7s\n" "$env" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A"
+            printf "%-12s| %-7s| %-5s| %-5s| %-9s| %-10s| %-14s| %-7s| %-8s| %-7s\n" "$env" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A" "N/A"
         fi
     done
     echo ""

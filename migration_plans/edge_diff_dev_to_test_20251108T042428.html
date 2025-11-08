@@ -34,7 +34,7 @@ pre { font-family: 'JetBrains Mono', monospace; font-size: .85rem; background: #
             <div class="metric-card"><h3>Source Functions</h3><p>3</p></div>
             <div class="metric-card"><h3>Target Functions</h3><p>3</p></div>
             <div class="metric-card"><h3>To Deploy</h3><p>0</p></div>
-            <div class="metric-card"><h3>To Redeploy</h3><p>3</p></div>
+            <div class="metric-card"><h3>To Redeploy</h3><p>1</p></div>
             <div class="metric-card"><h3>Review Target-Only</h3><p>0</p></div>
         </div>
         <div class="snapshots">
@@ -47,7 +47,6 @@ pre { font-family: 'JetBrains Mono', monospace; font-size: .85rem; background: #
                 <ul><li>ascii-value</li><li>circle-area</li><li>sign-jwt</li></ul>
             </div>
         </div>
-        
         <table class="edge-table">
             <thead>
                 <tr>
@@ -58,25 +57,24 @@ pre { font-family: 'JetBrains Mono', monospace; font-size: .85rem; background: #
                 </tr>
             </thead>
             <tbody>
-                
                 <tr>
-                    <td>ascii-value</td>
-                    <td><span class="badge badge-modify">Redeploy</span></td>
-                    <td>Code unavailable in one or both environments</td>
-                    <td>No diff available</td>
-                </tr>
-                <tr>
-                    <td>circle-area</td>
-                    <td><span class="badge badge-modify">Redeploy</span></td>
-                    <td>Code unavailable in one or both environments</td>
-                    <td>No diff available</td>
-                </tr>
-                <tr>
-                    <td>sign-jwt</td>
-                    <td><span class="badge badge-modify">Redeploy</span></td>
-                    <td>Code unavailable in one or both environments</td>
-                    <td>No diff available</td>
-                </tr>
+                        <td>ascii-value</td>
+                        <td><span class="badge badge-modify">Redeploy</span></td>
+                        <td>Code differs</td>
+                        <td><pre>--- target:ascii-value/index.ts
++++ source:ascii-value/index.ts
+--- /var/folders/mw/zbyc_w_13bvgzfdsckg2sqn40000gn/T/edge-tgt-1762575868124-0.6893605475509943	2025-11-07 22:24:28
++++ /var/folders/mw/zbyc_w_13bvgzfdsckg2sqn40000gn/T/edge-src-1762575868124-0.28927912376611264	2025-11-07 22:24:28
+@@ -28,7 +28,7 @@
+     }
+     if (!word) {
+       return new Response(JSON.stringify({
+-        error: "Missing the 'word'. Provide ?word=... or { \"word\": \"...\" }."
++        error: "Missing core the 'word'. Provide ?word=... or { \"word\": \"...\" }."
+       }), {
+         status: 400,
+         headers: {</pre></td>
+                    </tr>
             </tbody>
         </table>
     </div>

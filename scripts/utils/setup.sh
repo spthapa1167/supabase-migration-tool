@@ -60,6 +60,8 @@ REQUIRED_VARS=(
     "SUPABASE_TEST_DB_PASSWORD"
     "SUPABASE_DEV_PROJECT_REF"
     "SUPABASE_DEV_DB_PASSWORD"
+    "SUPABASE_BACKUP_PROJECT_REF"
+    "SUPABASE_BACKUP_DB_PASSWORD"
 )
 
 MISSING_VARS=()
@@ -89,6 +91,7 @@ PROJECT_REFS=(
     "$SUPABASE_PROD_PROJECT_REF"
     "$SUPABASE_TEST_PROJECT_REF"
     "$SUPABASE_DEV_PROJECT_REF"
+    "$SUPABASE_BACKUP_PROJECT_REF"
 )
 
 INVALID_REFS=()
@@ -112,8 +115,9 @@ echo ""
 # Step 4: Check for duplicate project references
 log_info "Step 4: Checking for duplicate project references..."
 
+TOTAL_REFS=${#PROJECT_REFS[@]}
 UNIQUE_REFS=$(printf '%s\n' "${PROJECT_REFS[@]}" | sort -u | wc -l)
-if [ "$UNIQUE_REFS" -lt 3 ]; then
+if [ "$UNIQUE_REFS" -lt "$TOTAL_REFS" ]; then
     log_error "Duplicate project references detected!"
     log_error "Each environment must have a unique project reference"
     exit 1

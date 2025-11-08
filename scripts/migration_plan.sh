@@ -39,8 +39,8 @@ Usage: $0 <source_env> <target_env> [output_dir]
 Generates a comprehensive HTML migration plan comparing source and target environments.
 
 Arguments:
-  source_env   Source environment (prod, test, dev)
-  target_env   Target environment (prod, test, dev)
+  source_env   Source environment (prod, test, dev, backup)
+  target_env   Target environment (prod, test, dev, backup)
   output_dir   Directory to save the HTML report (optional, defaults to ./migration_plans)
 
 Examples:
@@ -73,6 +73,8 @@ if [ $LOAD_ENV_EXIT_CODE -ne 0 ]; then
     exit 1
 fi
 set -u  # Re-enable unbound variable checking after environment is loaded
+
+log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
 
 validate_environments "$SOURCE_ENV" "$TARGET_ENV"
 
@@ -1379,14 +1381,14 @@ hero_markup = f"""
     <div class='hero-head'>
         <h1>Migration Plan</h1>
         <p>Synchronize <strong>{html.escape(source_env)}</strong> → <strong>{html.escape(target_env)}</strong></p>
-    </div>
+            </div>
     <div class='hero-meta'>
         <span>Project refs</span>
         <span class='env-chip'>Source<span>{html.escape(source_ref or 'n/a')}</span></span>
         <span class='env-chip'>Target<span>{html.escape(target_ref or 'n/a')}</span></span>
         <span class='env-chip'>Generated<span>{timestamp_display}</span></span>
         <span class='env-chip'>Actions<span>{summary['actions']}</span></span>
-    </div>
+                        </div>
 </section>
 """
 

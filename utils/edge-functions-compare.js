@@ -80,6 +80,10 @@ const envToRef = (env) => {
         case 'dev':
         case 'develop':
             return process.env.SUPABASE_DEV_PROJECT_REF || '';
+        case 'backup':
+        case 'bkup':
+        case 'bkp':
+            return process.env.SUPABASE_BACKUP_PROJECT_REF || '';
         default:
             return '';
     }
@@ -97,6 +101,10 @@ const envToPassword = (env) => {
         case 'dev':
         case 'develop':
             return process.env.SUPABASE_DEV_DB_PASSWORD || '';
+        case 'backup':
+        case 'bkup':
+        case 'bkp':
+            return process.env.SUPABASE_BACKUP_DB_PASSWORD || '';
         default:
             return '';
     }

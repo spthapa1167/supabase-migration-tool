@@ -1,0 +1,47 @@
+{
+  "source_env": "dev",
+  "target_env": "test",
+  "source_ref": "woeymnjpojemymkoqsoz",
+  "target_ref": "ceurnrexwpniqxkmcfyi",
+  "generated_at": "2025-11-08T01:55:41.666Z",
+  "summary": {
+    "source_count": 14,
+    "target_count": 14,
+    "adds": 0,
+    "removes": 0,
+    "modifies": 0
+  },
+  "edge_functions": [],
+  "source_functions": [
+    "ai-chat",
+    "ai-news",
+    "contact-email",
+    "crawl-website",
+    "create-course-payment",
+    "knowledge-chat",
+    "llm-leaderboard",
+    "llm-leaderboard-free",
+    "process-document",
+    "seed-initial-content",
+    "send-enrollment-confirmation",
+    "stripe-transactions",
+    "system-info",
+    "verify-payment-email"
+  ],
+  "target_functions": [
+    "ai-chat",
+    "ai-news",
+    "contact-email",
+    "crawl-website",
+    "create-course-payment",
+    "knowledge-chat",
+    "llm-leaderboard",
+    "llm-leaderboard-free",
+    "process-document",
+    "seed-initial-content",
+    "send-enrollment-confirmation",
+    "stripe-transactions",
+    "system-info",
+    "verify-payment-email"
+  ]
+}

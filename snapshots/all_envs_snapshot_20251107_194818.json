@@ -1,0 +1,582 @@
+{
+  "timestamp": "2025-11-07 19:48:18",
+  "generatedAt": 1762566517,
+  "environments": {
+    "dev": {
+      "env": "dev",
+      "name": "Development",
+      "projectRef": "woeymnjpojemymkoqsoz",
+      "projectName": "XyntraAI-Web-Dev",
+      "timestamp": "2025-11-08T01:48:25Z",
+      "counts": {
+        "tables": 32,
+        "views": 0,
+        "functions": 36,
+        "sequences": 1,
+        "indexes": 102,
+        "policies": 17,
+        "triggers": 9,
+        "types": 32,
+        "enums": 11,
+        "authUsers": 1,
+        "edgeFunctions": 14,
+        "buckets": 1,
+        "secrets": 10,
+        "totalRows": 203,
+        "storageObjects": 10
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 28
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 3
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 6
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 3
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "enrollments",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "knowledge_base",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "knowledge_embeddings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "site_content",
+          "rows": 30
+        },
+        {
+          "schema": "public",
+          "table": "training_programs",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "user_roles",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 10
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "receipts",
+          "objects": 10
+        }
+      ]
+    },
+    "test": {
+      "env": "test",
+      "name": "Test/Staging",
+      "projectRef": "ceurnrexwpniqxkmcfyi",
+      "projectName": "XyntraAI-Web-Test",
+      "timestamp": "2025-11-08T01:48:31Z",
+      "counts": {
+        "tables": 32,
+        "views": 0,
+        "functions": 36,
+        "sequences": 1,
+        "indexes": 102,
+        "policies": 17,
+        "triggers": 9,
+        "types": 32,
+        "enums": 11,
+        "authUsers": 1,
+        "edgeFunctions": 13,
+        "buckets": 1,
+        "secrets": 10,
+        "totalRows": 189,
+        "storageObjects": 5
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 28
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "enrollments",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "knowledge_base",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "knowledge_embeddings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "site_content",
+          "rows": 30
+        },
+        {
+          "schema": "public",
+          "table": "training_programs",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "user_roles",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 5
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "receipts",
+          "objects": 5
+        }
+      ]
+    },
+    "prod": {
+      "env": "prod",
+      "name": "Production",
+      "projectRef": "myasfyqrqwbsukpjwdxx",
+      "projectName": "XyntraAI-Web-Prod",
+      "timestamp": "2025-11-08T01:48:37Z",
+      "counts": {
+        "tables": 32,
+        "views": 0,
+        "functions": 36,
+        "sequences": 1,
+        "indexes": 102,
+        "policies": 17,
+        "triggers": 9,
+        "types": 32,
+        "enums": 11,
+        "authUsers": 1,
+        "edgeFunctions": 13,
+        "buckets": 1,
+        "secrets": 9,
+        "totalRows": 195,
+        "storageObjects": 5
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 35
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 1
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "enrollments",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "knowledge_base",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "knowledge_embeddings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "site_content",
+          "rows": 30
+        },
+        {
+          "schema": "public",
+          "table": "training_programs",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "user_roles",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 5
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 1
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "receipts",
+          "objects": 5
+        }
+      ]
+    }
+  }
+}

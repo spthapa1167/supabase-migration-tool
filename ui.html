@@ -613,6 +613,7 @@
                                     <option value="dev">Development (dev)</option>
                                     <option value="test">Test (test)</option>
                                     <option value="prod">Production (prod)</option>
+                                    <option value="backup">Backup (backup)</option>
                                 </select>
                             </div>
 
@@ -625,6 +626,7 @@
                                     <option value="dev">Development (dev)</option>
                                     <option value="test">Test (test)</option>
                                     <option value="prod">Production (prod)</option>
+                                    <option value="backup">Backup (backup)</option>
                                 </select>
                             </div>
                         </div>
@@ -745,6 +747,9 @@
                                         <option value="dev">dev</option>
                                         <option value="test">test</option>
                                         <option value="prod">prod</option>
+                                        <option value="backup">backup</option>
+                                        <option value="backup">backup</option>
+                                        <option value="backup">backup</option>
                                     </select>
                                 </div>
                                 <div>
@@ -755,6 +760,9 @@
                                         <option value="dev">dev</option>
                                         <option value="test">test</option>
                                         <option value="prod">prod</option>
+                                        <option value="backup">backup</option>
+                                        <option value="backup">backup</option>
+                                        <option value="backup">backup</option>
                                     </select>
                                 </div>
                             </div>
@@ -800,6 +808,7 @@
                                         <option value="dev">dev</option>
                                         <option value="test">test</option>
                                         <option value="prod">prod</option>
+                                        <option value="backup">backup</option>
                                     </select>
                                 </div>
                                 <div>
@@ -810,6 +819,7 @@
                                         <option value="dev">dev</option>
                                         <option value="test">test</option>
                                         <option value="prod">prod</option>
+                                        <option value="backup">backup</option>
                                     </select>
                                 </div>
                             </div>
@@ -924,7 +934,7 @@
                         </div>
                         <div>
                             <h2 class="text-2xl font-bold text-primary-900">Environment Comparison</h2>
-                            <p class="text-neutral-600 text-sm">Compare all objects across dev, test, and prod environments</p>
+                            <p class="text-neutral-600 text-sm">Compare all objects across dev, test, prod, and backup environments</p>
                         </div>
                     </div>
                     
@@ -934,7 +944,7 @@
                             <div class="flex items-center justify-between mb-4">
                                 <div>
                                     <h3 class="text-lg font-semibold text-primary-900">Generate Snapshot</h3>
-                                    <p class="text-sm text-neutral-600 mt-1">Create a snapshot of all objects in dev, test, and prod environments</p>
+                                    <p class="text-sm text-neutral-600 mt-1">Create a snapshot of all objects in dev, test, prod, and backup environments</p>
                                 </div>
                                 <button onclick="generateAllEnvsSnapshot()" 
                                     class="px-6 py-3 bg-primary-600 text-white text-sm font-semibold rounded-lg hover:bg-primary-700 shadow-md hover:shadow-lg transition-all duration-200 flex items-center space-x-2">
@@ -943,6 +953,24 @@
                                     </svg>
                                     <span>Generate Snapshot</span>
                                 </button>
+                            </div>
+                        </div>
+                        
+                        <!-- Snapshot Log Stream -->
+                        <div id="snapshotLog" class="hidden">
+                            <div class="glass-card animate-fade-in space-y-4">
+                                <div id="snapshotLogHeader" class="flex items-center space-x-3 p-4 bg-primary-50 border-2 border-primary-200 rounded-xl text-primary-800">
+                                    <svg class="w-5 h-5 text-primary-600 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                                    </svg>
+                                    <div>
+                                        <strong>Generating snapshot...</strong>
+                                        <span class="ml-2 px-2 py-1 bg-primary-600 text-white text-xs font-semibold rounded-full">RUNNING</span>
+                                    </div>
+                                </div>
+                                <div id="snapshotLogStream" class="log-container bg-slate-900 rounded-xl p-4 max-h-80 overflow-y-auto custom-scrollbar font-mono text-sm streaming">
+                                    <div class="text-slate-400 text-xs mb-2">Waiting for snapshot logs...</div>
+                                </div>
                             </div>
                         </div>
                         
@@ -1003,6 +1031,7 @@
                                     <option value="dev" selected>Development (dev)</option>
                                     <option value="test">Test (test)</option>
                                     <option value="prod">Production (prod)</option>
+                                    <option value="backup">Backup (backup)</option>
                                 </select>
                             </div>
                             <div>
@@ -1014,6 +1043,7 @@
                                     <option value="dev">Development (dev)</option>
                                     <option value="test" selected>Test (test)</option>
                                     <option value="prod">Production (prod)</option>
+                                    <option value="backup">Backup (backup)</option>
                                 </select>
                             </div>
                         </div>

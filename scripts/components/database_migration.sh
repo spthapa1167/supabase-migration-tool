@@ -1,3 +1,110 @@
+#!/usr/bin/env bash
+
+# Helper: run psql command with fallback across available endpoints
+run_psql_command_with_fallback() {
+    local description=$1
+    local ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    local command=$6
+
+    local success=false
+    local tmp_err
+    tmp_err=$(mktemp)
+
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        log_info "${description} via ${label} (${host}:${port})"
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -v ON_ERROR_STOP=on \
+            -c "$command" \
+            >>"$LOG_FILE" 2>"$tmp_err"; then
+            success=true
+            break
+        else
+            log_warning "${description} failed via ${label}: $(head -n 1 "$tmp_err")"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    rm -f "$tmp_err"
+    $success && return 0 || return 1
+}
+
+# Helper: run psql query and capture output with fallback
+run_psql_query_with_fallback() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local query=$5
+
+    local tmp_err
+    tmp_err=$(mktemp)
+
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -F '|' \
+            -t -A \
+            -v ON_ERROR_STOP=on \
+            -c "$query" \
+            2>"$tmp_err"; then
+            rm -f "$tmp_err"
+            return 0
+        else
+            log_warning "Query execution failed via ${label}: $(head -n 1 "$tmp_err")"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    cat "$tmp_err" >&2
+    rm -f "$tmp_err"
+    return 1
+}
+
+# Helper: run psql script file with fallback
+run_psql_script_with_fallback() {
+    local description=$1
+    local ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    local script_path=$6
+
+    local success=false
+    local tmp_err
+    tmp_err=$(mktemp)
+
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        log_info "${description} via ${label} (${host}:${port})"
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -v ON_ERROR_STOP=off \
+            -f "$script_path" \
+            >>"$LOG_FILE" 2>"$tmp_err"; then
+            success=true
+            break
+        else
+            log_warning "${description} failed via ${label}: $(head -n 1 "$tmp_err")"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    rm -f "$tmp_err"
+    $success && return 0 || return 1
+}
+
 #!/bin/bash
 # Database Migration Script
 # Migrates database schema (and optionally data) from source to target
@@ -21,6 +128,12 @@ INCLUDE_DATA=false
 INCLUDE_USERS=false
 BACKUP_TARGET=false
 MIGRATION_DIR=""
+REPLACE_TARGET_DATA=false
+TARGET_DATA_BACKUP=""
+TARGET_DATA_BACKUP_SQL=""
+TARGET_SCHEMA_BEFORE_FILE=""
+TARGET_SCHEMA_AFTER_FILE=""
+RELAXED_NOT_NULL_FILE=""
 
 # Parse arguments - extract flags first, then positional arguments
 SOURCE_ENV=""
@@ -37,6 +150,9 @@ for arg in "$@"; do
             ;;
         --backup)
             BACKUP_TARGET=true
+            ;;
+        --replace-data|--force-data-replace)
+            REPLACE_TARGET_DATA=true
             ;;
         -h|--help)
             # Will show usage after it's defined
@@ -68,7 +184,7 @@ MIGRATION_DIR=${POSITIONAL_ARGS[2]:-""}
 # Usage
 usage() {
     cat << EOF
-Usage: $0 <source_env> <target_env> [migration_dir] [--data] [--users] [--backup]
+Usage: $0 <source_env> <target_env> [migration_dir] [--data] [--users] [--backup] [--replace-data]
 
 Migrates database schema (and optionally data and auth users) from source to target
 
@@ -78,10 +194,11 @@ Default Behavior:
   Use --users flag to include authentication users, roles, and policies.
 
 Arguments:
-  source_env     Source environment (prod, test, dev)
-  target_env     Target environment (prod, test, dev)
+  source_env     Source environment (prod, test, dev, backup)
+  target_env     Target environment (prod, test, dev, backup)
   migration_dir  Directory to store migration files (optional, auto-generated if not provided)
   --data         Include data migration (default: schema only)
+  --replace-data Replace target data (destructive). Without this flag, data migrations run in append/delta mode.
   --users        Include authentication users, roles, and policies
   --backup       Create backup of target before migration (optional)
 
@@ -114,6 +231,8 @@ fi
 # Load environment
 load_env
 validate_environments "$SOURCE_ENV" "$TARGET_ENV"
+
+log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
 
 # Get project references and passwords
 SOURCE_REF=$(get_project_ref "$SOURCE_ENV")
@@ -154,12 +273,22 @@ LOG_FILE="${LOG_FILE:-$MIGRATION_DIR/migration.log}"
 MIGRATION_MODE="Schema Only"
 if [ "$INCLUDE_DATA" = "true" ] && [ "$INCLUDE_USERS" = "true" ]; then
     log_to_file "$LOG_FILE" "Starting database schema + data + auth users migration from $SOURCE_ENV to $TARGET_ENV"
-    log_info "📊 Database Schema + Data + Auth Users Migration"
-    MIGRATION_MODE="Schema + Data + Auth Users"
+    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        log_info "📊 Database Schema + Data + Auth Users Migration (replace target data)"
+        MIGRATION_MODE="Schema + Data + Auth Users (replace)"
+    else
+        log_info "📊 Database Schema + Data + Auth Users Migration (delta/append)"
+        MIGRATION_MODE="Schema + Data + Auth Users (delta)"
+    fi
 elif [ "$INCLUDE_DATA" = "true" ]; then
     log_to_file "$LOG_FILE" "Starting database schema + data migration from $SOURCE_ENV to $TARGET_ENV"
-    log_info "📊 Database Schema + Data Migration"
-    MIGRATION_MODE="Schema + Data"
+    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        log_info "📊 Database Schema + Data Migration (replace target data)"
+        MIGRATION_MODE="Schema + Data (replace)"
+    else
+        log_info "📊 Database Schema + Data Migration (delta/append)"
+        MIGRATION_MODE="Schema + Data (delta)"
+    fi
 elif [ "$INCLUDE_USERS" = "true" ]; then
     log_to_file "$LOG_FILE" "Starting database schema + auth users migration from $SOURCE_ENV to $TARGET_ENV"
     log_info "📊 Database Schema + Auth Users Migration"
@@ -350,10 +479,11 @@ if [ "$INCLUDE_DATA" = "true" ]; then
         exit 1
     fi
     
-    # Drop existing objects for full migration
-    log_warning "Dropping existing objects in target database..."
-    DROP_SCRIPT="$MIGRATION_DIR/drop_all.sql"
-    cat > "$DROP_SCRIPT" << 'EOF'
+    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        # Drop existing objects for full migration
+        log_warning "Dropping existing objects in target database (replace mode enabled)..."
+        DROP_SCRIPT="$MIGRATION_DIR/drop_all.sql"
+        cat > "$DROP_SCRIPT" << 'EOF'
 DO $$ 
 DECLARE
     r RECORD;
@@ -377,28 +507,31 @@ BEGIN
 END $$;
 EOF
 
-    # Get pooler host using environment name (more reliable)
-    POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
-    if [ -z "$POOLER_HOST" ]; then
-        POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
-    fi
-    if ! PGPASSWORD="$TARGET_PASSWORD" psql \
-        -h "$POOLER_HOST" \
-        -p 6543 \
-        -U "postgres.${TARGET_REF}" \
-        -d postgres \
-        -f "$DROP_SCRIPT" \
-        2>&1 | tee -a "$LOG_FILE"; then
-            log_warning "Pooler connection failed for drop, trying direct connection..."
-        if check_direct_connection_available "$TARGET_REF"; then
-            PGPASSWORD="$TARGET_PASSWORD" psql \
-                -h "db.${TARGET_REF}.supabase.co" \
-                -p 5432 \
-                -U "postgres.${TARGET_REF}" \
-                -d postgres \
-                -f "$DROP_SCRIPT" \
-                2>&1 | tee -a "$LOG_FILE" || log_warning "Some objects may not have been dropped"
+        # Get pooler host using environment name (more reliable)
+        POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
+        if [ -z "$POOLER_HOST" ]; then
+            POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
         fi
+        if ! PGPASSWORD="$TARGET_PASSWORD" psql \
+            -h "$POOLER_HOST" \
+            -p 6543 \
+            -U "postgres.${TARGET_REF}" \
+            -d postgres \
+            -f "$DROP_SCRIPT" \
+            2>&1 | tee -a "$LOG_FILE"; then
+                log_warning "Pooler connection failed for drop, trying direct connection..."
+            if check_direct_connection_available "$TARGET_REF"; then
+                PGPASSWORD="$TARGET_PASSWORD" psql \
+                    -h "db.${TARGET_REF}.supabase.co" \
+                    -p 5432 \
+                    -U "postgres.${TARGET_REF}" \
+                    -d postgres \
+                    -f "$DROP_SCRIPT" \
+                    2>&1 | tee -a "$LOG_FILE" || log_warning "Some objects may not have been dropped"
+            fi
+        fi
+    else
+        log_info "Delta mode enabled: skipping destructive DROP of target objects. Existing rows will be preserved."
     fi
 else
     log_info "Step 2/3: Restoring schema to target environment..."
@@ -411,14 +544,62 @@ else
 fi
 
 # Restore dump
-if [ "$INCLUDE_DATA" = "true" ]; then
-    log_info "Step 3/3: Restoring dump to target..."
-else
-    log_info "Step 3/3: Restoring schema dump to target..."
-fi
-
+RESTORE_ARGS=(--verbose)
 RESTORE_SUCCESS=false
 RESTORE_OUTPUT=$(mktemp)
+
+if [ "$INCLUDE_DATA" = "true" ]; then
+    log_info "Step 3/3: Restoring dump to target..."
+    RESTORE_ARGS+=(--clean --if-exists --schema-only --no-owner --no-acl)
+else
+    log_info "Step 3/3: Restoring schema dump to target..."
+    RESTORE_ARGS+=(--clean --if-exists --schema-only --no-owner --no-acl)
+fi
+
+DUPLICATE_ALLOWED=false
+
+# Preserve target data when running schema-only delta migrations
+if [ "$INCLUDE_DATA" != "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
+    TARGET_DATA_BACKUP="$MIGRATION_DIR/target_data_backup.dump"
+    TARGET_DATA_BACKUP_SQL="$MIGRATION_DIR/target_data_backup.sql"
+    TARGET_SCHEMA_BEFORE_FILE="$MIGRATION_DIR/target_schema_columns.before"
+    SCHEMA_SNAPSHOT_QUERY="SELECT table_schema, table_name, column_name, is_nullable, CASE WHEN column_default IS NULL THEN 'false' ELSE 'true' END AS has_default, data_type FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog','information_schema') AND table_schema NOT LIKE 'pg_toast%%' ORDER BY 1,2,3;"
+    log_info "Backing up existing target data to preserve rows..."
+    BACKUP_ARGS=(-d postgres -Fc --data-only --verbose -f "$TARGET_DATA_BACKUP")
+    if [ "$INCLUDE_USERS" = "true" ]; then
+        BACKUP_ARGS+=(--exclude-schema=auth)
+    fi
+    if run_pg_tool_with_fallback "pg_dump" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$LOG_FILE" \
+        "${BACKUP_ARGS[@]}"; then
+        if [ -f "$TARGET_DATA_BACKUP" ] && [ -s "$TARGET_DATA_BACKUP" ]; then
+            log_success "Target data backup created: $TARGET_DATA_BACKUP"
+        else
+            log_warning "Target data backup file appears empty; continuing without restore safeguard"
+            TARGET_DATA_BACKUP=""
+        fi
+    else
+        log_warning "Failed to backup target data; schema restore will proceed without automatic data preservation"
+        TARGET_DATA_BACKUP=""
+    fi
+
+    log_info "Creating fallback SQL backup for preserved data..."
+    SQL_BACKUP_ARGS=(-d postgres --data-only --inserts --column-inserts --no-owner --no-acl --disable-triggers -f "$TARGET_DATA_BACKUP_SQL")
+    if [ "$INCLUDE_USERS" = "true" ]; then
+        SQL_BACKUP_ARGS+=(--exclude-schema=auth)
+    fi
+    if ! run_pg_tool_with_fallback "pg_dump" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$LOG_FILE" \
+        "${SQL_BACKUP_ARGS[@]}"; then
+        log_warning "Failed to create SQL fallback backup; duplicate row handling may be limited."
+        TARGET_DATA_BACKUP_SQL=""
+    fi
+
+    if run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$SCHEMA_SNAPSHOT_QUERY" >"$TARGET_SCHEMA_BEFORE_FILE"; then
+        log_info "Captured target schema snapshot before migration."
+    else
+        log_warning "Unable to capture target schema snapshot before migration."
+        TARGET_SCHEMA_BEFORE_FILE=""
+    fi
+fi
 
 # Get pooler host using environment name (more reliable)
 POOLER_HOST=$(get_pooler_host_for_env "$TARGET_ENV" 2>/dev/null || get_pooler_host "$TARGET_REF")
@@ -433,11 +614,7 @@ PGPASSWORD="$TARGET_PASSWORD" pg_restore \
     -p 6543 \
     -U "postgres.${TARGET_REF}" \
     -d postgres \
-    --verbose \
-    --no-owner \
-    --no-acl \
-    --clean \
-    --if-exists \
+    "${RESTORE_ARGS[@]}" \
     "$DUMP_FILE" \
     2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
 RESTORE_EXIT_CODE=${PIPESTATUS[0]}
@@ -464,10 +641,21 @@ fi
 if grep -qiE "error:" "$RESTORE_OUTPUT" 2>/dev/null && ! grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; then
     # Check if there are errors other than expected ones
     error_lines=$(grep -iE "error:" "$RESTORE_OUTPUT" 2>/dev/null | grep -viE "(errors ignored|already exists|does not exist)" || echo "")
+    if [ "$DUPLICATE_ALLOWED" = "true" ]; then
+        error_lines=$(echo "$error_lines" | grep -viE "duplicate key value violates unique constraint|Key \\(" || echo "")
+        if grep -qiE "duplicate key value violates unique constraint" "$RESTORE_OUTPUT" 2>/dev/null; then
+            log_warning "Duplicate key conflicts detected while inserting data. Existing rows in target were preserved."
+        fi
+    fi
     if [ -n "$error_lines" ]; then
         has_actual_error=true
         log_warning "Actual errors detected (not just ignored errors)"
     fi
+fi
+
+duplicate_conflicts=false
+if [ "$DUPLICATE_ALLOWED" = "true" ] && grep -qiE "duplicate key value violates unique constraint" "$RESTORE_OUTPUT" 2>/dev/null; then
+    duplicate_conflicts=true
 fi
 
 # Success conditions:
@@ -482,14 +670,18 @@ if [ $RESTORE_EXIT_CODE -eq 0 ] && [ "$has_fatal_error" = "false" ]; then
         log_success "Schema restore completed successfully via pooler (exit code: $RESTORE_EXIT_CODE)"
     fi
     log_info "Warnings about 'errors ignored on restore' are expected with --clean option"
-elif [ $RESTORE_EXIT_CODE -eq 1 ] && [ "$has_fatal_error" = "false" ] && [ "$has_actual_error" = "false" ] && grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; then
-    # Exit code 1 but only expected "errors ignored" - this is success
+elif [ $RESTORE_EXIT_CODE -eq 1 ] && [ "$has_fatal_error" = "false" ] && [ "$has_actual_error" = "false" ] && { [ "$duplicate_conflicts" = "true" ] || grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; }; then
+    # Exit code 1 but only expected warnings - this is success
     RESTORE_SUCCESS=true
-    ignored_count=$(grep -i "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null | sed -n 's/.*errors ignored on restore: \([0-9]*\).*/\1/p' | head -1 || echo "many")
-    if [ "$INCLUDE_DATA" = "true" ]; then
-        log_success "Restore completed successfully via pooler (exit code: 1, but only expected errors ignored: $ignored_count)"
+    if [ "$duplicate_conflicts" = "true" ]; then
+        log_success "Restore completed with existing rows preserved (duplicate keys skipped)."
     else
-        log_success "Schema restore completed successfully via pooler (exit code: 1, but only expected errors ignored: $ignored_count)"
+        ignored_count=$(grep -i "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null | sed -n 's/.*errors ignored on restore: \([0-9]*\).*/\1/p' | head -1 || echo "many")
+        if [ "$INCLUDE_DATA" = "true" ]; then
+            log_success "Restore completed successfully via pooler (exit code: 1, but only expected errors ignored: $ignored_count)"
+        else
+            log_success "Schema restore completed successfully via pooler (exit code: 1, but only expected errors ignored: $ignored_count)"
+        fi
     fi
     log_info "With --clean option, pg_restore returns exit code 1 when objects don't exist (expected behavior)"
 else
@@ -524,13 +716,9 @@ if [ "$RESTORE_SUCCESS" != "true" ] && check_direct_connection_available "$TARGE
             -h "db.${TARGET_REF}.supabase.co" \
             -p 5432 \
             -U "postgres.${TARGET_REF}" \
-        -d postgres \
-        --verbose \
-        --no-owner \
-        --no-acl \
-        --clean \
-        --if-exists \
-        "$DUMP_FILE" \
+            -d postgres \
+            "${RESTORE_ARGS[@]}" \
+            "$DUMP_FILE" \
         2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
     RESTORE_EXIT_CODE=${PIPESTATUS[0]}
     set -e
@@ -546,9 +734,18 @@ if [ "$RESTORE_SUCCESS" != "true" ] && check_direct_connection_available "$TARGE
     
     if grep -qiE "error:" "$RESTORE_OUTPUT" 2>/dev/null && ! grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; then
         error_lines=$(grep -iE "error:" "$RESTORE_OUTPUT" 2>/dev/null | grep -viE "(errors ignored|already exists|does not exist)" || echo "")
+        if [ "$DUPLICATE_ALLOWED" = "true" ]; then
+            error_lines=$(echo "$error_lines" | grep -viE "duplicate key value violates unique constraint|Key \\(" || echo "")
+        fi
         if [ -n "$error_lines" ]; then
             has_actual_error=true
         fi
+    fi
+
+    duplicate_conflicts=false
+    if [ "$DUPLICATE_ALLOWED" = "true" ] && grep -qiE "duplicate key value violates unique constraint" "$RESTORE_OUTPUT" 2>/dev/null; then
+        duplicate_conflicts=true
+        log_warning "Duplicate key conflicts detected while inserting data over direct connection. Existing rows in target were preserved."
     fi
     
     if [ $RESTORE_EXIT_CODE -eq 0 ] && [ "$has_fatal_error" = "false" ]; then
@@ -559,15 +756,19 @@ if [ "$RESTORE_SUCCESS" != "true" ] && check_direct_connection_available "$TARGE
             log_success "Schema restore completed successfully via direct connection (exit code: $RESTORE_EXIT_CODE)"
         fi
         log_info "Warnings about 'errors ignored on restore' are expected with --clean option"
-    elif [ $RESTORE_EXIT_CODE -eq 1 ] && [ "$has_fatal_error" = "false" ] && [ "$has_actual_error" = "false" ] && grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; then
+    elif [ $RESTORE_EXIT_CODE -eq 1 ] && [ "$has_fatal_error" = "false" ] && [ "$has_actual_error" = "false" ] && { [ "$duplicate_conflicts" = "true" ] || grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; }; then
         RESTORE_SUCCESS=true
-        ignored_count=$(grep -i "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null | sed -n 's/.*errors ignored on restore: \([0-9]*\).*/\1/p' | head -1 || echo "many")
-        if [ "$INCLUDE_DATA" = "true" ]; then
-            log_success "Restore completed successfully via direct connection (exit code: 1, but only expected errors ignored: $ignored_count)"
+        if [ "$duplicate_conflicts" = "true" ]; then
+            log_success "Restore completed with existing rows preserved (duplicate keys skipped)."
         else
-            log_success "Schema restore completed successfully via direct connection (exit code: 1, but only expected errors ignored: $ignored_count)"
+            ignored_count=$(grep -i "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null | sed -n 's/.*errors ignored on restore: \([0-9]*\).*/\1/p' | head -1 || echo "many")
+            if [ "$INCLUDE_DATA" = "true" ]; then
+                log_success "Restore completed successfully via direct connection (exit code: 1, but only expected errors ignored: $ignored_count)"
+            else
+                log_success "Schema restore completed successfully via direct connection (exit code: 1, but only expected errors ignored: $ignored_count)"
+            fi
+            log_info "With --clean option, pg_restore returns exit code 1 when objects don't exist (expected behavior)"
         fi
-        log_info "With --clean option, pg_restore returns exit code 1 when objects don't exist (expected behavior)"
     else
         log_error "Direct connection restore also failed (exit code: $RESTORE_EXIT_CODE)"
         if [ "$has_fatal_error" = "true" ]; then
@@ -586,6 +787,252 @@ if [ "$RESTORE_SUCCESS" != "true" ] && check_direct_connection_available "$TARGE
 fi
 
 rm -f "$RESTORE_OUTPUT"
+
+if [ "$RESTORE_SUCCESS" = "true" ] && [ -n "$TARGET_SCHEMA_BEFORE_FILE" ] && [ -f "$TARGET_SCHEMA_BEFORE_FILE" ]; then
+    TARGET_SCHEMA_AFTER_FILE="$MIGRATION_DIR/target_schema_columns.after"
+    SCHEMA_SNAPSHOT_QUERY="SELECT table_schema, table_name, column_name, is_nullable, CASE WHEN column_default IS NULL THEN 'false' ELSE 'true' END AS has_default, data_type FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog','information_schema') AND table_schema NOT LIKE 'pg_toast%%' ORDER BY 1,2,3;"
+    if run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$SCHEMA_SNAPSHOT_QUERY" >"$TARGET_SCHEMA_AFTER_FILE"; then
+        tmp_relaxed_file="$MIGRATION_DIR/relaxed_not_null_columns.list"
+        set +e
+        python_output=$(SQL_BEFORE="$TARGET_SCHEMA_BEFORE_FILE" SQL_AFTER="$TARGET_SCHEMA_AFTER_FILE" python <<'PY'
+import os
+before_path = os.environ["SQL_BEFORE"]
+after_path = os.environ["SQL_AFTER"]
+before_keys = set()
+with open(before_path, "r", encoding="utf-8") as before_fp:
+    for line in before_fp:
+        parts = line.strip().split("|")
+        if len(parts) < 3:
+            continue
+        key = tuple(parts[:3])
+        before_keys.add(key)
+new_columns = []
+with open(after_path, "r", encoding="utf-8") as after_fp:
+    for line in after_fp:
+        parts = line.strip().split("|")
+        if len(parts) < 6:
+            continue
+        key = tuple(parts[:3])
+        if key in before_keys:
+            continue
+        is_nullable = parts[3]
+        has_default = parts[4]
+        data_type = parts[5]
+        if is_nullable.upper() == "NO" and has_default.lower() == "false":
+            new_columns.append("|".join(list(key) + [data_type]))
+if new_columns:
+    print("\n".join(new_columns))
+PY
+)
+        python_status=$?
+        set -e
+        if [ $python_status -eq 0 ] && [ -n "$python_output" ]; then
+            printf "%s\n" "$python_output" >"$tmp_relaxed_file"
+            RELAXED_NOT_NULL_FILE="$tmp_relaxed_file"
+            while IFS='|' read -r schema_name table_name column_name data_type; do
+                [ -z "$schema_name" ] && continue
+                drop_sql=$(printf 'ALTER TABLE "%s"."%s" ALTER COLUMN "%s" DROP NOT NULL;' "$schema_name" "$table_name" "$column_name")
+                run_psql_command_with_fallback "Temporarily relaxing NOT NULL constraint on ${schema_name}.${table_name}.${column_name}" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$drop_sql" || true
+            done <"$RELAXED_NOT_NULL_FILE"
+            if [ -s "$RELAXED_NOT_NULL_FILE" ]; then
+                log_warning "New NOT NULL columns detected without defaults; constraints temporarily relaxed to allow data preservation."
+            fi
+        else
+            RELAXED_NOT_NULL_FILE=""
+            rm -f "$tmp_relaxed_file"
+        fi
+    else
+        log_warning "Unable to capture target schema snapshot after migration."
+        TARGET_SCHEMA_AFTER_FILE=""
+    fi
+fi
+
+# Restore preserved data if applicable
+if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
+    log_info "Step 3b/3: Applying data changes from source dump..."
+    
+    DATA_DUPLICATE_ALLOWED=false
+    if [ "$REPLACE_TARGET_DATA" != "true" ]; then
+        DATA_DUPLICATE_ALLOWED=true
+    fi
+    
+    DATA_RESTORE_ARGS=(--verbose --no-owner --no-acl --disable-triggers --data-only -d postgres)
+    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        DATA_RESTORE_ARGS+=(--clean)
+    fi
+    
+    DATA_RESTORE_SUCCESS=false
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        
+        log_info "Restoring source data via ${label} (${host}:${port})..."
+        restore_log=$(mktemp)
+        set +e
+        PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            "${DATA_RESTORE_ARGS[@]}" \
+            "$DUMP_FILE" \
+            2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
+        DATA_RESTORE_EXIT=${PIPESTATUS[0]}
+        set -e
+        
+        if [ $DATA_RESTORE_EXIT -eq 0 ]; then
+            DATA_RESTORE_SUCCESS=true
+            log_success "Data restore from source succeeded via ${label}"
+            rm -f "$restore_log"
+            break
+        fi
+        
+        if [ "$DATA_DUPLICATE_ALLOWED" = "true" ] && \
+            { grep -qiE "duplicate key value violates unique constraint" "$restore_log" || grep -qiE "errors ignored on restore" "$restore_log"; }; then
+            DATA_RESTORE_SUCCESS=true
+            log_warning "Data restore via ${label} completed with duplicate key warnings; existing rows were preserved."
+            rm -f "$restore_log"
+            break
+        fi
+        
+        log_warning "Data restore via ${label} failed (exit code $DATA_RESTORE_EXIT)"
+        if [ -s "$restore_log" ]; then
+            tail -n 5 "$restore_log" | while read line; do
+                log_warning "  $line"
+            done
+        fi
+        rm -f "$restore_log"
+    done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    
+    rm -f "$DATA_RESTORE_OUTPUT"
+    
+    if [ "$DATA_RESTORE_SUCCESS" = "true" ]; then
+        log_success "Source data restored successfully."
+    else
+        log_error "Failed to restore source data after all connection attempts."
+        exit 1
+    fi
+fi
+
+# Restore preserved data if applicable (schema-only mode)
+if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" != "true" ] && [ -n "$TARGET_DATA_BACKUP" ] && [ -f "$TARGET_DATA_BACKUP" ] && [ -s "$TARGET_DATA_BACKUP" ]; then
+    log_info "Restoring preserved target data into updated schema..."
+
+    data_restore_completed=false
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+
+        log_info "Restoring preserved data via ${label} (${host}:${port})..."
+        restore_log=$(mktemp)
+        set +e
+        PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            --data-only \
+            --no-owner \
+            --no-acl \
+            --disable-triggers \
+            -d postgres \
+            "$TARGET_DATA_BACKUP" \
+            2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
+        DATA_RESTORE_EXIT=${PIPESTATUS[0]}
+        set -e
+
+        if [ $DATA_RESTORE_EXIT -eq 0 ]; then
+            data_restore_completed=true
+            log_success "Data restore succeeded via ${label}"
+            rm -f "$restore_log"
+            break
+        fi
+
+        if grep -qiE "duplicate key value violates unique constraint" "$restore_log" || grep -qiE "errors ignored on restore" "$restore_log"; then
+            data_restore_completed=true
+            log_warning "Data restore via ${label} completed with duplicate key warnings; existing rows were preserved."
+            rm -f "$restore_log"
+            break
+        fi
+
+        log_warning "Data restore via ${label} failed (exit code $DATA_RESTORE_EXIT)"
+        rm -f "$restore_log"
+    done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+
+    if [ "$data_restore_completed" != "true" ] && [ -n "$TARGET_DATA_BACKUP_SQL" ] && [ -f "$TARGET_DATA_BACKUP_SQL" ] && [ -s "$TARGET_DATA_BACKUP_SQL" ]; then
+        log_warning "Binary restore failed; attempting SQL fallback with ON CONFLICT DO NOTHING..."
+        transformed_sql=$(mktemp)
+        SQL_FALLBACK_SOURCE="$TARGET_DATA_BACKUP_SQL" SQL_FALLBACK_DEST="$transformed_sql" python - <<'PY'
+import os, re
+src_path = os.environ["SQL_FALLBACK_SOURCE"]
+dst_path = os.environ["SQL_FALLBACK_DEST"]
+with open(src_path, "r", encoding="utf-8") as src:
+    sql = src.read()
+pattern = re.compile(r'(INSERT INTO .*?;)', re.S | re.IGNORECASE)
+def repl(match):
+    stmt = match.group(1)
+    if 'ON CONFLICT' in stmt.upper():
+        return stmt
+    stmt = stmt.rstrip(';\n')
+    return stmt + ' ON CONFLICT DO NOTHING;\n'
+sql = pattern.sub(repl, sql)
+with open(dst_path, "w", encoding="utf-8") as dst:
+    dst.write(sql)
+PY
+        if run_psql_script_with_fallback "SQL data restore fallback" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$transformed_sql"; then
+            data_restore_completed=true
+            log_success "SQL fallback restore completed successfully."
+        else
+            log_warning "SQL fallback restore failed."
+        fi
+        rm -f "$transformed_sql"
+    fi
+
+    if [ "$data_restore_completed" = "true" ]; then
+        log_success "Preserved target data restored successfully."
+    else
+        log_error "Failed to restore preserved target data after all connection attempts."
+        exit 1
+    fi
+fi
+
+if [ "$RESTORE_SUCCESS" = "true" ] && [ -n "$RELAXED_NOT_NULL_FILE" ] && [ -f "$RELAXED_NOT_NULL_FILE" ] && [ -s "$RELAXED_NOT_NULL_FILE" ]; then
+    while IFS='|' read -r schema_name table_name column_name data_type; do
+        [ -z "$schema_name" ] && continue
+        null_count_query=$(printf 'SELECT COUNT(*) FROM "%s"."%s" WHERE "%s" IS NULL;' "$schema_name" "$table_name" "$column_name")
+        set +e
+        null_count=$(run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$null_count_query")
+        query_status=$?
+        set -e
+        if [ $query_status -ne 0 ]; then
+            log_warning "Unable to validate NULL count for ${schema_name}.${table_name}.${column_name}; leaving column nullable."
+            continue
+        fi
+        null_count=$(echo "$null_count" | tr -d '[:space:]')
+        if [ -z "$null_count" ]; then
+            log_warning "Unexpected NULL count result for ${schema_name}.${table_name}.${column_name}; leaving column nullable."
+            continue
+        fi
+        if [ "$null_count" = "0" ]; then
+            set +e
+            set_sql=$(printf 'ALTER TABLE "%s"."%s" ALTER COLUMN "%s" SET NOT NULL;' "$schema_name" "$table_name" "$column_name")
+            if run_psql_command_with_fallback "Reinstating NOT NULL constraint on ${schema_name}.${table_name}.${column_name}" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$set_sql"; then
+                log_success "Reinstated NOT NULL constraint on ${schema_name}.${table_name}.${column_name}."
+            else
+                log_warning "Failed to reinstate NOT NULL constraint on ${schema_name}.${table_name}.${column_name}; manual review required."
+            fi
+            set -e
+        else
+            log_warning "Column ${schema_name}.${table_name}.${column_name} has ${null_count} NULL values after data restore."
+            log_warning "Please backfill values, for example:"
+            log_warning "  UPDATE \"${schema_name}\".\"${table_name}\" SET \"${column_name}\" = COALESCE(/* derive value */, 'default_value') WHERE \"${column_name}\" IS NULL;"
+            log_warning "After backfilling, rerun the migration or apply 'ALTER TABLE \"${schema_name}\".\"${table_name}\" ALTER COLUMN \"${column_name}\" SET NOT NULL;' manually."
+        fi
+    done <"$RELAXED_NOT_NULL_FILE"
+    rm -f "$RELAXED_NOT_NULL_FILE"
+    RELAXED_NOT_NULL_FILE=""
+fi
+
+[ -n "$TARGET_SCHEMA_BEFORE_FILE" ] && rm -f "$TARGET_SCHEMA_BEFORE_FILE"
+[ -n "$TARGET_SCHEMA_AFTER_FILE" ] && rm -f "$TARGET_SCHEMA_AFTER_FILE"
+TARGET_SCHEMA_BEFORE_FILE=""
+TARGET_SCHEMA_AFTER_FILE=""
 
 # Step 4: Sync auth users from source to target if requested
 if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
@@ -623,8 +1070,8 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
     if [ "$SOURCE_USER_COUNT" = "0" ]; then
         log_warning "Source has 0 auth users"
         
-        # If both --data and --users are used, clear target to match source (full sync)
-        if [ "$INCLUDE_DATA" = "true" ]; then
+        # If both --data and --users are used with replace mode, clear target to match source
+        if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
             log_info "Clearing all auth users from target to match source (full sync)..."
             TARGET_USER_COUNT_BEFORE=$(PGPASSWORD="$TARGET_PASSWORD" psql \
                 -h "$POOLER_HOST" \
@@ -663,6 +1110,8 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                 }
                 log_success "Cleared all auth users from target (target now matches source: 0 users)"
             fi
+        else
+            log_info "Delta mode enabled: existing auth users in target will be preserved."
         fi
         log_warning "Skipping auth users sync (source has no users)"
     else
@@ -678,9 +1127,8 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
             -c "SELECT COUNT(*) FROM auth.users;" 2>/dev/null || echo "0")
         log_info "Current auth users in target: $TARGET_USER_COUNT_BEFORE"
         
-        # If both --data and --users are used, do a FULL SYNC (replace all users)
-        # This ensures target matches source exactly (add missing, remove extra)
-        if [ "$INCLUDE_DATA" = "true" ]; then
+        # If both --data and --users are used with replace mode, do a FULL SYNC (replace all users)
+        if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
             log_info "Full sync mode: Clearing existing auth data in target to ensure exact match with source..."
             log_warning "This will remove all existing auth users, identities, refresh_tokens, and sessions in target"
             
@@ -722,14 +1170,16 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                     exit 1
                 fi
             fi
+        else
+            log_info "Delta mode enabled: existing auth users in target will be preserved (no deletions)."
         fi
         
         # Use the existing auth_users.dump file (created in Step 2a) to restore all users
         if [ -f "$AUTH_USERS_DUMP" ] && [ -s "$AUTH_USERS_DUMP" ]; then
-            if [ "$INCLUDE_DATA" = "true" ]; then
-                log_info "Restoring all auth users from source (full sync mode)..."
+            if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
+                log_info "Restoring all auth users from source (replace mode)..."
             else
-                log_info "Copying auth users from source (adding missing users only)..."
+                log_info "Copying auth users from source (delta/append mode)..."
             fi
             
             RESTORE_OUTPUT=$(mktemp)
@@ -754,6 +1204,12 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                ! grep -qiE "SET.*log_min_messages.*fatal|Command was:.*fatal" "$RESTORE_OUTPUT" 2>/dev/null; then
                 has_fatal_error=true
             fi
+
+            auth_duplicates=false
+            if [ "$REPLACE_TARGET_DATA" != "true" ] && grep -qiE "duplicate key value violates unique constraint" "$RESTORE_OUTPUT" 2>/dev/null; then
+                auth_duplicates=true
+                log_warning "Duplicate auth users detected in target; existing records were preserved."
+            fi
             
             # Verify final count
             TARGET_USER_COUNT_AFTER=$(PGPASSWORD="$TARGET_PASSWORD" psql \
@@ -773,7 +1229,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                     log_info "Retrying auth users restore via direct connection..."
                     
                     # Clear again if needed (in case partial restore happened)
-                    if [ "$INCLUDE_DATA" = "true" ] && [ "$TARGET_USER_COUNT_AFTER" -lt "$SOURCE_USER_COUNT" ]; then
+                    if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ] && [ "$TARGET_USER_COUNT_AFTER" -lt "$SOURCE_USER_COUNT" ]; then
                         log_info "Clearing partial data and retrying..."
                         PGPASSWORD="$TARGET_PASSWORD" psql \
                             -h db.${TARGET_REF}.supabase.co \
@@ -815,7 +1271,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
             fi
             
             # Verify sync was successful
-            if [ "$INCLUDE_DATA" = "true" ]; then
+            if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
                 # Full sync mode: target must match source exactly
                 if [ "$TARGET_USER_COUNT_AFTER" = "$SOURCE_USER_COUNT" ]; then
                     log_success "Auth users sync completed successfully:"
@@ -830,7 +1286,10 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
             else
                 # Incremental mode: just add missing users
                 ACTUAL_COPIED=$((TARGET_USER_COUNT_AFTER - TARGET_USER_COUNT_BEFORE))
-                if [ "$ACTUAL_COPIED" -gt 0 ] || [ "$RESTORE_EXIT_CODE" -eq 0 ]; then
+                if [ "$ACTUAL_COPIED" -lt 0 ]; then
+                    ACTUAL_COPIED=0
+                fi
+                if [ "$ACTUAL_COPIED" -gt 0 ] || [ "$RESTORE_EXIT_CODE" -eq 0 ] || [ "$auth_duplicates" = "true" ]; then
                     log_success "Auth users copy completed:"
                     log_info "  New users added: $ACTUAL_COPIED user(s)"
                     log_info "  Target now has: $TARGET_USER_COUNT_AFTER user(s) (was $TARGET_USER_COUNT_BEFORE, source had $SOURCE_USER_COUNT)"

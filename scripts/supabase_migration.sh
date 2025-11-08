@@ -31,6 +31,7 @@ BACKUP_TARGET=false
 INCLUDE_DATA=false  # Default: false - don't migrate database data by default
 INCLUDE_FILES=false  # Default: false - don't migrate bucket files by default
 INCLUDE_USERS=false  # Default: false - don't migrate auth users by default
+REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
 
 # Colors
 RED='\033[0;31m'
@@ -54,12 +55,13 @@ Usage: $0 <source_env> <target_env> [OPTIONS]
 Supabase Migration Utility - Comprehensive migration with step-by-step validation
 
 Arguments:
-  <source_env>            Source environment (prod, test, dev) - REQUIRED
-  <target_env>            Target environment (prod, test, dev) - REQUIRED
+  <source_env>            Source environment (prod, test, dev, backup) - REQUIRED
+  <target_env>            Target environment (prod, test, dev, backup) - REQUIRED
 
 Options:
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
   --data                  Include database data/rows migration (default: false)
+  --replace-data          Allow destructive replace of target data (requires --data). Without this flag, data sync runs in delta/append mode.
   --users                 Include authentication users, roles, and policies migration (default: false)
   --files                 Include storage bucket files migration (default: false)
   --env-file <file>       Environment file (default: .env.local)
@@ -144,6 +146,10 @@ parse_args() {
                 ;;
             --data)
                 INCLUDE_DATA=true
+                shift
+                ;;
+            --replace-data|--force-data-replace)
+                REPLACE_TARGET_DATA=true
                 shift
                 ;;
             --users)
@@ -889,7 +895,17 @@ $([ "$MODE" = "full" ] && echo "- **Data**: All data was migrated" || echo "- **
    - Sequences were synchronized
 
 2. **Database Data** $(([ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]) && echo "✅" || echo "⏭️  (Skipped)")
-   $(([ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]) && echo "   - All table data was copied from source to target" || echo "   - No data was copied (schema-only migration)")
+   $(
+        if [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
+            if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+                echo "   - Target rows were replaced with data from source"
+            else
+                echo "   - Data copied in delta mode (existing target rows preserved)"
+            fi
+        else
+            echo "   - No data was copied (schema-only migration)"
+        fi
+    )
 
 3. **Auth Users** $([ "$INCLUDE_USERS" = "true" ] && echo "✅" || echo "⏭️  (Skipped)")
    $([ "$INCLUDE_USERS" = "true" ] && echo "   - Authentication users, roles, and policies were migrated from source to target" || echo "   - No auth users were migrated (users migration was skipped)")
@@ -911,7 +927,17 @@ $([ "$MODE" = "full" ] && echo "- **Data**: All data was migrated" || echo "- **
 The following changes were applied to the target environment:
 
 - **Schema Changes**: All differences between source and target schemas were resolved
-- **Data Migration**: $(([ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]) && echo "Complete data copy from source to target" || echo "No data migration (schema only)")
+- **Data Migration**: $(
+    if [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
+        if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+            echo "Complete replacement of target data with source data"
+        else
+            echo "Delta copy – existing target rows preserved, new rows appended"
+        fi
+    else
+        echo "No data migration (schema only)"
+    fi
+  )
 - **Files Migration**: $([ "$INCLUDE_FILES" = "true" ] && echo "Storage bucket files migrated from source to target" || echo "No files migration (bucket configuration only)")
 - **Configuration**: Storage buckets, edge functions, and secrets structure migrated
 
@@ -1256,11 +1282,24 @@ perform_migration() {
     fi
     if [ "$migrate_data" = "true" ]; then
         db_migration_args+=("--data")
+        if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+            db_migration_args+=("--replace-data")
+        fi
     fi
     if [ "$INCLUDE_USERS" = "true" ]; then
         db_migration_args+=("--users")
     fi
     
+    if [ "$MODE" = "full" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
+        log_warning "Full mode selected without --replace-data: running data sync in delta mode to preserve target rows."
+    fi
+
+    if [ "$migrate_data" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        log_warning "Data migration will REPLACE target data. Ensure you have backups and have confirmed this is intended."
+    elif [ "$migrate_data" = "true" ]; then
+        log_info "Data migration set to delta mode: existing target rows will be preserved. Only new data will be attempted."
+    fi
+
     if [ "$migrate_data" = "true" ] && [ "$INCLUDE_USERS" = "true" ]; then
         log_info "Migrating database (schema + data + auth users)..."
     elif [ "$migrate_data" = "true" ]; then
@@ -1461,7 +1500,7 @@ interactive_mode() {
     echo ""
     
     # Prompt for source
-    echo "Available environments: prod, test, dev"
+    echo "Available environments: prod, test, dev, backup"
     read -p "Source environment: " SOURCE_ENV
     SOURCE_ENV=$(echo "$SOURCE_ENV" | tr '[:upper:]' '[:lower:]')
     
@@ -1509,6 +1548,7 @@ interactive_mode() {
     log_info "  Target: $TARGET_ENV"
     log_info "  Mode: $MODE"
     log_info "  Include Data: $INCLUDE_DATA"
+    log_info "  Replace Target Data: $REPLACE_TARGET_DATA"
     log_info "  Include Users: $INCLUDE_USERS"
     log_info "  Include Files: $INCLUDE_FILES"
     log_info "  Backup: $BACKUP_TARGET"
@@ -1536,6 +1576,11 @@ main() {
         exit 1
     fi
     
+    if [ "$REPLACE_TARGET_DATA" = "true" ] && [ "$MODE" != "full" ] && [ "$INCLUDE_DATA" = "false" ]; then
+        log_error "--replace-data requires --data or --mode full. Refusing to run destructive migration without data sync."
+        exit 1
+    fi
+    
     # Load environment using the robust load_env function
     if [ ! -f "$ENV_FILE" ]; then
         log_error "Environment file not found: $ENV_FILE"
@@ -1551,6 +1596,8 @@ main() {
         exit 1
     fi
     
+    log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
+
     # Note: We don't cleanup before migration anymore
     # Cleanup happens AFTER migration completes to keep last 3 records
     

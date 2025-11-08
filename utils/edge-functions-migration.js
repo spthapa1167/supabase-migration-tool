@@ -98,6 +98,7 @@ function getSupabaseConfig(projectRef) {
     const prodRef = process.env.SUPABASE_PROD_PROJECT_REF || '';
     const testRef = process.env.SUPABASE_TEST_PROJECT_REF || '';
     const devRef = process.env.SUPABASE_DEV_PROJECT_REF || '';
+    const backupRef = process.env.SUPABASE_BACKUP_PROJECT_REF || '';
     
     if (prodRef === projectRef) {
         envName = 'PROD';
@@ -105,6 +106,8 @@ function getSupabaseConfig(projectRef) {
         envName = 'TEST';
     } else if (devRef === projectRef) {
         envName = 'DEV';
+    } else if (backupRef === projectRef) {
+        envName = 'BACKUP';
     }
     
     if (envName) {
@@ -144,8 +147,8 @@ if (!SOURCE_REF || !TARGET_REF || !MIGRATION_DIR) {
     console.error('');
     console.error('Environment variables required in .env.local:');
     console.error('  - SUPABASE_ACCESS_TOKEN (required for Management API)');
-    console.error('  - SUPABASE_PROD_PROJECT_REF, SUPABASE_TEST_PROJECT_REF, SUPABASE_DEV_PROJECT_REF');
-    console.error('  - SUPABASE_PROD_DB_PASSWORD, SUPABASE_TEST_DB_PASSWORD, SUPABASE_DEV_DB_PASSWORD (required for linking)');
+    console.error('  - SUPABASE_PROD_PROJECT_REF, SUPABASE_TEST_PROJECT_REF, SUPABASE_DEV_PROJECT_REF, SUPABASE_BACKUP_PROJECT_REF');
+    console.error('  - SUPABASE_PROD_DB_PASSWORD, SUPABASE_TEST_DB_PASSWORD, SUPABASE_DEV_DB_PASSWORD, SUPABASE_BACKUP_DB_PASSWORD (required for linking)');
     process.exit(1);
 }
 

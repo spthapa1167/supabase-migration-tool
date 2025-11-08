@@ -276,11 +276,12 @@ async function loadAppInfo() {
         
         const envInfoElement = document.getElementById('envInfo');
         if (envInfoElement && data.environments) {
-            const envOrder = ['prod', 'test', 'dev'];
+            const envOrder = ['prod', 'test', 'dev', 'backup'];
             const envBadgeColors = {
                 prod: 'bg-error-100 text-error-700',
                 test: 'bg-warning-100 text-warning-700',
-                dev: 'bg-success-100 text-success-700'
+                dev: 'bg-success-100 text-success-700',
+                backup: 'bg-primary-100 text-primary-700'
             };
 
             const envBadges = [];
@@ -332,14 +333,16 @@ function loadEnvironmentsList() {
     const environments = [
         { key: 'dev', name: 'Development', color: 'success', icon: '🟢' },
         { key: 'test', name: 'Test/Staging', color: 'warning', icon: '🟡' },
-        { key: 'prod', name: 'Production', color: 'error', icon: '🔴' }
+        { key: 'prod', name: 'Production', color: 'error', icon: '🔴' },
+        { key: 'backup', name: 'Backup', color: 'info', icon: '🔵' }
     ];
     
     // Use inline styles for colors to avoid Tailwind dynamic class issues
     const colorClasses = {
         'error': { bg: '#fee2e2', text: '#991b1b' },
         'warning': { bg: '#fef3c7', text: '#92400e' },
-        'success': { bg: '#d1fae5', text: '#065f46' }
+        'success': { bg: '#d1fae5', text: '#065f46' },
+        'info': { bg: '#dbeafe', text: '#1d4ed8' }
     };
     
     // Build HTML for each environment
@@ -400,7 +403,8 @@ async function testConnection(env) {
     const envNames = {
         'prod': 'Production',
         'test': 'Test/Staging',
-        'dev': 'Development'
+        'dev': 'Development',
+        'backup': 'Backup'
     };
     const envName = envNames[env] || env;
     testResultsTitle.textContent = `Test Results: ${envName}`;
@@ -593,11 +597,12 @@ async function testAllConnections() {
     testResults.scrollIntoView({ behavior: 'smooth', block: 'start' });
     
     // Test all environments in parallel
-    const environments = ['dev', 'test', 'prod'];
+    const environments = ['dev', 'test', 'prod', 'backup'];
     const envNames = {
         'prod': 'Production',
         'test': 'Test/Staging',
-        'dev': 'Development'
+        'dev': 'Development',
+        'backup': 'Backup'
     };
     
     // Create result containers for each environment
@@ -671,7 +676,8 @@ async function testConnectionForEnv(env, isAllTests = false) {
     const envNames = {
         'prod': 'Production',
         'test': 'Test/Staging',
-        'dev': 'Development'
+        'dev': 'Development',
+        'backup': 'Backup'
     };
     const envName = envNames[env] || env;
     
@@ -945,8 +951,8 @@ function setEdgeCompareStatus(message = '', tone = 'info') {
     statusEl.textContent = message || '';
 }
 
-function renderEdgeComparisonResult(data) {
-    const container = document.getElementById('edgeComparisonResult');
+function renderEdgeComparisonResult(data, targetContainer = null) {
+    const container = targetContainer || document.getElementById('edgeComparisonResult');
     if (!container) return;
 
     const summary = data?.summary || {};
@@ -1116,22 +1122,83 @@ async function performEdgeComparison(source, target, { auto = false } = {}) {
         runButton.disabled = true;
         runButton.classList.add('opacity-70', 'cursor-not-allowed');
     }
+
     setEdgeCompareStatus(auto ? 'Refreshing edge comparison...' : 'Running edge comparison...', 'info');
     showLoading('edgeCompareLoading');
 
     resultContainer.innerHTML = `
-        <div class="glass-card animate-fade-in">
-            <div class="flex items-center space-x-3 text-neutral-600">
-                <svg class="w-5 h-5 text-primary-500 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
-                </svg>
-                <span class="text-sm font-semibold">Comparing edge functions...</span>
+        <div class="space-y-4">
+            <div class="glass-card animate-fade-in">
+                <div id="edgeCompareLogHeader" class="flex items-center space-x-3 p-4 bg-primary-50 border-2 border-primary-200 rounded-xl text-primary-800">
+                    <svg class="w-5 h-5 text-primary-600 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                    </svg>
+                    <div>
+                        <strong>Edge comparison running...</strong>
+                        <span class="ml-2 px-2 py-1 bg-primary-600 text-white text-xs font-semibold rounded-full">RUNNING</span>
+                    </div>
+                </div>
+                <div id="edgeCompareLogContainer" class="log-container bg-slate-900 rounded-xl p-4 mt-4 max-h-96 overflow-y-auto custom-scrollbar"></div>
             </div>
+            <div id="edgeCompareSummary" class="space-y-6"></div>
         </div>
     `;
 
-    try {
-        const response = await fetch(`${API_BASE}/api/edge-comparison`, {
+    const logHeader = resultContainer.querySelector('#edgeCompareLogHeader');
+    const logContainer = resultContainer.querySelector('#edgeCompareLogContainer');
+    const summaryContainer = resultContainer.querySelector('#edgeCompareSummary');
+
+    if (logContainer) {
+        logContainer.classList.add('streaming');
+        addLogLine(logContainer, `Source: ${source} → Target: ${target}`, 'stdout');
+    }
+
+    const setHeaderState = (state, exitCode = null) => {
+        if (!logHeader) return;
+        if (state === 'completed') {
+            logHeader.className = 'flex items-center space-x-3 p-4 bg-success-50 border-2 border-success-200 rounded-xl text-success-800';
+            logHeader.innerHTML = `
+                <svg class="w-5 h-5 text-success-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <div>
+                    <strong>Edge comparison completed</strong>
+                    <span class="ml-2 px-2 py-1 bg-success-600 text-white text-xs font-semibold rounded-full">COMPLETED</span>
+                    ${exitCode !== null ? `<span class="ml-2 text-xs text-success-700">Exit code ${exitCode}</span>` : ''}
+                </div>
+            `;
+        } else if (state === 'failed') {
+            logHeader.className = 'flex items-center space-x-3 p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800';
+            logHeader.innerHTML = `
+                <svg class="w-5 h-5 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <div>
+                    <strong>Edge comparison failed</strong>
+                    <span class="ml-2 px-2 py-1 bg-error-600 text-white text-xs font-semibold rounded-full">FAILED</span>
+                    ${exitCode !== null ? `<span class="ml-2 text-xs text-error-700">Exit code ${exitCode}</span>` : ''}
+                </div>
+            `;
+        } else {
+            logHeader.className = 'flex items-center space-x-3 p-4 bg-primary-50 border-2 border-primary-200 rounded-xl text-primary-800';
+            logHeader.innerHTML = `
+                <svg class="w-5 h-5 text-primary-600 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+                <div>
+                    <strong>Edge comparison running...</strong>
+                    <span class="ml-2 px-2 py-1 bg-primary-600 text-white text-xs font-semibold rounded-full">RUNNING</span>
+                </div>
+            `;
+        }
+    };
+
+    let streamStatus = 'running';
+    let exitCode = null;
+    let comparisonPayload = null;
+
+    const consumeStream = () => new Promise((resolve, reject) => {
+        fetch(`${API_BASE}/api/edge-comparison`, {
             method: 'POST',
             headers: {
                 ...getAuthHeaders(),
@@ -1139,38 +1206,151 @@ async function performEdgeComparison(source, target, { auto = false } = {}) {
             },
             body: JSON.stringify({
                 sourceEnv: source,
-                targetEnv: target
+                targetEnv: target,
+                stream: true
             })
-        });
+        })
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
 
-        if (!response.ok) {
-            let errorMessage = 'Failed to generate edge comparison';
-            try {
-                const errorPayload = await response.json();
-                errorMessage = errorPayload?.error || errorMessage;
-            } catch (parseError) {
-                errorMessage = response.statusText || errorMessage;
-            }
-            throw new Error(errorMessage);
-        }
+                if (!response.body) {
+                    throw new Error('Streaming not supported in this browser');
+                }
 
-        const data = await response.json();
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+
+                const finalize = () => {
+                    if (logContainer) {
+                        logContainer.classList.remove('streaming');
+                    }
+                    if (streamStatus === 'completed') {
+                        if (comparisonPayload) {
+                            renderEdgeComparisonResult(comparisonPayload, summaryContainer);
+                            const timestamp = comparisonPayload.generatedAt ? `Generated ${formatDate(comparisonPayload.generatedAt)}` : 'Edge comparison completed.';
+                            setEdgeCompareStatus(timestamp, 'success');
+                        } else {
+                            summaryContainer.innerHTML = `
+                                <div class="glass-card bg-success-50 border border-success-200 text-success-800 p-6 animate-fade-in">
+                                    <p class="font-semibold">Edge comparison completed. No diff payload was generated.</p>
+                                </div>
+                            `;
+                            setEdgeCompareStatus('Edge comparison completed.', 'success');
+                        }
+                    } else {
+                        if (!summaryContainer.innerHTML) {
+                            summaryContainer.innerHTML = `
+                                <div class="glass-card bg-error-50 border border-error-200 text-error-700 p-6 animate-fade-in">
+                                    <p class="font-semibold">Edge comparison failed. Review the logs above for details.</p>
+                                </div>
+                            `;
+                        }
+                        if (streamStatus !== 'failed') {
+                            setEdgeCompareStatus('Edge comparison ended with issues. Check logs.', 'warning');
+                        }
+                    }
+
+                    setHeaderState(streamStatus, exitCode);
+                    resolve();
+                };
+
+                const processLine = (line) => {
+                    if (!line.startsWith('data: ')) return;
+                    try {
+                        const payload = JSON.parse(line.substring(6));
+                        if (payload.type === 'stdout' || payload.type === 'stderr') {
+                            if (!logContainer) return;
+                            const logLines = payload.data.split('\n');
+                            logLines.forEach(logLine => {
+                                if (logLine.trim()) {
+                                    addLogLine(logContainer, logLine, payload.type);
+                                }
+                            });
+                        } else if (payload.type === 'result') {
+                            comparisonPayload = payload.data;
+                        } else if (payload.type === 'error') {
+                            streamStatus = 'failed';
+                            if (payload.error) {
+                                addLogLine(logContainer, `ERROR: ${payload.error}`, 'stderr');
+                                setEdgeCompareStatus(payload.error, 'error');
+                            }
+                            if (Array.isArray(payload.logs)) {
+                                payload.logs.forEach(logLine => addLogLine(logContainer, logLine, 'stderr'));
+                            } else if (payload.logs) {
+                                addLogLine(logContainer, payload.logs, 'stderr');
+                            }
+                        } else if (payload.type === 'complete') {
+                            streamStatus = payload.status || 'completed';
+                            exitCode = payload.exitCode ?? null;
+                        }
+                    } catch (parseError) {
+                        // Ignore malformed SSE payloads
+                    }
+                };
+
+                const readStream = () => {
+                    reader.read().then(({ done, value }) => {
+                        if (done) {
+                            if (buffer.trim()) {
+                                processLine(buffer.trim());
+                            }
+                            finalize();
+                            return;
+                        }
+
+                        buffer += decoder.decode(value, { stream: true });
+                        const lines = buffer.split('\n');
+                        buffer = lines.pop() || '';
+                        lines.forEach(line => {
+                            if (line.trim()) {
+                                processLine(line.trim());
+                            }
+                        });
+                        readStream();
+                    }).catch((error) => {
+                        streamStatus = 'failed';
+                        addLogLine(logContainer, `Stream error: ${error.message}`, 'stderr');
+                        setEdgeCompareStatus(error.message, 'error');
+                        finalize();
+                    });
+                };
+
+                readStream();
+        })
+            .catch(error => {
+                streamStatus = 'failed';
+                setEdgeCompareStatus(error.message || 'Failed to run edge comparison', 'error');
+                if (logContainer) {
+                    addLogLine(logContainer, `ERROR: ${error.message}`, 'stderr');
+                    logContainer.classList.remove('streaming');
+                }
+                setHeaderState('failed');
+                resolve();
+            });
+    });
+
+    try {
+        await consumeStream();
         lastEdgeComparison = { source, target };
-        renderEdgeComparisonResult(data);
-        setEdgeCompareStatus(data.generatedAt ? `Generated ${formatDate(data.generatedAt)}` : 'Edge comparison completed.', 'success');
-
-        // Refresh plans list to surface new report
-        setTimeout(loadPlans, 1000);
+        if (streamStatus === 'completed') {
+            setTimeout(loadPlans, 1000);
+        }
     } catch (error) {
         console.error('Edge comparison error:', error);
         const message = error?.message || 'Failed to run edge comparison';
-        resultContainer.innerHTML = `
-            <div class="glass-card bg-error-50 border border-error-200 text-error-700 p-6 animate-fade-in">
-                <p class="font-semibold">${escapeHtml(message)}</p>
-                <p class="text-sm mt-1">Check server logs for more details.</p>
-            </div>
-        `;
+        if (summaryContainer && !summaryContainer.innerHTML) {
+            summaryContainer.innerHTML = `
+                <div class="glass-card bg-error-50 border border-error-200 text-error-700 p-6 animate-fade-in">
+                    <p class="font-semibold">${escapeHtml(message)}</p>
+                    <p class="text-sm mt-1">Check server logs for more details.</p>
+                </div>
+            `;
+        }
         setEdgeCompareStatus(message, 'error');
+        setHeaderState('failed', exitCode);
     } finally {
         hideLoading('edgeCompareLoading');
         edgeComparisonInFlight = false;
@@ -1206,13 +1386,77 @@ async function generateAllEnvsSnapshot() {
     const snapshotLoading = document.getElementById('snapshotLoading');
     const comparisonTable = document.getElementById('comparisonTable');
     const snapshotTimestamp = document.getElementById('snapshotTimestamp');
+    const snapshotLogWrapper = document.getElementById('snapshotLog');
+    const snapshotLogHeader = document.getElementById('snapshotLogHeader');
+    const snapshotLogStream = document.getElementById('snapshotLogStream');
     
     if (!snapshotResults || !snapshotLoading || !comparisonTable) return;
+    
+    const setSnapshotLogState = (state, exitCode = null) => {
+        if (!snapshotLogHeader) return;
+        if (state === 'completed') {
+            snapshotLogHeader.className = 'flex items-center space-x-3 p-4 bg-success-50 border-2 border-success-200 rounded-xl text-success-800';
+            snapshotLogHeader.innerHTML = `
+                <svg class="w-5 h-5 text-success-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <div>
+                    <strong>Snapshot completed</strong>
+                    <span class="ml-2 px-2 py-1 bg-success-600 text-white text-xs font-semibold rounded-full">COMPLETED</span>
+                    ${exitCode !== null ? `<span class="ml-2 text-xs text-success-700">Exit code ${exitCode}</span>` : ''}
+                </div>
+            `;
+        } else if (state === 'failed') {
+            snapshotLogHeader.className = 'flex items-center space-x-3 p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800';
+            snapshotLogHeader.innerHTML = `
+                <svg class="w-5 h-5 text-error-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                </svg>
+                <div>
+                    <strong>Snapshot failed</strong>
+                    <span class="ml-2 px-2 py-1 bg-error-600 text-white text-xs font-semibold rounded-full">FAILED</span>
+                    ${exitCode !== null ? `<span class="ml-2 text-xs text-error-700">Exit code ${exitCode}</span>` : ''}
+                </div>
+            `;
+        } else {
+            snapshotLogHeader.className = 'flex items-center space-x-3 p-4 bg-primary-50 border-2 border-primary-200 rounded-xl text-primary-800';
+            snapshotLogHeader.innerHTML = `
+                <svg class="w-5 h-5 text-primary-600 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
+                </svg>
+                <div>
+                    <strong>Generating snapshot...</strong>
+                    <span class="ml-2 px-2 py-1 bg-primary-600 text-white text-xs font-semibold rounded-full">RUNNING</span>
+                </div>
+            `;
+        }
+    };
+    
+    const resetSnapshotLog = () => {
+        if (!snapshotLogWrapper || !snapshotLogStream) return;
+        snapshotLogWrapper.classList.remove('hidden');
+        snapshotLogStream.innerHTML = '<div class="text-slate-400 text-xs mb-2">Live snapshot logs will appear here...</div>';
+        snapshotLogStream.classList.add('streaming');
+        setSnapshotLogState('running');
+    };
+    
+    const appendSnapshotLog = (rawText, type = 'stdout') => {
+        if (!snapshotLogStream) return;
+        const cleaned = rawText.replace(/\u001b\[[0-9;]*m/g, '');
+        cleaned.split('\n').forEach(line => {
+            if (line.trim()) {
+                addLogLine(snapshotLogStream, line, type);
+            }
+        });
+        snapshotLogStream.scrollTop = snapshotLogStream.scrollHeight;
+    };
     
     // Show loading, hide results
     snapshotLoading.classList.remove('hidden');
     snapshotResults.classList.add('hidden');
     comparisonTable.innerHTML = '';
+    resetSnapshotLog();
+    appendSnapshotLog('Starting environment snapshot generation...', 'stdout');
     
     try {
         const response = await fetch(`${API_BASE}/api/all-envs-snapshot`, {
@@ -1234,6 +1478,8 @@ async function generateAllEnvsSnapshot() {
         const decoder = new TextDecoder();
         let buffer = '';
         let snapshotData = null;
+        let streamStatus = 'running';
+        let exitCode = null;
         
         while (true) {
             const { done, value } = await reader.read();
@@ -1248,11 +1494,28 @@ async function generateAllEnvsSnapshot() {
                     try {
                         const data = JSON.parse(line.slice(6));
                         
+                        if ((data.type === 'stdout' || data.type === 'stderr') && data.data) {
+                            appendSnapshotLog(data.data, data.type);
+                            continue;
+                        }
+                        
                         if (data.type === 'snapshot') {
                             snapshotData = data.data;
                         } else if (data.type === 'complete') {
+                            streamStatus = data.status || 'completed';
+                            exitCode = data.exitCode ?? null;
+
                             // Processing complete
                             snapshotLoading.classList.add('hidden');
+                            if (snapshotLogStream) {
+                                snapshotLogStream.classList.remove('streaming');
+                            }
+                            setSnapshotLogState(streamStatus, exitCode);
+                            if (streamStatus === 'completed') {
+                                appendSnapshotLog('Snapshot generation completed successfully.', 'stdout');
+                            } else {
+                                appendSnapshotLog('Snapshot process ended with issues. Review logs above.', 'stderr');
+                            }
                             
                             if (snapshotData) {
                                 displaySnapshotComparison(snapshotData);
@@ -1269,6 +1532,14 @@ async function generateAllEnvsSnapshot() {
                                 snapshotResults.classList.remove('hidden');
                             }
                         } else if (data.type === 'error') {
+                            streamStatus = 'failed';
+                            if (snapshotLogStream) {
+                                snapshotLogStream.classList.remove('streaming');
+                            }
+                            setSnapshotLogState('failed');
+                            if (data.error) {
+                                appendSnapshotLog(`ERROR: ${data.error}`, 'stderr');
+                            }
                             snapshotLoading.classList.add('hidden');
                             comparisonTable.innerHTML = `
                                 <div class="p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800">
@@ -1286,6 +1557,11 @@ async function generateAllEnvsSnapshot() {
     } catch (error) {
         console.error('Error generating snapshot:', error);
         snapshotLoading.classList.add('hidden');
+        if (snapshotLogStream) {
+            snapshotLogStream.classList.remove('streaming');
+            appendSnapshotLog(`ERROR: ${error.message}`, 'stderr');
+        }
+        setSnapshotLogState('failed');
         comparisonTable.innerHTML = `
             <div class="p-4 bg-error-50 border-2 border-error-200 rounded-xl text-error-800">
                 <p class="font-semibold">Error: ${escapeHtml(error.message)}</p>
@@ -1309,17 +1585,55 @@ function displaySnapshotComparison(snapshotData) {
     
     // Extract environment data
     const envs = snapshotData.environments || {};
-    const dev = envs.dev || {};
-    const test = envs.test || {};
-    const prod = envs.prod || {};
-    
-    const devCounts = dev.counts || {};
-    const testCounts = test.counts || {};
-    const prodCounts = prod.counts || {};
+    const envOrder = ['dev', 'test', 'prod', 'backup'];
+    const envDisplay = {
+        dev: { label: 'Development', short: 'Dev', icon: '🟢', iconClass: 'text-success-600' },
+        test: { label: 'Test/Staging', short: 'Test', icon: '🟡', iconClass: 'text-warning-600' },
+        prod: { label: 'Production', short: 'Prod', icon: '🔴', iconClass: 'text-error-600' },
+        backup: { label: 'Backup', short: 'Backup', icon: '🔵', iconClass: 'text-primary-600' }
+    };
+
+    const sanitizeValue = (value) => (value && value !== 'N/A' ? value : '');
+
+    const envColumns = envOrder.map((key) => {
+        const base = envDisplay[key] || { label: key.toUpperCase(), short: key.toUpperCase(), icon: '⚪️', iconClass: 'text-neutral-400' };
+        const data = envs[key] || {};
+        const counts = data.counts || {};
+        const tableRows = Array.isArray(data.tableRows) ? data.tableRows : [];
+        const storageBucketObjects = Array.isArray(data.storageBucketObjects) ? data.storageBucketObjects : [];
+
+        const projectName = sanitizeValue(data.projectName);
+        const projectRef = sanitizeValue(data.projectRef);
+        const envData = {
+            ...data,
+            name: data.name || base.label,
+            projectName: projectName || projectRef || 'N/A',
+            projectRef
+        };
+
+        return {
+            key,
+            displayLabel: base.label,
+            shortLabel: base.short,
+            icon: base.icon,
+            iconClass: base.iconClass,
+            counts,
+            tableRows,
+            storageBucketObjects,
+            envData
+        };
+    });
+
+    const formatNumber = (value) => {
+        if (typeof value === 'number' && Number.isFinite(value)) return value.toLocaleString();
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numeric.toLocaleString() : (value ?? '0');
+    };
     
     // Define comparison rows
     const rows = [
         { label: 'Tables', key: 'tables' },
+        { label: 'Total Table Rows', key: 'totalRows' },
         { label: 'Views', key: 'views' },
         { label: 'Functions', key: 'functions' },
         { label: 'Sequences', key: 'sequences' },
@@ -1331,6 +1645,7 @@ function displaySnapshotComparison(snapshotData) {
         { label: 'Auth Users', key: 'authUsers' },
         { label: 'Edge Functions', key: 'edgeFunctions' },
         { label: 'Storage Buckets', key: 'buckets' },
+        { label: 'Storage Objects', key: 'storageObjects' },
         { label: 'Secrets', key: 'secrets' }
     ];
     
@@ -1341,54 +1656,52 @@ function displaySnapshotComparison(snapshotData) {
                 <thead class="bg-neutral-50">
                     <tr>
                         <th class="px-6 py-3 text-left text-xs font-semibold text-neutral-700 uppercase tracking-wider">Object Type</th>
-                        <th class="px-6 py-3 text-center text-xs font-semibold text-neutral-700 uppercase tracking-wider">
-                            <div class="flex items-center justify-center space-x-2">
-                                <span class="text-success-600">🟢</span>
-                                <span>${escapeHtml(dev.name || 'Dev')}</span>
-                            </div>
-                            <div class="text-xs font-normal text-neutral-500 mt-1">${escapeHtml(dev.projectName || dev.projectRef || 'N/A')}</div>
-                        </th>
-                        <th class="px-6 py-3 text-center text-xs font-semibold text-neutral-700 uppercase tracking-wider">
-                            <div class="flex items-center justify-center space-x-2">
-                                <span class="text-warning-600">🟡</span>
-                                <span>${escapeHtml(test.name || 'Test')}</span>
-                            </div>
-                            <div class="text-xs font-normal text-neutral-500 mt-1">${escapeHtml(test.projectName || test.projectRef || 'N/A')}</div>
-                        </th>
-                        <th class="px-6 py-3 text-center text-xs font-semibold text-neutral-700 uppercase tracking-wider">
-                            <div class="flex items-center justify-center space-x-2">
-                                <span class="text-error-600">🔴</span>
-                                <span>${escapeHtml(prod.name || 'Prod')}</span>
-                            </div>
-                            <div class="text-xs font-normal text-neutral-500 mt-1">${escapeHtml(prod.projectName || prod.projectRef || 'N/A')}</div>
-                        </th>
+                        ${envColumns.map(col => `
+                            <th class="px-6 py-3 text-center text-xs font-semibold text-neutral-700 uppercase tracking-wider">
+                                <div class="flex items-center justify-center space-x-2">
+                                    <span class="${col.iconClass}">${col.icon}</span>
+                                    <span>${escapeHtml(col.envData.name || col.displayLabel)}</span>
+                                </div>
+                                <div class="text-xs font-normal text-neutral-500 mt-1">${escapeHtml(col.envData.projectName || col.envData.projectRef || 'N/A')}</div>
+                            </th>
+                        `).join('')}
                     </tr>
                 </thead>
                 <tbody class="bg-white divide-y divide-neutral-200">
     `;
     
     rows.forEach(row => {
-        const devVal = devCounts[row.key] || 0;
-        const testVal = testCounts[row.key] || 0;
-        const prodVal = prodCounts[row.key] || 0;
+        const values = envColumns.map(col => {
+            const raw = col.counts?.[row.key];
+            if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
+            const numeric = Number(raw);
+            return Number.isFinite(numeric) ? numeric : 0;
+        });
         
-        // Determine if values differ
-        const allSame = devVal === testVal && testVal === prodVal;
+        const allSame = values.every((val, idx, arr) => idx === 0 || val === arr[0]);
         const rowClass = allSame ? '' : 'bg-warning-50';
         
         // Highlight differences
-        const getCellClass = (val, otherVal1, otherVal2) => {
-            if (val === otherVal1 && val === otherVal2) return '';
-            if (val === 0) return 'text-neutral-400';
-            return 'font-semibold text-primary-700';
+        const getCellClass = (val, idx) => {
+            const othersMatch = values.every((other, otherIdx) => otherIdx === idx || other === val);
+            const classes = [];
+            if (!othersMatch) {
+                classes.push('font-semibold', 'text-primary-700');
+            }
+            if (!val || Number(val) === 0) {
+                const filtered = classes.filter(cls => !cls.startsWith('text-'));
+                filtered.push('text-neutral-400');
+                return filtered.join(' ');
+            }
+            return classes.join(' ');
         };
         
         tableHTML += `
             <tr class="${rowClass} hover:bg-neutral-50">
                 <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-neutral-900">${escapeHtml(row.label)}</td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-center ${getCellClass(devVal, testVal, prodVal)}">${devVal}</td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-center ${getCellClass(testVal, devVal, prodVal)}">${testVal}</td>
-                <td class="px-6 py-4 whitespace-nowrap text-sm text-center ${getCellClass(prodVal, devVal, testVal)}">${prodVal}</td>
+                ${values.map((val, idx) => `
+                    <td class="px-6 py-4 whitespace-nowrap text-sm text-center ${getCellClass(val, idx)}">${formatNumber(val)}</td>
+                `).join('')}
             </tr>
         `;
     });
@@ -1399,7 +1712,98 @@ function displaySnapshotComparison(snapshotData) {
         </div>
     `;
     
-    comparisonTable.innerHTML = tableHTML;
+    const renderMetricCard = (envData, items, title, valueFormatter, emptyMessage) => {
+        const displayName = escapeHtml(envData.name || 'Environment');
+        const projectInfo = escapeHtml(envData.projectName || envData.projectRef || 'N/A');
+        if (!items.length) {
+            return `
+                <div class="border border-neutral-200 rounded-xl bg-white p-4 shadow-sm">
+                    <div class="flex items-center justify-between mb-3">
+                        <div>
+                            <p class="text-sm font-semibold text-primary-800">${title}</p>
+                            <p class="text-xs text-neutral-500">${projectInfo}</p>
+                        </div>
+                        <span class="text-xs text-neutral-400 uppercase tracking-wide">${displayName}</span>
+                    </div>
+                    <p class="text-sm text-neutral-500">${emptyMessage}</p>
+                </div>
+            `;
+        }
+
+        const listItems = items
+            .slice()
+            .sort((a, b) => (b.rows ?? b.objects ?? 0) - (a.rows ?? a.objects ?? 0))
+            .map(item => valueFormatter(item))
+            .join('');
+
+        return `
+            <div class="border border-neutral-200 rounded-xl bg-white p-4 shadow-sm">
+                <div class="flex items-center justify-between mb-3">
+                    <div>
+                        <p class="text-sm font-semibold text-primary-800">${title}</p>
+                        <p class="text-xs text-neutral-500">${projectInfo}</p>
+                    </div>
+                    <span class="text-xs text-neutral-400 uppercase tracking-wide">${displayName}</span>
+                </div>
+                <div class="space-y-2 max-h-64 overflow-y-auto custom-scrollbar pr-2">
+                    ${listItems}
+                </div>
+            </div>
+        `;
+    };
+
+    const renderTableRowItem = ({ schema, table, rows }) => `
+        <div class="flex items-center justify-between rounded-lg bg-neutral-50 px-3 py-2 text-sm">
+            <span class="font-medium text-neutral-700">${escapeHtml([schema, table].filter(Boolean).join('.'))}</span>
+            <span class="text-primary-700 font-semibold">${formatNumber(rows)}</span>
+        </div>
+    `;
+
+    const renderStorageObjectItem = ({ bucket, objects }) => `
+        <div class="flex items-center justify-between rounded-lg bg-neutral-50 px-3 py-2 text-sm">
+            <span class="font-medium text-neutral-700">${escapeHtml(bucket || 'Default')}</span>
+            <span class="text-primary-700 font-semibold">${formatNumber(objects)}</span>
+        </div>
+    `;
+
+    const tableCards = envColumns.map(col =>
+        renderMetricCard(
+            col.envData,
+            col.tableRows,
+            col.displayLabel,
+            renderTableRowItem,
+            'No table data available'
+        )
+    ).join('');
+
+    const storageCards = envColumns.map(col =>
+        renderMetricCard(
+            col.envData,
+            col.storageBucketObjects,
+            col.displayLabel,
+            renderStorageObjectItem,
+            'No storage objects found'
+        )
+    ).join('');
+
+    const detailSections = `
+        <div class="mt-8 space-y-8">
+            <div>
+                <h4 class="text-base font-semibold text-primary-900 mb-3">Table Row Breakdown</h4>
+                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                    ${tableCards}
+                </div>
+            </div>
+            <div>
+                <h4 class="text-base font-semibold text-primary-900 mb-3">Storage Objects per Bucket</h4>
+                <div class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+                    ${storageCards}
+                </div>
+            </div>
+        </div>
+    `;
+    
+    comparisonTable.innerHTML = tableHTML + detailSections;
 }
 
 // Helper function to stream logs via SSE

@@ -38,6 +38,8 @@ if [ "$SOURCE_ENV" = "$TARGET_ENV" ]; then
     exit 1
 fi
 
+log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
+
 if ! command -v node >/dev/null 2>&1; then
     log_error "Node.js is required to compare edge functions"
     exit 1
