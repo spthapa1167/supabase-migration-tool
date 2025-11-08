@@ -902,8 +902,6 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
         rm -f "$restore_log"
     done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
     
-    rm -f "$DATA_RESTORE_OUTPUT"
-    
     if [ "$DATA_RESTORE_SUCCESS" = "true" ]; then
         log_success "Source data restored successfully."
     else

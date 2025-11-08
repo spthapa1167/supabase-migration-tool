@@ -209,6 +209,8 @@ secrets_to_migrate=""
 skipped_count=0
 migrated_count=0
 failed_count=0
+restricted_count=0
+restricted_secrets=""
 
 log_info ""
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -236,6 +238,14 @@ for secret_name in $source_secret_names; do
     
     # Secret needs to be migrated
     log_info "  Secret: $secret_name"
+    
+    if [[ "$secret_name" == SUPABASE_* ]]; then
+        log_warning "    ⚠ Skipping Supabase-managed secret (prefix SUPABASE_ is restricted)"
+        restricted_count=$((restricted_count + 1))
+        restricted_secrets="${restricted_secrets}${secret_name}"$'\n'
+        echo ""
+        continue
+    fi
     
     # Default: migrate keys only with blank values
     # Note: Secret values cannot be retrieved via API/CLI for security reasons
@@ -313,6 +323,11 @@ removed_failed_count=0
 for target_secret_name in $target_secret_names; do
     target_secret_name=$(echo "$target_secret_name" | xargs)
     [ -z "$target_secret_name" ] && continue
+
+    if [[ "$target_secret_name" == SUPABASE_* ]]; then
+        log_warning "  ⚠ Skipping removal of Supabase-managed secret: $target_secret_name"
+        continue
+    fi
     
     # Check if this secret exists in source
     exists_in_source=false
@@ -375,6 +390,21 @@ cat > "$summary_file" << EOF
 - **Failed**: $failed_count secret(s)
 - **Removed**: $removed_count secret(s) (removed from target - not in source)
 - **Removal Failed**: $removed_failed_count secret(s)
+
+EOF
+
+if [ $restricted_count -gt 0 ]; then
+    cat >> "$summary_file" << EOF
+- **Reserved Skipped**: $restricted_count secret(s) (Supabase-managed prefix SUPABASE_)
+
+## Reserved Supabase Secrets (Skipped - manage manually)
+
+$(printf '%s' "$restricted_secrets" | sed '/^$/d' | sed 's/^/- /')
+
+EOF
+fi
+
+cat >> "$summary_file" << EOF
 
 ## Migrated Secrets
 
@@ -446,6 +476,9 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 log_info ""
 log_success "Migrated: $migrated_count secret(s)"
 log_info "Skipped: $skipped_count secret(s) (already exist in target)"
+if [ $restricted_count -gt 0 ]; then
+    log_warning "Reserved (SUPABASE_*) skipped: $restricted_count secret(s) - manage manually"
+fi
 if [ $failed_count -gt 0 ]; then
     log_error "Failed: $failed_count secret(s)"
 fi

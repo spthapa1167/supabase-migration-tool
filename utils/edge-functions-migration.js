@@ -328,15 +328,29 @@ function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword)
                     timeout: 60000
                 });
             } catch (e) {
-                // If regular download fails, try legacy bundle (for functions deployed with older CLI)
-                if (e.message && (e.message.includes('Docker') || e.message.includes('docker'))) {
+                const stderr = e.stderr ? e.stderr.toString() : '';
+                const stdout = e.stdout ? e.stdout.toString() : '';
+                const combinedOutput = `${e.message || ''}\n${stderr}\n${stdout}`;
+                const needsLegacyBundle = /docker/i.test(combinedOutput) ||
+                    /legacy[- ]bundle/i.test(combinedOutput) ||
+                    /invalid eszip/i.test(combinedOutput) ||
+                    /eszip v2/i.test(combinedOutput);
+                
+                if (needsLegacyBundle) {
                     logInfo(`    Regular download failed, trying legacy bundle...`);
-                    execSync(`supabase functions download --legacy-bundle ${functionName}`, {
-                        stdio: 'pipe',
-                        timeout: 60000
-                    });
+                    try {
+                        execSync(`supabase functions download --legacy-bundle ${functionName}`, {
+                            stdio: 'pipe',
+                            timeout: 60000
+                        });
+                    } catch (legacyError) {
+                        const legacyStderr = legacyError.stderr ? legacyError.stderr.toString() : '';
+                        const legacyStdout = legacyError.stdout ? legacyError.stdout.toString() : '';
+                        const legacyCombined = `${legacyError.message || ''}\n${legacyStderr}\n${legacyStdout}`;
+                        throw new Error(`Regular and legacy download attempts failed.\nOriginal error:\n${combinedOutput}\nLegacy attempt error:\n${legacyCombined}`);
+                    }
                 } else {
-                    throw e;
+                    throw new Error(combinedOutput.trim() || e.message);
                 }
             }
         } catch (e) {
