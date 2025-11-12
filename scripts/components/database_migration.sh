@@ -335,14 +335,20 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
         
         # Capture target state as SQL for manual rollback
         log_info "Creating rollback SQL script..."
+        local rollback_mode="schema"
         if [ "$INCLUDE_DATA" = "true" ]; then
-            if capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "full"; then
-                log_success "Rollback SQL script created: $MIGRATION_DIR/rollback_db.sql"
+            rollback_mode="full"
+        fi
+        if ! capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "$rollback_mode"; then
+            if [ "$rollback_mode" = "full" ]; then
+                log_warning "Full rollback capture failed, attempting schema-only fallback..."
+                capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "schema" || \
+                    log_warning "Schema-only rollback capture also failed."
+            else
+                log_warning "Schema-only rollback capture failed."
             fi
         else
-            if capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "schema"; then
-                log_success "Rollback SQL script created: $MIGRATION_DIR/rollback_db.sql"
-            fi
+            log_success "Rollback SQL script created: $MIGRATION_DIR/rollback_db.sql"
         fi
         
         supabase unlink --yes 2>/dev/null || true
