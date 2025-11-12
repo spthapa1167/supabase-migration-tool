@@ -9,8 +9,11 @@
 
 const https = require('https');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execSync } = require('child_process');
+const { createManagementClient } = require('./lib/edgeFunctionsClient');
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 // ANSI color codes for console output
 const colors = {
@@ -86,6 +89,16 @@ function loadEnvFile() {
 
 // Load environment variables
 loadEnvFile();
+
+let managementClient = null;
+try {
+    if (process.env.SUPABASE_ACCESS_TOKEN) {
+        managementClient = createManagementClient(process.env.SUPABASE_ACCESS_TOKEN);
+    }
+} catch (clientError) {
+    logWarning(`Unable to initialize Management API client: ${clientError.message}`);
+    managementClient = null;
+}
 
 // Configuration from arguments
 const SOURCE_REF = process.argv[2];
@@ -278,50 +291,117 @@ function linkProject(projectRef, dbPassword) {
     }
 }
 
-// Download edge function code using Supabase CLI
-function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword) {
+// Download edge function code (Management API preferred, CLI fallback)
+function findFunctionDirectory(rootDir, functionName) {
+    if (!rootDir || !fs.existsSync(rootDir)) {
+        return null;
+    }
+
+    const candidates = [
+        path.join(rootDir, 'supabase', 'functions', functionName),
+        path.join(rootDir, functionName),
+        rootDir
+    ];
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate) && fs.lstatSync(candidate).isDirectory()) {
+            const contents = fs.readdirSync(candidate);
+            if (contents.length > 0) {
+                return candidate;
+            }
+        }
+    }
+
+    const queue = [rootDir];
+    const visited = new Set();
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || visited.has(current)) continue;
+        visited.add(current);
+
+        let entries = [];
+        try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+
+        const hasEntryPoint = entries.some((entry) => {
+            if (!entry.isFile()) return false;
+            const lower = entry.name.toLowerCase();
+            return lower === 'index.ts' ||
+                lower === 'index.js' ||
+                lower === 'main.ts' ||
+                lower === 'main.js' ||
+                lower === 'deno.json';
+        });
+
+        if (hasEntryPoint) {
+            return current;
+        }
+
+        for (const entry of entries) {
+            if (entry.isDirectory()) {
+                queue.push(path.join(current, entry.name));
+            }
+        }
+    }
+
+    return null;
+}
+
+async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword) {
+    let finalFunctionPath = path.join(downloadDir, functionName);
     try {
         logInfo(`    Downloading function code: ${functionName}...`);
-        
-        // Check if Docker is running (required for function download)
+
+        if (managementClient) {
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                const apiTempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-api-${functionName}-${attempt}-`));
+                try {
+                    logInfo(`    Attempting Management API bundle download (attempt ${attempt}/${maxAttempts})...`);
+                    await managementClient.downloadFunctionCode(projectRef, functionName, apiTempDir);
+                    const apiFunctionDir = findFunctionDirectory(apiTempDir, functionName);
+                    if (apiFunctionDir) {
+                        fs.rmSync(finalFunctionPath, { recursive: true, force: true });
+                        fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
+                        fs.cpSync(apiFunctionDir, finalFunctionPath, { recursive: true });
+                        logSuccess(`    ✓ Downloaded function via Management API: ${functionName}`);
+                        fs.rmSync(apiTempDir, { recursive: true, force: true });
+                        return true;
+                    }
+                    logWarning(`    Management API download succeeded but function files were not located; retrying...`);
+                } catch (apiError) {
+                    logWarning(`    Management API download attempt ${attempt}/${maxAttempts} failed (${apiError.message})`);
+                } finally {
+                    fs.rmSync(apiTempDir, { recursive: true, force: true });
+                }
+            }
+            logWarning(`    Management API download failed after retries; falling back to CLI options`);
+        }
+
         if (!checkDocker()) {
-            logError(`    ✗ Docker is not running - required for downloading functions`);
-            logError(`    Please start Docker Desktop and try again`);
+            logError(`    ✗ Docker is not running - required for downloading functions via CLI`);
             throw new Error('Docker is not running');
         }
-        
-        // Create temporary directory for download
-        const tempDir = path.join(downloadDir, '.temp');
-        if (!fs.existsSync(tempDir)) {
-            fs.mkdirSync(tempDir, { recursive: true });
-        }
-        
-        // Create supabase functions directory structure
-        const functionsDir = path.join(tempDir, 'supabase', 'functions');
-        if (!fs.existsSync(functionsDir)) {
-            fs.mkdirSync(functionsDir, { recursive: true });
-        }
-        
-        // Create a minimal config.toml for supabase link
-        const configTomlPath = path.join(tempDir, 'supabase', 'config.toml');
-        if (!fs.existsSync(path.dirname(configTomlPath))) {
-            fs.mkdirSync(path.dirname(configTomlPath), { recursive: true });
-        }
-        fs.writeFileSync(configTomlPath, `project_id = "${projectRef}"\n`);
-        
-        // Change to temp directory and link
+
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-cli-${functionName}-`));
         const originalCwd = process.cwd();
-        process.chdir(tempDir);
-        
         try {
-            // Link to project (in temp directory)
-            logInfo(`    Linking to source project...`);
+            const supabaseDir = path.join(tempDir, 'supabase');
+            const functionsDir = path.join(supabaseDir, 'functions');
+            fs.mkdirSync(functionsDir, { recursive: true });
+            fs.writeFileSync(path.join(supabaseDir, 'config.toml'), `project_id = "${projectRef}"\n`);
+
+            process.chdir(tempDir);
+
+            logInfo(`    Linking to source project for CLI download...`);
             if (!linkProject(projectRef, dbPassword)) {
                 throw new Error('Failed to link to project');
             }
-            
-            // Download function (project is now linked)
-            // Try regular download first, then legacy bundle if that fails
+
             try {
                 execSync(`supabase functions download ${functionName}`, {
                     stdio: 'pipe',
@@ -335,7 +415,7 @@ function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword)
                     /legacy[- ]bundle/i.test(combinedOutput) ||
                     /invalid eszip/i.test(combinedOutput) ||
                     /eszip v2/i.test(combinedOutput);
-                
+
                 if (needsLegacyBundle) {
                     logInfo(`    Regular download failed, trying legacy bundle...`);
                     try {
@@ -353,33 +433,34 @@ function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword)
                     throw new Error(combinedOutput.trim() || e.message);
                 }
             }
-        } catch (e) {
-            process.chdir(originalCwd);
-            throw new Error(`Failed to download function: ${e.message}`);
+
+            const downloadedFunctionPath = findFunctionDirectory(tempDir, functionName) ||
+                path.join(tempDir, 'supabase', 'functions', functionName);
+
+            if (!downloadedFunctionPath || !fs.existsSync(downloadedFunctionPath)) {
+                throw new Error(`Downloaded function directory not found`);
+            }
+
+            fs.rmSync(finalFunctionPath, { recursive: true, force: true });
+            fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
+            fs.cpSync(downloadedFunctionPath, finalFunctionPath, { recursive: true });
+
+            logSuccess(`    ✓ Downloaded function via CLI: ${functionName}`);
+            return true;
         } finally {
             process.chdir(originalCwd);
-        }
-        
-        // Check if download was successful
-        const downloadedFunctionPath = path.join(functionsDir, functionName);
-        if (fs.existsSync(downloadedFunctionPath)) {
-            // Move to final location
-            const finalFunctionPath = path.join(downloadDir, functionName);
-            if (fs.existsSync(finalFunctionPath)) {
-                fs.rmSync(finalFunctionPath, { recursive: true, force: true });
-            }
-            fs.renameSync(downloadedFunctionPath, finalFunctionPath);
-            
-            // Cleanup temp directory
             fs.rmSync(tempDir, { recursive: true, force: true });
-            
-            logSuccess(`    ✓ Downloaded function: ${functionName}`);
-            return true;
-        } else {
-            fs.rmSync(tempDir, { recursive: true, force: true });
-            throw new Error(`Downloaded function directory not found`);
         }
     } catch (error) {
+        const fallbackDir = path.join(PROJECT_ROOT, 'supabase', 'functions', functionName);
+        if (fs.existsSync(fallbackDir)) {
+            logWarning(`    Using local repository copy for ${functionName} (remote download failed)`);
+            fs.rmSync(finalFunctionPath, { recursive: true, force: true });
+            fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
+            fs.cpSync(fallbackDir, finalFunctionPath, { recursive: true });
+            logSuccess(`    ✓ Copied local function source for ${functionName}`);
+            return true;
+        }
         logError(`    ✗ Failed to download function ${functionName}: ${error.message}`);
         return false;
     }
@@ -578,7 +659,7 @@ async function migrateEdgeFunctions() {
             
             // Download function from source
             const functionDir = path.join(functionsDir, functionName);
-            const downloadSuccess = downloadEdgeFunction(functionName, SOURCE_REF, functionsDir, sourceConfig.dbPassword);
+            const downloadSuccess = await downloadEdgeFunction(functionName, SOURCE_REF, functionsDir, sourceConfig.dbPassword);
             
             if (!downloadSuccess) {
                 logWarning(`  ⚠ Could not download function code - skipping deployment`);

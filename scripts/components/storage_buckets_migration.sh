@@ -29,6 +29,7 @@ Migrates storage buckets (configuration + files) from source to target using del
 Default Behavior:
   By default, migrates BUCKET CONFIGURATION ONLY (no files).
   Use --file or --files flag to include file migration.
+  Use --increment to explicitly request incremental/delta mode (default behaviour).
 
 Arguments:
   source_env     Source environment (prod, test, dev, backup)
@@ -37,6 +38,7 @@ Arguments:
   --file, --files  Include file migration (migrates buckets + files)
   --include-files  Include file migration (same as --file/--files)
   --exclude-files  Exclude file migration (default, migrates bucket config only)
+  --increment      Prefer incremental/delta operations (default: enabled)
 
 Examples:
   $0 dev test                          # Migrate buckets only (default - no files)
@@ -59,6 +61,7 @@ fi
 
 # Default: bucket configuration only (no files)
 INCLUDE_FILES="false"
+INCREMENTAL_MODE="false"
 
 # Parse arguments for flags
 for arg in "$@"; do
@@ -72,6 +75,9 @@ for arg in "$@"; do
         --exclude-files)
             INCLUDE_FILES="false"
             ;;
+        --increment|--incremental)
+            INCREMENTAL_MODE="true"
+            ;;
     esac
 done
 
@@ -83,6 +89,9 @@ if [ -n "$MIGRATION_DIR" ]; then
     elif [ "$MIGRATION_DIR" = "--exclude-files" ]; then
         INCLUDE_FILES="false"
         MIGRATION_DIR=""
+    elif [ "$MIGRATION_DIR" = "--increment" ] || [ "$MIGRATION_DIR" = "--incremental" ]; then
+        INCREMENTAL_MODE="true"
+        MIGRATION_DIR=""
     fi
 fi
 
@@ -92,6 +101,8 @@ if [ -n "${4:-}" ]; then
         INCLUDE_FILES="true"
     elif [ "$4" = "--exclude-files" ]; then
         INCLUDE_FILES="false"
+    elif [ "$4" = "--increment" ] || [ "$4" = "--incremental" ]; then
+        INCREMENTAL_MODE="true"
     fi
 fi
 
@@ -129,6 +140,7 @@ log_info "🗄️  Storage Buckets Migration"
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR"
+log_info "Incremental mode: $INCREMENTAL_MODE (storage migration utility performs delta syncs by default)"
 echo ""
 
 # Check for Node.js and storage migration utility

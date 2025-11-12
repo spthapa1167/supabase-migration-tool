@@ -19,6 +19,15 @@ source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 SOURCE_ENV=${1:-}
 TARGET_ENV=${2:-}
 MIGRATION_DIR=${3:-""}
+INCREMENTAL_MODE="false"
+# Parse optional flags (beyond the first three positionals)
+for arg in "$@"; do
+    case "$arg" in
+        --increment|--incremental)
+            INCREMENTAL_MODE="true"
+            ;;
+    esac
+done
 
 # Usage
 usage() {
@@ -31,6 +40,7 @@ Arguments:
   source_env     Source environment (prod, test, dev, backup)
   target_env     Target environment (prod, test, dev, backup)
   migration_dir  Directory to store migration files (optional, auto-generated if not provided)
+  --increment    Prefer incremental/delta operations (default behaviour)
 
 Examples:
   $0 prod test                          # Migrate edge functions from prod to test
@@ -80,6 +90,7 @@ log_info "⚡ Edge Functions Migration"
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR"
+log_info "Incremental mode: $INCREMENTAL_MODE (edge functions utility performs delta comparisons by default)"
 echo ""
 
 # Check for Node.js

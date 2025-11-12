@@ -32,6 +32,7 @@ INCLUDE_DATA=false  # Default: false - don't migrate database data by default
 INCLUDE_FILES=false  # Default: false - don't migrate bucket files by default
 INCLUDE_USERS=false  # Default: false - don't migrate auth users by default
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
+INCREMENTAL_MODE=false  # Default: false - full synchronization unless --increment is provided
 
 # Colors
 RED='\033[0;31m'
@@ -60,6 +61,7 @@ Arguments:
 
 Options:
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
+  --increment             Prefer incremental/delta updates for all components (default: full sync)
   --data                  Include database data/rows migration (default: false)
   --replace-data          Allow destructive replace of target data (requires --data). Without this flag, data sync runs in delta/append mode.
   --users                 Include authentication users, roles, and policies migration (default: false)
@@ -143,6 +145,10 @@ parse_args() {
                     exit 1
                 fi
                 shift 2
+                ;;
+            --increment|--incremental)
+                INCREMENTAL_MODE=true
+                shift
                 ;;
             --data)
                 INCLUDE_DATA=true
@@ -1209,6 +1215,11 @@ perform_migration() {
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     log_info "Migration: $source → $target ($MODE mode)"
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        log_info "Incremental mode: Enabled (components will prefer delta/incremental operations)"
+    else
+        log_info "Incremental mode: Disabled (components will run in standard sync mode)"
+    fi
     echo ""
     
     if [ "$DRY_RUN" = "true" ]; then
@@ -1220,6 +1231,7 @@ perform_migration() {
         echo "  Source: $source ($(get_project_ref "$source"))"
         echo "  Target: $target ($(get_project_ref "$target"))"
         echo "  Mode: $MODE"
+        echo "  Incremental Mode: $INCREMENTAL_MODE"
         echo "  Include Data: $INCLUDE_DATA"
         echo "  Include Users: $INCLUDE_USERS"
         echo "  Include Files: $INCLUDE_FILES"
@@ -1263,12 +1275,12 @@ perform_migration() {
     mkdir -p "$migration_dir"
     touch "$LOG_FILE"
     
-    log_to_file "$LOG_FILE" "Starting migration from $source to $target (mode: $MODE)"
+    log_to_file "$LOG_FILE" "Starting migration from $source to $target (mode: $MODE, incremental: $INCREMENTAL_MODE)"
     
     local exit_code=0
     local actual_migration_dir="$migration_dir"
     
-    # Step 1: Migrate database (schema + optionally data + users)
+    # Step 1: Migrate database (schema + optionally data)
     # Check if data migration is requested (either via --data flag or --mode full)
     local migrate_data=false
     if [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
@@ -1277,6 +1289,12 @@ perform_migration() {
     
     # Build command arguments for database migration
     local db_migration_args=("$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        db_migration_args+=("--increment")
+    fi
+    if [ "$INCLUDE_USERS" = "true" ]; then
+        db_migration_args+=("--users")
+    fi
     if [ "$BACKUP_TARGET" = "true" ]; then
         db_migration_args+=("--backup")
     fi
@@ -1285,9 +1303,6 @@ perform_migration() {
         if [ "$REPLACE_TARGET_DATA" = "true" ]; then
             db_migration_args+=("--replace-data")
         fi
-    fi
-    if [ "$INCLUDE_USERS" = "true" ]; then
-        db_migration_args+=("--users")
     fi
     
     if [ "$MODE" = "full" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
@@ -1300,14 +1315,14 @@ perform_migration() {
         log_info "Data migration set to delta mode: existing target rows will be preserved. Only new data will be attempted."
     fi
 
-    if [ "$migrate_data" = "true" ] && [ "$INCLUDE_USERS" = "true" ]; then
-        log_info "Migrating database (schema + data + auth users)..."
-    elif [ "$migrate_data" = "true" ]; then
+    if [ "$migrate_data" = "true" ]; then
         log_info "Migrating database (schema + data)..."
-    elif [ "$INCLUDE_USERS" = "true" ]; then
-        log_info "Migrating database (schema + auth users)..."
     else
-        log_info "Migrating database (schema only - no data, no users)..."
+        log_info "Migrating database (schema only - no data)..."
+    fi
+
+    if [ "$INCLUDE_USERS" = "true" ]; then
+        log_info "Auth users migration will run within the database migration step."
     fi
     
     # Call database_migration.sh component script
@@ -1318,10 +1333,13 @@ perform_migration() {
         log_error "Database migration failed!"
         return 1
     fi
-    
+
     # Step 2: Migrate storage buckets (configuration + optionally files)
     # Build command arguments for storage migration
     local storage_migration_args=("$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        storage_migration_args+=("--increment")
+    fi
     if [ "$INCLUDE_FILES" = "true" ]; then
         storage_migration_args+=("--file")
         log_info "Migrating storage buckets (configuration + files)..."
@@ -1343,7 +1361,11 @@ perform_migration() {
     # Step 3: Migrate edge functions
     log_info "Migrating edge functions..."
     # Call edge_functions_migration.sh component script
-    if "$PROJECT_ROOT/scripts/components/edge_functions_migration.sh" "$source" "$target" "$migration_dir" 2>&1 | tee -a "$LOG_FILE"; then
+    local edge_migration_cmd=("$PROJECT_ROOT/scripts/components/edge_functions_migration.sh" "$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        edge_migration_cmd+=("--increment")
+    fi
+    if "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
         log_success "Edge functions migrated successfully"
     else
         log_warning "Edge functions migration had errors, continuing..."
@@ -1352,7 +1374,11 @@ perform_migration() {
     # Step 4: Migrate secrets
     log_info "Migrating secrets..."
     # Call secrets_migration.sh component script
-    if "$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target" "$migration_dir" 2>&1 | tee -a "$LOG_FILE"; then
+    local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        secrets_migration_cmd+=("--increment")
+    fi
+    if "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
         log_success "Secrets migrated successfully (structure created - values need manual update)"
     else
         log_warning "Secrets migration had errors, continuing..."
@@ -1542,6 +1568,12 @@ interactive_mode() {
         DRY_RUN=true
     fi
     
+    # Prompt for incremental mode
+    read -p "Prefer incremental (delta) mode? [y/N]: " increment_input
+    if [[ "$increment_input" =~ ^[Yy]$ ]]; then
+        INCREMENTAL_MODE=true
+    fi
+    
     echo ""
     log_info "Configuration:"
     log_info "  Source: $SOURCE_ENV"
@@ -1553,6 +1585,7 @@ interactive_mode() {
     log_info "  Include Files: $INCLUDE_FILES"
     log_info "  Backup: $BACKUP_TARGET"
     log_info "  Dry Run: $DRY_RUN"
+    log_info "  Incremental Mode: $INCREMENTAL_MODE"
     echo ""
 }
 
@@ -1579,6 +1612,10 @@ main() {
     if [ "$REPLACE_TARGET_DATA" = "true" ] && [ "$MODE" != "full" ] && [ "$INCLUDE_DATA" = "false" ]; then
         log_error "--replace-data requires --data or --mode full. Refusing to run destructive migration without data sync."
         exit 1
+    fi
+    
+    if [ "$REPLACE_TARGET_DATA" = "true" ] && [ "$INCREMENTAL_MODE" = "true" ]; then
+        log_warning "--increment requested but --replace-data also set; replace mode will override incremental data behaviour."
     fi
     
     # Load environment using the robust load_env function

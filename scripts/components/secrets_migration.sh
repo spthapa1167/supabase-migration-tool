@@ -23,6 +23,7 @@ MIGRATION_DIR=${3:-""}
 
 # Default: only migrate keys with blank values
 INCLUDE_VALUES=false
+INCREMENTAL_MODE=false
 
 # Parse arguments for flags
 for arg in "$@"; do
@@ -30,11 +31,19 @@ for arg in "$@"; do
         --values)
             INCLUDE_VALUES=true
             ;;
+        --increment|--incremental)
+            INCREMENTAL_MODE=true
+            ;;
     esac
 done
 
 # If the optional migration directory argument is actually a flag, ignore it
 if [[ -n "$MIGRATION_DIR" && "$MIGRATION_DIR" == --* ]]; then
+    if [[ "$MIGRATION_DIR" == "--values" ]]; then
+        INCLUDE_VALUES=true
+    elif [[ "$MIGRATION_DIR" == "--increment" || "$MIGRATION_DIR" == "--incremental" ]]; then
+        INCREMENTAL_MODE=true
+    fi
     MIGRATION_DIR=""
 fi
 
@@ -49,12 +58,14 @@ Default Behavior:
   By default, only migrates SECRET KEYS with blank/placeholder values.
   Secret values are NOT migrated for security reasons (values are secret).
   Use --values flag to attempt migrating values (may require manual input or CLI access).
+  Use --increment to explicitly request incremental/delta operations (default behaviour).
 
 Arguments:
   source_env     Source environment (prod, test, dev, backup)
   target_env     Target environment (prod, test, dev, backup)
   migration_dir  Directory to store migration files (optional, auto-generated if not provided)
   --values       Attempt to migrate secret values (if accessible via CLI)
+  --increment    Prefer incremental/delta operations (default: enabled)
 
 Examples:
   $0 dev test                          # Migrate secret keys only (default - blank values)
@@ -120,6 +131,7 @@ if [ "$INCLUDE_VALUES" = "true" ]; then
 else
     log_info "Mode: Keys Only (blank values)"
 fi
+log_info "Incremental mode: $INCREMENTAL_MODE (secrets migration uses Management API delta comparison)"
 echo ""
 
 # Step 1: Get secrets from source using Management API

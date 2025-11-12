@@ -1,0 +1,726 @@
+{
+  "timestamp": "2025-11-08 12:43:29",
+  "generatedAt": 1762627431,
+  "environments": {
+    "dev": {
+      "env": "dev",
+      "name": "Development",
+      "projectRef": "rkiovortqlqaqksllzqz",
+      "projectName": "Test_Supabase_Dev",
+      "timestamp": "2025-11-08T18:43:34Z",
+      "counts": {
+        "tables": 29,
+        "views": 0,
+        "functions": 33,
+        "sequences": 1,
+        "indexes": 93,
+        "policies": 3,
+        "triggers": 7,
+        "types": 29,
+        "enums": 10,
+        "authUsers": 3,
+        "edgeFunctions": 3,
+        "buckets": 2,
+        "secrets": 9,
+        "totalRows": 128,
+        "storageObjects": 4
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 3
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "Hello2",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "My_Test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "new_table",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "Test_bucket",
+          "objects": 2
+        },
+        {
+          "bucket": "test3",
+          "objects": 2
+        }
+      ]
+    },
+    "test": {
+      "env": "test",
+      "name": "Test/Staging",
+      "projectRef": "tkaapbxrheffccvfdben",
+      "projectName": "Test_Supabase_Test",
+      "timestamp": "2025-11-08T18:43:41Z",
+      "counts": {
+        "tables": 29,
+        "views": 0,
+        "functions": 33,
+        "sequences": 1,
+        "indexes": 93,
+        "policies": 3,
+        "triggers": 7,
+        "types": 29,
+        "enums": 10,
+        "authUsers": 3,
+        "edgeFunctions": 3,
+        "buckets": 2,
+        "secrets": 9,
+        "totalRows": 127,
+        "storageObjects": 4
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 3
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "Hello2",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "My_Test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "new_table",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "Test_bucket",
+          "objects": 2
+        },
+        {
+          "bucket": "test3",
+          "objects": 2
+        }
+      ]
+    },
+    "prod": {
+      "env": "prod",
+      "name": "Production",
+      "projectRef": "qkngycoksmmfwldqzjoz",
+      "projectName": "Test_Supabase_Prod",
+      "timestamp": "2025-11-08T18:43:46Z",
+      "counts": {
+        "tables": 29,
+        "views": 0,
+        "functions": 33,
+        "sequences": 1,
+        "indexes": 93,
+        "policies": 3,
+        "triggers": 7,
+        "types": 29,
+        "enums": 10,
+        "authUsers": 3,
+        "edgeFunctions": 3,
+        "buckets": 4,
+        "secrets": 9,
+        "totalRows": 125,
+        "storageObjects": 2
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 3
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "Hello2",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "My_Test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "new_table",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "Test_bucket",
+          "objects": 2
+        }
+      ]
+    },
+    "backup": {
+      "env": "backup",
+      "name": "Backup",
+      "projectRef": "gbkekwnjbqoonlyjpeks",
+      "projectName": "Test_Supabase_Prod_BackUp",
+      "timestamp": "2025-11-08T18:43:51Z",
+      "counts": {
+        "tables": 29,
+        "views": 0,
+        "functions": 33,
+        "sequences": 1,
+        "indexes": 93,
+        "policies": 3,
+        "triggers": 7,
+        "types": 29,
+        "enums": 10,
+        "authUsers": 3,
+        "edgeFunctions": 0,
+        "buckets": 2,
+        "secrets": 5,
+        "totalRows": 127,
+        "storageObjects": 4
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 3
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "Hello2",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "My_Test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "new_table",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "Test_bucket",
+          "objects": 2
+        },
+        {
+          "bucket": "test3",
+          "objects": 2
+        }
+      ]
+    }
+  }
+}

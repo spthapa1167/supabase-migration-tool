@@ -104,6 +104,16 @@
 - Realtime configurations
 - Auth providers
 
+### Auth Users Migration
+
+```bash
+./scripts/components/authUsers_migration.sh <source> <target> [--replace]
+```
+
+- Migrates auth users and identities between Supabase environments.
+- Default behaviour upserts by user ID; `--replace` wipes target auth users first.
+- Artefacts and logs are stored under `backups/auth_users_migration_*`.
+
 ## 🛡️ Safety
 
 - Production operations require `YES` confirmation

@@ -129,6 +129,7 @@ INCLUDE_USERS=false
 BACKUP_TARGET=false
 MIGRATION_DIR=""
 REPLACE_TARGET_DATA=false
+INCREMENTAL_MODE=false
 TARGET_DATA_BACKUP=""
 TARGET_DATA_BACKUP_SQL=""
 TARGET_SCHEMA_BEFORE_FILE=""
@@ -153,6 +154,9 @@ for arg in "$@"; do
             ;;
         --replace-data|--force-data-replace)
             REPLACE_TARGET_DATA=true
+            ;;
+        --increment|--incremental)
+            INCREMENTAL_MODE=true
             ;;
         -h|--help)
             # Will show usage after it's defined
@@ -192,6 +196,7 @@ Default Behavior:
   By default, migrates SCHEMA ONLY (no data, no auth users).
   Use --data flag to include data migration.
   Use --users flag to include authentication users, roles, and policies.
+  Use --increment to prefer incremental/delta operations (non-destructive) when possible.
 
 Arguments:
   source_env     Source environment (prod, test, dev, backup)
@@ -201,6 +206,7 @@ Arguments:
   --replace-data Replace target data (destructive). Without this flag, data migrations run in append/delta mode.
   --users        Include authentication users, roles, and policies
   --backup       Create backup of target before migration (optional)
+  --increment    Prefer incremental/delta operations (default: disabled)
 
 Examples:
   $0 prod test                          # Migrate schema only (default)
@@ -298,10 +304,16 @@ else
     log_info "📊 Database Schema-Only Migration"
 fi
 
+if [ "$INCREMENTAL_MODE" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
+    log_warning "Incremental mode requested but --replace-data supplied; replace mode will override incremental behaviour for data sections."
+fi
+
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR"
 log_info "Mode: $MIGRATION_MODE"
+log_info "Incremental mode: $INCREMENTAL_MODE"
+log_to_file "$LOG_FILE" "Incremental mode: $INCREMENTAL_MODE"
 echo ""
 
 # Source rollback utilities
@@ -548,15 +560,22 @@ RESTORE_ARGS=(--verbose)
 RESTORE_SUCCESS=false
 RESTORE_OUTPUT=$(mktemp)
 
+RESTORE_ARGS+=(--schema-only --no-owner --no-acl)
 if [ "$INCLUDE_DATA" = "true" ]; then
     log_info "Step 3/3: Restoring dump to target..."
-    RESTORE_ARGS+=(--clean --if-exists --schema-only --no-owner --no-acl)
 else
     log_info "Step 3/3: Restoring schema dump to target..."
-    RESTORE_ARGS+=(--clean --if-exists --schema-only --no-owner --no-acl)
+fi
+if [ "$INCREMENTAL_MODE" = "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
+    log_info "Incremental mode: skipping --clean on schema restore to avoid dropping target objects."
+else
+    RESTORE_ARGS+=(--clean --if-exists)
 fi
 
 DUPLICATE_ALLOWED=false
+if [ "$INCREMENTAL_MODE" = "true" ]; then
+    DUPLICATE_ALLOWED=true
+fi
 
 # Preserve target data when running schema-only delta migrations
 if [ "$INCLUDE_DATA" != "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
