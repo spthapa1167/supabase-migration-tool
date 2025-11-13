@@ -141,6 +141,13 @@ SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
 
 # Supabase-managed schemas that are handled by dedicated scripts or platform defaults
 PROTECTED_SCHEMAS=(auth vault storage realtime pgbouncer graphql_public supabase_functions supabase_functions_api pgsodium supavisor)
+INCLUDE_TABLES=()
+
+PYTHON_BIN=$(command -v python3 || command -v python || true)
+if [ -z "$PYTHON_BIN" ]; then
+    log_error "python3 (or python) is required but not found in PATH."
+    exit 1
+fi
 
 # Parse arguments - extract flags first, then positional arguments
 SOURCE_ENV=""
@@ -919,57 +926,95 @@ fi
 if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
     log_info "Step 3b/3: Applying data changes from source dump..."
     
-    DATA_DUPLICATE_ALLOWED=false
-    if [ "$REPLACE_TARGET_DATA" != "true" ]; then
-        DATA_DUPLICATE_ALLOWED=true
-    fi
-    
     DATA_RESTORE_ARGS=(--verbose --no-owner --no-acl --data-only -d postgres "--role=supabase_admin")
     for schema in "${PROTECTED_SCHEMAS[@]}"; do
         DATA_RESTORE_ARGS+=(--exclude-schema="$schema")
     done
-    # --clean cannot be combined with --data-only; target objects are dropped earlier when replace-data is enabled.
+    for table in "${INCLUDE_TABLES[@]}"; do
+        DATA_RESTORE_ARGS+=(--table="$table")
+    done
     
     DATA_RESTORE_SUCCESS=false
-    while IFS='|' read -r host port user label; do
-        [ -z "$host" ] && continue
-        
-        log_info "Restoring source data via ${label} (${host}:${port})..."
-        restore_log=$(mktemp)
-        set +e
-        PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
-            -h "$host" \
-            -p "$port" \
-            -U "$user" \
-            "${DATA_RESTORE_ARGS[@]}" \
-            "$DUMP_FILE" \
-            2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
-        DATA_RESTORE_EXIT=${PIPESTATUS[0]}
-        set -e
-        
-        if [ $DATA_RESTORE_EXIT -eq 0 ]; then
-            DATA_RESTORE_SUCCESS=true
-            log_success "Data restore from source succeeded via ${label}"
+    
+    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        while IFS='|' read -r host port user label; do
+            [ -z "$host" ] && continue
+            
+            log_info "Restoring source data via ${label} (${host}:${port})..."
+            restore_log=$(mktemp)
+            set +e
+            PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
+                -h "$host" \
+                -p "$port" \
+                -U "$user" \
+                "${DATA_RESTORE_ARGS[@]}" \
+                "$DUMP_FILE" \
+                2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
+            DATA_RESTORE_EXIT=${PIPESTATUS[0]}
+            set -e
+            
+            if [ $DATA_RESTORE_EXIT -eq 0 ]; then
+                DATA_RESTORE_SUCCESS=true
+                log_success "Data restore from source succeeded via ${label}"
+                rm -f "$restore_log"
+                break
+            fi
+            
+            log_warning "Data restore via ${label} failed (exit code $DATA_RESTORE_EXIT)"
+            if [ -s "$restore_log" ]; then
+                tail -n 5 "$restore_log" | while read line; do
+                    log_warning "  $line"
+                done
+            fi
             rm -f "$restore_log"
-            break
+        done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    fi
+    
+    if [ "$DATA_RESTORE_SUCCESS" != "true" ]; then
+        log_info "Using incremental SQL restore with ON CONFLICT DO NOTHING..."
+        incremental_sql=$(mktemp)
+        processed_sql=$(mktemp)
+        if pg_restore --data-only --no-owner --no-privileges $(for t in "${INCLUDE_TABLES[@]}"; do printf -- "--table=%s " "$t"; done) -f "$incremental_sql" "$DUMP_FILE"; then
+            if [ "${#INCLUDE_TABLES[@]}" -gt 0 ]; then
+                TARGET_TABLE_LIST=$(for t in "${INCLUDE_TABLES[@]}"; do printf "'%s'," "$t"; done)
+                TARGET_TABLE_LIST="${TARGET_TABLE_LIST%,}"
+                prune_sql=$(mktemp)
+                {
+                    echo "DELETE FROM public._policy_dump_queue;"
+                    echo "CREATE TEMP TABLE _inserted_tables(table_name text primary key);"
+                } >"$prune_sql"
+                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
+                cat <<'SQL' >>"$processed_sql"
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN SELECT DISTINCT table_schema || '.' || table_name AS full_name
+             FROM information_schema.tables
+             WHERE table_schema NOT IN ('pg_catalog','information_schema') LOOP
+        BEGIN
+            EXECUTE 'INSERT INTO _inserted_tables(table_name) VALUES ($1)' USING r.full_name;
+        EXCEPTION WHEN unique_violation THEN
+            NULL;
+        END;
+    END LOOP;
+END $$;
+
+SQL
+            else
+                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
+            fi
+            if run_psql_script_with_fallback "Incremental data restore" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$processed_sql"; then
+                log_success "Incremental data restore completed successfully."
+                DATA_RESTORE_SUCCESS=true
+            else
+                log_error "Incremental SQL restore failed."
+            fi
+        else
+            log_error "pg_restore could not produce SQL dump for incremental restore."
         fi
-        
-        if [ "$DATA_DUPLICATE_ALLOWED" = "true" ] && \
-            { grep -qiE "duplicate key value violates unique constraint" "$restore_log" || grep -qiE "errors ignored on restore" "$restore_log"; }; then
-            DATA_RESTORE_SUCCESS=true
-            log_warning "Data restore via ${label} completed with duplicate key warnings; existing rows were preserved."
-            rm -f "$restore_log"
-            break
-        fi
-        
-        log_warning "Data restore via ${label} failed (exit code $DATA_RESTORE_EXIT)"
-        if [ -s "$restore_log" ]; then
-            tail -n 5 "$restore_log" | while read line; do
-                log_warning "  $line"
-            done
-        fi
-        rm -f "$restore_log"
-    done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+        rm -f "$incremental_sql" "$processed_sql"
+    fi
     
     if [ "$DATA_RESTORE_SUCCESS" = "true" ]; then
         log_success "Source data restored successfully."

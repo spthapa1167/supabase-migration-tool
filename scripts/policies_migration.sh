@@ -15,7 +15,7 @@ SOURCE_ENV=${1:-}
 TARGET_ENV=${2:-}
 MIGRATION_DIR=""
 
-DEFAULT_TABLES=("auth.roles" "auth.user_roles" "public.profiles")
+DEFAULT_TABLES=("auth.roles" "auth.user_roles" "public.profiles" "public.user_roles")
 TABLES=("${DEFAULT_TABLES[@]}")
 AUTO_CONFIRM=${AUTO_CONFIRM:-false}
 
@@ -88,6 +88,40 @@ TARGET_POOLER_REGION=$(get_pooler_region_for_env "$TARGET_ENV")
 SOURCE_POOLER_PORT=$(get_pooler_port_for_env "$SOURCE_ENV")
 TARGET_POOLER_PORT=$(get_pooler_port_for_env "$TARGET_ENV")
 
+FINAL_TABLES=()
+
+add_unique_table() {
+    local candidate
+    candidate=$(echo "$1" | xargs)
+    [[ -z "$candidate" || "$candidate" != *.* ]] && return 0
+    local existing
+    if [ ${#FINAL_TABLES[@]} -gt 0 ]; then
+        for existing in "${FINAL_TABLES[@]}"; do
+            if [ "$existing" = "$candidate" ]; then
+                return 0
+            fi
+        done
+    fi
+    FINAL_TABLES+=("$candidate")
+}
+
+for tbl in "${TABLES[@]}"; do
+    add_unique_table "$tbl"
+done
+
+while IFS= read -r line; do
+    add_unique_table "$line"
+done <<EOF
+$(discover_role_tables "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" || echo "")
+EOF
+
+if [ ${#FINAL_TABLES[@]} -eq 0 ]; then
+    log_warning "No role-related tables discovered; nothing to migrate."
+    exit 0
+fi
+
+TABLES=("${FINAL_TABLES[@]}")
+
 if [ -z "$MIGRATION_DIR" ]; then
     MIGRATION_DIR=$(create_backup_dir "policies" "$SOURCE_ENV" "$TARGET_ENV")
 fi
@@ -146,32 +180,52 @@ run_psql_script_direct() {
 transform_inserts() {
     local input_file="$1"
     local output_file="$2"
-    "$PYTHON_BIN" <<'PY' "$input_file" "$output_file"
-import sys
-src, dest = sys.argv[1], sys.argv[2]
-with open(src, 'r', encoding='utf-8') as f_in, open(dest, 'w', encoding='utf-8') as f_out:
-    inside = False
-    for line in f_in:
-        if not inside and line.startswith("INSERT INTO"):
-            inside = True
-        f_out.write(line)
-        if inside and line.rstrip().endswith(';'):
-            f_out.seek(f_out.tell() - len(line))
-            f_out.write(line.rstrip()[:-1] + " ON CONFLICT DO NOTHING;\n")
-            inside = False
-PY
+    "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$input_file" "$output_file"
+}
+
+discover_role_tables() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local query="
+        SELECT table_schema || '.' || table_name
+        FROM information_schema.tables
+        WHERE table_schema IN ('auth','public')
+          AND (table_name ILIKE '%role%' OR table_name ILIKE '%user_role%')
+        ORDER BY 1;
+    "
+
+    local endpoints
+    endpoints=$(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        output=$(PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            -c "$query" 2>/dev/null) && printf "%s\n" "$output" && return 0
+        log_warning "Table discovery failed via ${label}, trying next endpoint..."
+    done <<< "$endpoints"
+    return 1
 }
 
 for table in "${TABLES[@]}"; do
     table_trimmed=$(echo "$table" | xargs)
     [ -z "$table_trimmed" ] && continue
     table_safe=${table_trimmed//./_}
+    table_schema=${table_trimmed%%.*}
+    table_name=${table_trimmed#*.}
+    quoted_table="\"${table_schema}\".\"${table_name}\""
+    dump_target="\"${table_schema}\".\"${table_name}\""
     dump_file="$MIGRATION_DIR/${table_safe}_source.sql"
     upsert_file="$MIGRATION_DIR/${table_safe}_upsert.sql"
 
     log_info "Dumping data from source table: $table_trimmed"
     if run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
-        -d postgres --data-only --column-inserts --table="$table_trimmed" --no-owner --no-privileges -f "$dump_file"; then
+        -d postgres --data-only --column-inserts --table="$quoted_table" --no-owner --no-privileges -f "$dump_file"; then
         log_success "Dump created for $table_trimmed"
     else
         log_warning "Could not dump $table_trimmed (object may be missing or inaccessible); skipping."
@@ -181,7 +235,7 @@ for table in "${TABLES[@]}"; do
     fi
 
     log_info "Transforming insert statements for $table_trimmed"
-    "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$dump_file" "$upsert_file"
+    transform_inserts "$dump_file" "$upsert_file"
 
     if [ ! -s "$upsert_file" ]; then
         log_warning "No data found for $table_trimmed; skipping insert."
