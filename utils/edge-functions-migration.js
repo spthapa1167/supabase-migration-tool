@@ -53,6 +53,56 @@ function logSeparator() {
     console.log('━'.repeat(70));
 }
 
+function mergeDirectories(srcDir, destDir) {
+    if (!fs.existsSync(srcDir)) {
+        return;
+    }
+    fs.mkdirSync(destDir, { recursive: true });
+    const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+    for (const entry of entries) {
+        const srcPath = path.join(srcDir, entry.name);
+        const destPath = path.join(destDir, entry.name);
+        if (entry.isDirectory()) {
+            mergeDirectories(srcPath, destPath);
+        } else if (entry.isFile()) {
+            fs.mkdirSync(path.dirname(destPath), { recursive: true });
+            fs.copyFileSync(srcPath, destPath);
+        }
+    }
+}
+
+function normalizeFunctionLayout(functionDir, downloadRoot) {
+    const sharedDest = path.join(downloadRoot, '_shared');
+    try {
+        const nestedFunctionsDir = path.join(functionDir, 'functions');
+        if (fs.existsSync(nestedFunctionsDir) && fs.lstatSync(nestedFunctionsDir).isDirectory()) {
+            const nestedEntries = fs.readdirSync(nestedFunctionsDir, { withFileTypes: true });
+            for (const entry of nestedEntries) {
+                const entryPath = path.join(nestedFunctionsDir, entry.name);
+                if (entry.name === '_shared') {
+                    mergeDirectories(entryPath, sharedDest);
+                } else {
+                    const destPath = path.join(functionDir, entry.name);
+                    if (fs.existsSync(destPath)) {
+                        fs.rmSync(destPath, { recursive: true, force: true });
+                    }
+                    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+                    fs.cpSync(entryPath, destPath, { recursive: true });
+                }
+            }
+            fs.rmSync(nestedFunctionsDir, { recursive: true, force: true });
+        }
+
+        const localSharedDir = path.join(functionDir, '_shared');
+        if (fs.existsSync(localSharedDir) && fs.lstatSync(localSharedDir).isDirectory()) {
+            mergeDirectories(localSharedDir, sharedDest);
+            fs.rmSync(localSharedDir, { recursive: true, force: true });
+        }
+    } catch (err) {
+        logWarning(`    ⚠ Unable to normalize layout for ${path.basename(functionDir)}: ${err.message}`);
+    }
+}
+
 // Load environment variables from .env.local or .env file
 function loadEnvFile() {
     const envFiles = ['.env.local', '.env'];
@@ -103,7 +153,51 @@ try {
 // Configuration from arguments
 const SOURCE_REF = process.argv[2];
 const TARGET_REF = process.argv[3];
-const MIGRATION_DIR = process.argv[4];
+const MIGRATION_DIR_INPUT = process.argv[4];
+const MIGRATION_DIR = MIGRATION_DIR_INPUT ? path.resolve(process.cwd(), MIGRATION_DIR_INPUT) : undefined;
+
+const additionalArgs = process.argv.slice(5);
+let filterList = [];
+let filterFilePath = null;
+let allowPartialFilter = false;
+
+for (const rawArg of additionalArgs) {
+    if (!rawArg) continue;
+    if (rawArg.startsWith('--functions=')) {
+        const csv = rawArg.split('=')[1] || '';
+        const names = csv.split(',').map((item) => item.trim()).filter(Boolean);
+        filterList = filterList.concat(names);
+    } else if (rawArg.startsWith('--filter-file=')) {
+        filterFilePath = rawArg.split('=')[1] || '';
+    } else if (rawArg === '--allow-missing') {
+        allowPartialFilter = true;
+    } else if (rawArg.trim().length > 0) {
+        logWarning(`Unknown argument ignored: ${rawArg}`);
+    }
+}
+
+if (filterFilePath) {
+    const resolvedPath = path.resolve(process.cwd(), filterFilePath);
+    if (fs.existsSync(resolvedPath)) {
+        const fileContents = fs.readFileSync(resolvedPath, 'utf8');
+        const names = fileContents
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0 && !line.startsWith('#'));
+        filterList = filterList.concat(names);
+    } else {
+        logWarning(`Filter file not found: ${resolvedPath}. Continuing without it.`);
+    }
+}
+
+const uniqueFilterSet = filterList.length > 0 ? new Set(filterList) : null;
+const requestedFilterNames = uniqueFilterSet ? Array.from(uniqueFilterSet) : [];
+const filterNamesFound = new Set();
+const missingFilterFunctions = [];
+
+const migratedFunctions = [];
+const failedFunctions = [];
+const skippedFunctions = [];
 
 // Get Supabase URLs, access token, and database password from environment
 function getSupabaseConfig(projectRef) {
@@ -368,6 +462,7 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
                         fs.rmSync(finalFunctionPath, { recursive: true, force: true });
                         fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
                         fs.cpSync(apiFunctionDir, finalFunctionPath, { recursive: true });
+                        normalizeFunctionLayout(finalFunctionPath, downloadDir);
                         logSuccess(`    ✓ Downloaded function via Management API: ${functionName}`);
                         fs.rmSync(apiTempDir, { recursive: true, force: true });
                         return true;
@@ -444,6 +539,7 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             fs.rmSync(finalFunctionPath, { recursive: true, force: true });
             fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
             fs.cpSync(downloadedFunctionPath, finalFunctionPath, { recursive: true });
+            normalizeFunctionLayout(finalFunctionPath, downloadDir);
 
             logSuccess(`    ✓ Downloaded function via CLI: ${functionName}`);
             return true;
@@ -458,6 +554,7 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             fs.rmSync(finalFunctionPath, { recursive: true, force: true });
             fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
             fs.cpSync(fallbackDir, finalFunctionPath, { recursive: true });
+            normalizeFunctionLayout(finalFunctionPath, downloadDir);
             logSuccess(`    ✓ Copied local function source for ${functionName}`);
             return true;
         }
@@ -476,6 +573,8 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
             throw new Error(`Function directory not found: ${functionDir}`);
         }
         
+        normalizeFunctionLayout(functionDir, path.dirname(functionDir));
+
         // Check if function has index file
         const hasIndex = fs.existsSync(path.join(functionDir, 'index.ts')) ||
                         fs.existsSync(path.join(functionDir, 'index.js')) ||
@@ -509,6 +608,19 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
             fs.rmSync(tempFunctionPath, { recursive: true, force: true });
         }
         fs.cpSync(functionDir, tempFunctionPath, { recursive: true });
+
+        const globalSharedDir = path.join(functionsParentDir, '_shared');
+        const localSharedDir = path.join(functionDir, '_shared');
+        const sharedDestDir = path.join(supabaseDir, '_shared');
+        if (fs.existsSync(sharedDestDir)) {
+            fs.rmSync(sharedDestDir, { recursive: true, force: true });
+        }
+        if (fs.existsSync(globalSharedDir)) {
+            mergeDirectories(globalSharedDir, sharedDestDir);
+        }
+        if (fs.existsSync(localSharedDir)) {
+            mergeDirectories(localSharedDir, sharedDestDir);
+        }
         
         // Change to supabase directory and link
         process.chdir(supabaseConfigDir);
@@ -570,6 +682,33 @@ async function migrateEdgeFunctions() {
         logError('Failed to fetch source edge functions - cannot continue migration');
         throw error;
     }
+
+    if (uniqueFilterSet) {
+        logInfo(`Function filter enabled (${requestedFilterNames.length} requested).`);
+        sourceFunctions = sourceFunctions.filter((func) => {
+            const name = func?.name;
+            if (!name) return false;
+            if (uniqueFilterSet.has(name)) {
+                filterNamesFound.add(name);
+                return true;
+            }
+            return false;
+        });
+
+        const missingNames = requestedFilterNames.filter((name) => !filterNamesFound.has(name));
+        if (missingNames.length > 0) {
+            missingFilterFunctions.push(...missingNames);
+            logWarning(`Requested ${missingNames.length} function(s) not present in source: ${missingNames.join(', ')}`);
+            if (!allowPartialFilter) {
+                logWarning('To ignore missing functions, pass --allow-missing (used by retry script).');
+            }
+        }
+
+        logInfo(`Filter result: ${sourceFunctions.length} function(s) available for migration.`);
+        if (sourceFunctions.length === 0) {
+            logWarning('No source functions remain after filtering; exiting early.');
+        }
+    }
     
     console.log('');
     
@@ -610,7 +749,6 @@ async function migrateEdgeFunctions() {
     
     // Determine which functions need migration
     const functionsToMigrate = [];
-    const functionsToSkip = [];
     
     for (const sourceFunction of sourceFunctions) {
         const functionName = sourceFunction.name;
@@ -629,7 +767,7 @@ async function migrateEdgeFunctions() {
     // Check if all functions are already in target
     if (functionsToMigrate.length === 0) {
         logSuccess(`✓ All source functions already exist in target - no migration needed`);
-        skippedCount = sourceFunctions.length;
+        skippedFunctions.push(...sourceFunctions.map((fn) => fn?.name).filter(Boolean));
     } else {
         logInfo(`Functions to migrate: ${functionsToMigrate.length}`);
         logInfo(`  - New functions: ${functionsToMigrate.filter(f => f.isNew).length}`);
@@ -640,13 +778,15 @@ async function migrateEdgeFunctions() {
         for (let i = 0; i < functionsToMigrate.length; i++) {
             const { function: sourceFunction, isNew } = functionsToMigrate[i];
             const functionName = sourceFunction.name;
+            const indexLabel = `${i + 1}/${functionsToMigrate.length}`;
             
             if (!functionName) {
-                logError(`Function ${i + 1} has no name: ${JSON.stringify(sourceFunction)}`);
+                logError(`Function ${indexLabel} has no name: ${JSON.stringify(sourceFunction)}`);
+                failedFunctions.push('(unknown)');
                 continue;
             }
             
-            logInfo(`${colors.bright}Function ${i + 1}/${functionsToMigrate.length}: ${functionName}${colors.reset}`);
+            logInfo(`${colors.bright}Function ${indexLabel}: ${functionName}${colors.reset}`);
             
             if (isNew) {
                 logInfo(`  Status: NEW - will create in target`);
@@ -664,7 +804,7 @@ async function migrateEdgeFunctions() {
             if (!downloadSuccess) {
                 logWarning(`  ⚠ Could not download function code - skipping deployment`);
                 logWarning(`    Function may need to be deployed manually from codebase`);
-                failedCount++;
+                failedFunctions.push(functionName);
                 console.log('');
                 continue;
             }
@@ -672,7 +812,7 @@ async function migrateEdgeFunctions() {
             // Check if function directory was created
             if (!fs.existsSync(functionDir)) {
                 logWarning(`  ⚠ Function directory not found after download - skipping`);
-                failedCount++;
+                failedFunctions.push(functionName);
                 console.log('');
                 continue;
             }
@@ -681,10 +821,10 @@ async function migrateEdgeFunctions() {
             const deploySuccess = deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword);
             
             if (deploySuccess) {
-                migratedCount++;
+                migratedFunctions.push(functionName);
                 logSuccess(`  ✓ Function ${isNew ? 'created' : 'updated'} successfully`);
             } else {
-                failedCount++;
+                failedFunctions.push(functionName);
                 logError(`  ✗ Function migration failed`);
             }
             
@@ -692,6 +832,50 @@ async function migrateEdgeFunctions() {
         }
     }
     
+    const dedupe = (arr) => Array.from(new Set(arr.filter(Boolean)));
+    const attemptedFunctionNames = functionsToMigrate.map(({ function: func }) => func?.name).filter(Boolean);
+    const uniqueMigratedFunctions = dedupe(migratedFunctions);
+    const uniqueFailedFunctions = dedupe([...failedFunctions, ...missingFilterFunctions]);
+    const uniqueSkippedFunctions = dedupe(skippedFunctions);
+
+    migratedCount = uniqueMigratedFunctions.length;
+    failedCount = uniqueFailedFunctions.length;
+    skippedCount = uniqueSkippedFunctions.length;
+
+    const summary = {
+        timestamp: new Date().toISOString(),
+        sourceRef: SOURCE_REF,
+        targetRef: TARGET_REF,
+        requested: uniqueFilterSet ? requestedFilterNames : null,
+        allowMissing: allowPartialFilter,
+        attempted: attemptedFunctionNames,
+        migrated: uniqueMigratedFunctions,
+        failed: uniqueFailedFunctions,
+        skipped: uniqueSkippedFunctions,
+        missingInSource: dedupe(missingFilterFunctions)
+    };
+
+    const failedFilePath = path.join(MIGRATION_DIR, 'edge_functions_failed.txt');
+    const migratedFilePath = path.join(MIGRATION_DIR, 'edge_functions_migrated.txt');
+    const skippedFilePath = path.join(MIGRATION_DIR, 'edge_functions_skipped.txt');
+    const summaryJsonPath = path.join(MIGRATION_DIR, 'edge_functions_summary.json');
+
+    const writeListFile = (filePath, list) => {
+        const content = list.length > 0 ? `${list.join('\n')}\n` : '';
+        fs.writeFileSync(filePath, content, 'utf8');
+    };
+
+    writeListFile(failedFilePath, uniqueFailedFunctions);
+    writeListFile(migratedFilePath, uniqueMigratedFunctions);
+    writeListFile(skippedFilePath, uniqueSkippedFunctions);
+    fs.writeFileSync(summaryJsonPath, JSON.stringify(summary, null, 2), 'utf8');
+
+    if (uniqueFailedFunctions.length > 0) {
+        logWarning(`Failed edge functions recorded in: ${failedFilePath}`);
+    } else {
+        logSuccess('No edge function failures recorded.');
+    }
+
     // Create README
     const readmePath = path.join(functionsDir, 'README.md');
     const readmeContent = `# Edge Functions Backup

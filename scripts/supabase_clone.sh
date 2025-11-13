@@ -42,8 +42,16 @@ if [ "$SOURCE_ENV" = "$TARGET_ENV" ]; then
 fi
 
 EXTRA_FLAGS=()
+AUTO_PROCEED=false
 if [ $# -gt 0 ]; then
     EXTRA_FLAGS=("$@")
+    for flag in "${EXTRA_FLAGS[@]}"; do
+        case "$flag" in
+            --auto-confirm|--yes|-y)
+                AUTO_PROCEED=true
+                ;;
+        esac
+    done
 fi
 
 cd "$PROJECT_ROOT"
@@ -59,21 +67,31 @@ echo "This operation is destructive on the target environment."
 echo "A pre-clone backup of the target will be created automatically."
 echo
 
-if [ ${#EXTRA_FLAGS[@]} -gt 0 ]; then
-    "$PROJECT_ROOT/scripts/supabase_migration.sh" "$SOURCE_ENV" "$TARGET_ENV" \
-        --mode full \
-        --users \
-        --files \
-        --replace-data \
-        --backup \
-        "${EXTRA_FLAGS[@]}"
-else
-    "$PROJECT_ROOT/scripts/supabase_migration.sh" "$SOURCE_ENV" "$TARGET_ENV" \
-        --mode full \
-        --users \
-        --files \
-        --replace-data \
-        --backup
+if [ "$AUTO_PROCEED" != "true" ]; then
+    read -p "Proceed with cloning $SOURCE_ENV → $TARGET_ENV? [y/N]: " confirm
+    confirm=$(echo "$confirm" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [ "$confirm" != "y" ] && [ "$confirm" != "yes" ]; then
+        echo "[INFO] Clone cancelled by user."
+        exit 0
+    fi
 fi
+
+CMD=(
+    "$PROJECT_ROOT/scripts/supabase_migration.sh"
+    "$SOURCE_ENV"
+    "$TARGET_ENV"
+    --mode full
+    --users
+    --files
+    --replace-data
+    --backup
+    --auto-confirm
+)
+
+if [ ${#EXTRA_FLAGS[@]} -gt 0 ]; then
+    CMD+=("${EXTRA_FLAGS[@]}")
+fi
+
+"${CMD[@]}"
 
 

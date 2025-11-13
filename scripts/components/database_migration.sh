@@ -136,6 +136,12 @@ TARGET_SCHEMA_BEFORE_FILE=""
 TARGET_SCHEMA_AFTER_FILE=""
 RELAXED_NOT_NULL_FILE=""
 
+AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
+SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
+
+# Supabase-managed schemas that are handled by dedicated scripts or platform defaults
+PROTECTED_SCHEMAS=(auth vault storage realtime pgbouncer graphql_public supabase_functions supabase_functions_api pgsodium supavisor)
+
 # Parse arguments - extract flags first, then positional arguments
 SOURCE_ENV=""
 TARGET_ENV=""
@@ -157,6 +163,9 @@ for arg in "$@"; do
             ;;
         --increment|--incremental)
             INCREMENTAL_MODE=true
+            ;;
+        --auto-confirm|--yes|-y)
+            AUTO_CONFIRM_COMPONENT="true"
             ;;
         -h|--help)
             # Will show usage after it's defined
@@ -221,6 +230,30 @@ Returns:
 
 EOF
     exit 1
+}
+
+component_prompt_proceed() {
+    local title=$1
+    local message=${2:-"Proceed?"}
+
+    if [ "${AUTO_CONFIRM_COMPONENT}" = "true" ] || [ "${SKIP_COMPONENT_CONFIRM}" = "true" ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  ${title}"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    log_warning "$message"
+    read -r -p "Proceed? [y/N]: " response
+    response=$(echo "$response" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    echo ""
+
+    if [ "$response" = "y" ] || [ "$response" = "yes" ]; then
+        return 0
+    fi
+    return 1
 }
 
 # Check if help was requested
@@ -316,6 +349,14 @@ log_info "Incremental mode: $INCREMENTAL_MODE"
 log_to_file "$LOG_FILE" "Incremental mode: $INCREMENTAL_MODE"
 echo ""
 
+if [ "$SKIP_COMPONENT_CONFIRM" != "true" ]; then
+    if ! component_prompt_proceed "Database Migration" "Proceed with database migration from $SOURCE_ENV to $TARGET_ENV?"; then
+        log_warning "Database migration skipped by user request."
+        log_to_file "$LOG_FILE" "Database migration skipped by user."
+        exit 0
+    fi
+fi
+
 # Source rollback utilities
 source "$PROJECT_ROOT/lib/rollback_utils.sh" 2>/dev/null || true
 
@@ -335,7 +376,7 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
         
         # Capture target state as SQL for manual rollback
         log_info "Creating rollback SQL script..."
-        local rollback_mode="schema"
+        rollback_mode="schema"
         if [ "$INCLUDE_DATA" = "true" ]; then
             rollback_mode="full"
         fi
@@ -373,18 +414,15 @@ if [ "$INCLUDE_DATA" = "true" ]; then
         POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
     fi
     
-    if [ "$INCLUDE_USERS" = "true" ]; then
-         log_info "Creating full database dump (excluding auth schema - will be handled separately)..."
-        if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
-            -d postgres -Fc --verbose --exclude-schema=auth -f "$DUMP_FILE"; then
-            log_warning "Failed to create full dump via any connection"
-        fi
-    else
-        log_info "Creating full database dump..."
-        if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
-            -d postgres -Fc --verbose -f "$DUMP_FILE"; then
-            log_warning "Failed to create full dump via any connection"
-        fi
+    PG_DUMP_ARGS=(-d postgres -Fc --verbose -f "$DUMP_FILE")
+    for schema in "${PROTECTED_SCHEMAS[@]}"; do
+        PG_DUMP_ARGS+=(--exclude-schema="$schema")
+    done
+
+    log_info "Creating full database dump (protected schemas excluded: ${PROTECTED_SCHEMAS[*]})..."
+    if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
+        "${PG_DUMP_ARGS[@]}"; then
+        log_warning "Failed to create full dump via any connection"
     fi
 else
     log_info "Step 1/3: Dumping source schema (structure only)..."
@@ -403,9 +441,14 @@ else
         POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
     fi
     
-    log_info "Creating schema-only dump (no data)..."
+    PG_DUMP_ARGS=(-d postgres -Fc --schema-only --no-owner --no-acl --verbose -f "$DUMP_FILE")
+    for schema in "${PROTECTED_SCHEMAS[@]}"; do
+        PG_DUMP_ARGS+=(--exclude-schema="$schema")
+    done
+
+    log_info "Creating schema-only dump (protected schemas excluded: ${PROTECTED_SCHEMAS[*]})..."
     if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
-        -d postgres -Fc --schema-only --no-owner --no-acl --verbose -f "$DUMP_FILE"; then
+        "${PG_DUMP_ARGS[@]}"; then
         log_warning "Failed to create schema-only dump via any connection"
     fi
  fi
@@ -562,7 +605,7 @@ else
 fi
 
 # Restore dump
-RESTORE_ARGS=(--verbose)
+RESTORE_ARGS=(--verbose "--role=supabase_admin")
 RESTORE_SUCCESS=false
 RESTORE_OUTPUT=$(mktemp)
 
@@ -608,7 +651,7 @@ if [ "$INCLUDE_DATA" != "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
     fi
 
     log_info "Creating fallback SQL backup for preserved data..."
-    SQL_BACKUP_ARGS=(-d postgres --data-only --inserts --column-inserts --no-owner --no-acl --disable-triggers -f "$TARGET_DATA_BACKUP_SQL")
+    SQL_BACKUP_ARGS=(-d postgres --data-only --inserts --column-inserts --no-owner --no-acl -f "$TARGET_DATA_BACKUP_SQL")
     if [ "$INCLUDE_USERS" = "true" ]; then
         SQL_BACKUP_ARGS+=(--exclude-schema=auth)
     fi
@@ -881,10 +924,11 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
         DATA_DUPLICATE_ALLOWED=true
     fi
     
-    DATA_RESTORE_ARGS=(--verbose --no-owner --no-acl --disable-triggers --data-only -d postgres)
-    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
-        DATA_RESTORE_ARGS+=(--clean)
-    fi
+    DATA_RESTORE_ARGS=(--verbose --no-owner --no-acl --data-only -d postgres "--role=supabase_admin")
+    for schema in "${PROTECTED_SCHEMAS[@]}"; do
+        DATA_RESTORE_ARGS+=(--exclude-schema="$schema")
+    done
+    # --clean cannot be combined with --data-only; target objects are dropped earlier when replace-data is enabled.
     
     DATA_RESTORE_SUCCESS=false
     while IFS='|' read -r host port user label; do
@@ -953,7 +997,6 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" != "true" ] && [ -n "$TA
             --data-only \
             --no-owner \
             --no-acl \
-            --disable-triggers \
             -d postgres \
             "$TARGET_DATA_BACKUP" \
             2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
@@ -1215,7 +1258,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                 --no-owner \
                 --no-acl \
                 --data-only \
-                --disable-triggers \
+                --role=supabase_auth_admin \
                 "$AUTH_USERS_DUMP" \
                 2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
             RESTORE_EXIT_CODE=${PIPESTATUS[0]}
@@ -1277,7 +1320,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                         --no-owner \
                         --no-acl \
                         --data-only \
-                        --disable-triggers \
+            --role=supabase_auth_admin \
                         "$AUTH_USERS_DUMP" \
                         2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
                     RESTORE_EXIT_CODE=${PIPESTATUS[0]}

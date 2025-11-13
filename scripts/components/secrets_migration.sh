@@ -24,6 +24,8 @@ MIGRATION_DIR=${3:-""}
 # Default: only migrate keys with blank values
 INCLUDE_VALUES=false
 INCREMENTAL_MODE=false
+AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
+SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
 
 # Parse arguments for flags
 for arg in "$@"; do
@@ -34,6 +36,9 @@ for arg in "$@"; do
         --increment|--incremental)
             INCREMENTAL_MODE=true
             ;;
+        --auto-confirm|--yes|-y)
+            AUTO_CONFIRM_COMPONENT=true
+            ;;
     esac
 done
 
@@ -43,6 +48,8 @@ if [[ -n "$MIGRATION_DIR" && "$MIGRATION_DIR" == --* ]]; then
         INCLUDE_VALUES=true
     elif [[ "$MIGRATION_DIR" == "--increment" || "$MIGRATION_DIR" == "--incremental" ]]; then
         INCREMENTAL_MODE=true
+    elif [[ "$MIGRATION_DIR" == "--auto-confirm" || "$MIGRATION_DIR" == "--yes" || "$MIGRATION_DIR" == "-y" ]]; then
+        AUTO_CONFIRM_COMPONENT=true
     fi
     MIGRATION_DIR=""
 fi
@@ -78,6 +85,30 @@ Returns:
 
 EOF
     exit 1
+}
+
+component_prompt_proceed() {
+    local title=$1
+    local message=${2:-"Proceed?"}
+
+    if [ "${AUTO_CONFIRM_COMPONENT}" = "true" ] || [ "${SKIP_COMPONENT_CONFIRM}" = "true" ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  ${title}"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    log_warning "$message"
+    read -r -p "Proceed? [y/N]: " response
+    response=$(echo "$response" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    echo ""
+
+    if [ "$response" = "y" ] || [ "$response" = "yes" ]; then
+        return 0
+    fi
+    return 1
 }
 
 # Check arguments
@@ -133,6 +164,14 @@ else
 fi
 log_info "Incremental mode: $INCREMENTAL_MODE (secrets migration uses Management API delta comparison)"
 echo ""
+
+if [ "$SKIP_COMPONENT_CONFIRM" != "true" ]; then
+    if ! component_prompt_proceed "Secrets Migration" "Proceed with secrets migration from $SOURCE_ENV to $TARGET_ENV?"; then
+        log_warning "Secrets migration skipped by user request."
+        log_to_file "$LOG_FILE" "Secrets migration skipped by user."
+        exit 0
+    fi
+fi
 
 # Step 1: Get secrets from source using Management API
 log_info "Step 1/4: Fetching secrets from source project..."

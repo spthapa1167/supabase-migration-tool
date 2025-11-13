@@ -589,11 +589,19 @@ app.post('/api/migration', async (req, res) => {
     // Always add --auto-confirm for web UI (non-interactive)
     args.push('--auto-confirm');
     
+    if (options.mode === 'full') {
+        args.push('--mode', 'full');
+    } else if (options.mode === 'schema') {
+        args.push('--mode', 'schema');
+    }
+    
     if (options.data) args.push('--data');
     if (options.users) args.push('--users');
     if (options.files) args.push('--files');
     if (options.backup) args.push('--backup');
     if (options.dryRun) args.push('--dry-run');
+    if (options.increment) args.push('--increment');
+    if (options.replaceData) args.push('--replace-data');
 
     // If streaming requested, use SSE
     if (stream === true) {
@@ -678,6 +686,97 @@ app.post('/api/migration', async (req, res) => {
     }
 });
 
+// Execute full environment clone with streaming
+app.post('/api/clone', async (req, res) => {
+    const { sourceEnv, targetEnv, options = {}, stream } = req.body;
+
+    if (!sourceEnv || !targetEnv) {
+        return res.status(400).json({ error: 'sourceEnv and targetEnv are required' });
+    }
+
+    const args = [sourceEnv, targetEnv];
+    if (options.autoConfirm) args.push('--auto-confirm');
+
+    if (stream === true) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+        try {
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/supabase_clone.sh');
+            await fs.access(fullPath, fs.constants.F_OK);
+
+            const allArgs = args.filter(arg => arg !== null && arg !== undefined);
+            const child = spawn('bash', [fullPath, ...allArgs], {
+                cwd: PROJECT_ROOT,
+                env: process.env
+            });
+
+            const output = {
+                processId,
+                stdout: '',
+                stderr: '',
+                exitCode: null,
+                status: 'running'
+            };
+
+            child.stdout.on('data', (data) => {
+                const text = data.toString();
+                output.stdout += text;
+                res.write(`data: ${JSON.stringify({ type: 'stdout', data: text })}\n\n`);
+            });
+
+            child.stderr.on('data', (data) => {
+                const text = data.toString();
+                output.stderr += text;
+                res.write(`data: ${JSON.stringify({ type: 'stderr', data: text })}\n\n`);
+            });
+
+            child.on('close', (code) => {
+                output.exitCode = code;
+                output.status = code === 0 ? 'completed' : 'failed';
+                res.write(`data: ${JSON.stringify({ type: 'complete', status: output.status, exitCode: code })}\n\n`);
+                res.end();
+            });
+
+            child.on('error', (error) => {
+                res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+                res.end();
+            });
+
+            activeProcesses.set(processId, {
+                child,
+                output,
+                type: 'environment-clone',
+                sourceEnv,
+                targetEnv,
+                options,
+                startTime: new Date().toISOString(),
+                endpoint: '/api/clone'
+            });
+
+            req.on('close', () => {
+                if (child && !child.killed) {
+                    child.kill();
+                }
+                activeProcesses.delete(processId);
+            });
+        } catch (error) {
+            res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+            res.end();
+        }
+    } else {
+        try {
+            const result = await executeScript('scripts/supabase_clone.sh', args);
+            res.json(result);
+        } catch (error) {
+            res.status(500).json(error);
+        }
+    }
+});
+
 // Execute database migration with streaming
 app.post('/api/migration/database', async (req, res) => {
     const { sourceEnv, targetEnv, migrationDir, options = {}, stream } = req.body;
@@ -691,6 +790,8 @@ app.post('/api/migration/database', async (req, res) => {
     if (options.data) args.push('--data');
     if (options.users) args.push('--users');
     if (options.backup) args.push('--backup');
+    if (options.increment) args.push('--increment');
+    if (options.replaceData) args.push('--replace-data');
 
     // If streaming requested, use SSE
     if (stream === true) {
@@ -786,6 +887,7 @@ app.post('/api/migration/storage', async (req, res) => {
     const args = [sourceEnv, targetEnv];
     if (migrationDir) args.push(migrationDir);
     if (options.files) args.push('--file');
+    if (options.increment) args.push('--increment');
 
     // If streaming requested, use SSE
     if (stream === true) {
@@ -872,7 +974,7 @@ app.post('/api/migration/storage', async (req, res) => {
 
 // Execute edge functions migration with streaming
 app.post('/api/migration/edge-functions', async (req, res) => {
-    const { sourceEnv, targetEnv, migrationDir, stream } = req.body;
+    const { sourceEnv, targetEnv, migrationDir, options = {}, stream } = req.body;
     
     if (!sourceEnv || !targetEnv) {
         return res.status(400).json({ error: 'sourceEnv and targetEnv are required' });
@@ -880,6 +982,7 @@ app.post('/api/migration/edge-functions', async (req, res) => {
 
     const args = [sourceEnv, targetEnv];
     if (migrationDir) args.push(migrationDir);
+    if (options.increment) args.push('--increment');
 
     // If streaming requested, use SSE
     if (stream === true) {
@@ -974,6 +1077,7 @@ app.post('/api/migration/secrets', async (req, res) => {
     const args = [sourceEnv, targetEnv];
     if (migrationDir) args.push(migrationDir);
     if (options.values) args.push('--values');
+    if (options.increment) args.push('--increment');
 
     // If streaming requested, use SSE
     if (stream === true) {

@@ -93,15 +93,6 @@ const runSupabaseCommand = (executable, args, options) => {
     }
 };
 
-const runSupabaseCommand = (executable, args, options) => {
-    try {
-        execFileSync(executable, args, options);
-        return { success: true };
-    } catch (err) {
-        return { success: false, error: err };
-    }
-};
-
 const runDockerSupabaseCommand = (tempRoot, projectRef, dbPassword, args, logger) => {
     const baseArgs = [
         'run',
