@@ -32,6 +32,7 @@ INCLUDE_DATA=false  # Default: false - don't migrate database data by default
 INCLUDE_FILES=false  # Default: false - don't migrate bucket files by default
 INCLUDE_USERS=false  # Default: false - don't migrate auth users by default
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
+INCREMENTAL_MODE=false  # Default: false - full synchronization unless --increment is provided
 
 # Colors
 RED='\033[0;31m'
@@ -60,6 +61,7 @@ Arguments:
 
 Options:
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
+  --increment             Prefer incremental/delta updates for all components (default: full sync)
   --data                  Include database data/rows migration (default: false)
   --replace-data          Allow destructive replace of target data (requires --data). Without this flag, data sync runs in delta/append mode.
   --users                 Include authentication users, roles, and policies migration (default: false)
@@ -143,6 +145,10 @@ parse_args() {
                     exit 1
                 fi
                 shift 2
+                ;;
+            --increment|--incremental)
+                INCREMENTAL_MODE=true
+                shift
                 ;;
             --data)
                 INCLUDE_DATA=true
@@ -1187,20 +1193,23 @@ perform_migration() {
         log_error "Diff comparison cancelled by user"
         return 1
     elif [ $diff_result -eq 2 ]; then
-        # Projects are identical - skip migration
-        log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log_success "  MIGRATION SKIPPED - Projects are identical"
-        log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        echo ""
-        log_info "Source and target projects have identical database schemas."
-        log_info "No migration needed - generating results page..."
-        echo ""
-        
-        # Generate result.md indicating skipped migration
-        generate_result_md "$migration_dir" "⏭️  Skipped (Projects Identical)"
-        
-        log_success "Results page generated: $migration_dir/result.md"
-        return 0
+        if [ "$migrate_data" = "true" ] || [ "$INCLUDE_USERS" = "true" ] || [ "$INCLUDE_FILES" = "true" ]; then
+            log_warning "Database schemas are identical, but data/files/users were requested. Continuing with migration to synchronize state."
+        else
+            log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_success "  MIGRATION SKIPPED - Projects are identical"
+            log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            log_info "Source and target projects have identical database schemas."
+            log_info "No migration needed - generating results page..."
+            echo ""
+            
+            # Generate result.md indicating skipped migration
+            generate_result_md "$migration_dir" "⏭️  Skipped (Projects Identical)"
+            
+            log_success "Results page generated: $migration_dir/result.md"
+            return 0
+        fi
     fi
     
     # Step 3: Actual migration
@@ -1209,6 +1218,11 @@ perform_migration() {
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
     log_info "Migration: $source → $target ($MODE mode)"
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        log_info "Incremental mode: Enabled (components will prefer delta/incremental operations)"
+    else
+        log_info "Incremental mode: Disabled (components will run in standard sync mode)"
+    fi
     echo ""
     
     if [ "$DRY_RUN" = "true" ]; then
@@ -1220,6 +1234,7 @@ perform_migration() {
         echo "  Source: $source ($(get_project_ref "$source"))"
         echo "  Target: $target ($(get_project_ref "$target"))"
         echo "  Mode: $MODE"
+        echo "  Incremental Mode: $INCREMENTAL_MODE"
         echo "  Include Data: $INCLUDE_DATA"
         echo "  Include Users: $INCLUDE_USERS"
         echo "  Include Files: $INCLUDE_FILES"
@@ -1263,12 +1278,16 @@ perform_migration() {
     mkdir -p "$migration_dir"
     touch "$LOG_FILE"
     
-    log_to_file "$LOG_FILE" "Starting migration from $source to $target (mode: $MODE)"
+    log_to_file "$LOG_FILE" "Starting migration from $source to $target (mode: $MODE, incremental: $INCREMENTAL_MODE)"
+    
+    export SKIP_COMPONENT_CONFIRM=true
     
     local exit_code=0
     local actual_migration_dir="$migration_dir"
-    
-    # Step 1: Migrate database (schema + optionally data + users)
+    local -a SUCCEEDED_COMPONENTS=()
+    local -a FAILED_COMPONENTS=()
+    local -a SKIPPED_COMPONENTS=()
+    # Step 1: Migrate database (schema + optionally data)
     # Check if data migration is requested (either via --data flag or --mode full)
     local migrate_data=false
     if [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
@@ -1277,6 +1296,12 @@ perform_migration() {
     
     # Build command arguments for database migration
     local db_migration_args=("$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        db_migration_args+=("--increment")
+    fi
+    if [ "$INCLUDE_USERS" = "true" ]; then
+        db_migration_args+=("--users")
+    fi
     if [ "$BACKUP_TARGET" = "true" ]; then
         db_migration_args+=("--backup")
     fi
@@ -1285,9 +1310,6 @@ perform_migration() {
         if [ "$REPLACE_TARGET_DATA" = "true" ]; then
             db_migration_args+=("--replace-data")
         fi
-    fi
-    if [ "$INCLUDE_USERS" = "true" ]; then
-        db_migration_args+=("--users")
     fi
     
     if [ "$MODE" = "full" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
@@ -1300,28 +1322,40 @@ perform_migration() {
         log_info "Data migration set to delta mode: existing target rows will be preserved. Only new data will be attempted."
     fi
 
-    if [ "$migrate_data" = "true" ] && [ "$INCLUDE_USERS" = "true" ]; then
-        log_info "Migrating database (schema + data + auth users)..."
-    elif [ "$migrate_data" = "true" ]; then
+    if [ "$migrate_data" = "true" ]; then
         log_info "Migrating database (schema + data)..."
-    elif [ "$INCLUDE_USERS" = "true" ]; then
-        log_info "Migrating database (schema + auth users)..."
     else
-        log_info "Migrating database (schema only - no data, no users)..."
+        log_info "Migrating database (schema only - no data)..."
     fi
-    
-    # Call database_migration.sh component script
-    if "$PROJECT_ROOT/scripts/components/database_migration.sh" "${db_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Database migration completed successfully"
+
+    if [ "$INCLUDE_USERS" = "true" ]; then
+        log_info "Auth users migration will run within the database migration step."
+    fi
+
+    if [ "$AUTO_CONFIRM" = "true" ]; then
+        db_migration_args+=("--auto-confirm")
+    fi
+
+    if ! prompt_proceed "Database Migration" "Proceed with database migration from $source to $target?"; then
+        log_warning "Database migration skipped by user."
+        SKIPPED_COMPONENTS+=("database")
     else
-        exit_code=$?
-        log_error "Database migration failed!"
-        return 1
+        if "$PROJECT_ROOT/scripts/components/database_migration.sh" "${db_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Database migration completed successfully"
+            SUCCEEDED_COMPONENTS+=("database")
+        else
+            log_error "Database migration encountered errors (continuing to remaining components)."
+            FAILED_COMPONENTS+=("database")
+            exit_code=1
+        fi
     fi
-    
+
     # Step 2: Migrate storage buckets (configuration + optionally files)
     # Build command arguments for storage migration
     local storage_migration_args=("$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        storage_migration_args+=("--increment")
+    fi
     if [ "$INCLUDE_FILES" = "true" ]; then
         storage_migration_args+=("--file")
         log_info "Migrating storage buckets (configuration + files)..."
@@ -1330,33 +1364,110 @@ perform_migration() {
     fi
     
     # Call storage_buckets_migration.sh component script
-    if "$PROJECT_ROOT/scripts/components/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-        if [ "$INCLUDE_FILES" = "true" ]; then
-            log_success "Storage buckets migrated successfully (with files)"
-        else
-            log_success "Storage buckets migrated successfully (configuration only)"
-        fi
+    if [ "$AUTO_CONFIRM" = "true" ]; then
+        storage_migration_args+=("--auto-confirm")
+    fi
+    
+    if ! prompt_proceed "Storage Migration" "Proceed with storage bucket migration from $source to $target?"; then
+        log_warning "Storage migration skipped by user."
+        SKIPPED_COMPONENTS+=("storage")
     else
-        log_warning "Storage buckets migration had errors, continuing..."
+        if "$PROJECT_ROOT/scripts/components/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            if [ "$INCLUDE_FILES" = "true" ]; then
+                log_success "Storage buckets migrated successfully (with files)"
+            else
+                log_success "Storage buckets migrated successfully (configuration only)"
+            fi
+            SUCCEEDED_COMPONENTS+=("storage")
+        else
+            log_warning "Storage buckets migration had errors, continuing..."
+            FAILED_COMPONENTS+=("storage")
+            exit_code=1
+        fi
     fi
     
     # Step 3: Migrate edge functions
     log_info "Migrating edge functions..."
     # Call edge_functions_migration.sh component script
-    if "$PROJECT_ROOT/scripts/components/edge_functions_migration.sh" "$source" "$target" "$migration_dir" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Edge functions migrated successfully"
+    local edge_migration_cmd=("$PROJECT_ROOT/scripts/components/edge_functions_migration.sh" "$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        edge_migration_cmd+=("--increment")
+    fi
+    if [ "$AUTO_CONFIRM" = "true" ]; then
+        edge_migration_cmd+=("--auto-confirm")
+    fi
+    if ! prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $source to $target?"; then
+        log_warning "Edge functions migration skipped by user."
+        SKIPPED_COMPONENTS+=("edge functions")
     else
-        log_warning "Edge functions migration had errors, continuing..."
+        if "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Edge functions migrated successfully"
+            SUCCEEDED_COMPONENTS+=("edge functions")
+        else
+            log_warning "Edge functions migration had errors, continuing..."
+            FAILED_COMPONENTS+=("edge functions")
+            exit_code=1
+        fi
     fi
     
     # Step 4: Migrate secrets
     log_info "Migrating secrets..."
     # Call secrets_migration.sh component script
-    if "$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target" "$migration_dir" 2>&1 | tee -a "$LOG_FILE"; then
-        log_success "Secrets migrated successfully (structure created - values need manual update)"
-    else
-        log_warning "Secrets migration had errors, continuing..."
+    local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target" "$migration_dir")
+    if [ "$INCREMENTAL_MODE" = "true" ]; then
+        secrets_migration_cmd+=("--increment")
     fi
+    if [ "$AUTO_CONFIRM" = "true" ]; then
+        secrets_migration_cmd+=("--auto-confirm")
+    fi
+    if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
+        log_warning "Secrets migration skipped by user."
+        SKIPPED_COMPONENTS+=("secrets")
+    else
+        if "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            log_success "Secrets migrated successfully (structure created - values need manual update)"
+            SUCCEEDED_COMPONENTS+=("secrets")
+        else
+            log_warning "Secrets migration had errors, continuing..."
+            FAILED_COMPONENTS+=("secrets")
+            exit_code=1
+        fi
+    fi
+    
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  COMPONENT SUMMARY"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    if [ ${#SUCCEEDED_COMPONENTS[@]} -gt 0 ]; then
+        local joined_success
+        joined_success=$(printf '%s, ' "${SUCCEEDED_COMPONENTS[@]}")
+        joined_success=${joined_success%, }
+        log_success "Components completed: ${joined_success}"
+        log_to_file "$LOG_FILE" "Components completed successfully: ${joined_success}"
+    else
+        log_warning "No components completed successfully."
+        log_to_file "$LOG_FILE" "No components completed successfully."
+    fi
+
+    if [ ${#FAILED_COMPONENTS[@]} -gt 0 ]; then
+        local joined_failed
+        joined_failed=$(printf '%s, ' "${FAILED_COMPONENTS[@]}")
+        joined_failed=${joined_failed%, }
+        log_warning "Components with errors: ${joined_failed}"
+        log_to_file "$LOG_FILE" "Components with errors: ${joined_failed}"
+    else
+        log_success "No component errors reported."
+        log_to_file "$LOG_FILE" "No component errors reported."
+    fi
+
+    if [ ${#SKIPPED_COMPONENTS[@]} -gt 0 ]; then
+        local joined_skipped
+        joined_skipped=$(printf '%s, ' "${SKIPPED_COMPONENTS[@]}")
+        joined_skipped=${joined_skipped%, }
+        log_warning "Components skipped: ${joined_skipped}"
+        log_to_file "$LOG_FILE" "Components skipped: ${joined_skipped}"
+    fi
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info ""
     
     # The duplicate script creates its own BACKUP_DIR, so find the most recent one
     # But we also need to check if the migration_dir we created was used
@@ -1542,6 +1653,12 @@ interactive_mode() {
         DRY_RUN=true
     fi
     
+    # Prompt for incremental mode
+    read -p "Prefer incremental (delta) mode? [y/N]: " increment_input
+    if [[ "$increment_input" =~ ^[Yy]$ ]]; then
+        INCREMENTAL_MODE=true
+    fi
+    
     echo ""
     log_info "Configuration:"
     log_info "  Source: $SOURCE_ENV"
@@ -1553,6 +1670,7 @@ interactive_mode() {
     log_info "  Include Files: $INCLUDE_FILES"
     log_info "  Backup: $BACKUP_TARGET"
     log_info "  Dry Run: $DRY_RUN"
+    log_info "  Incremental Mode: $INCREMENTAL_MODE"
     echo ""
 }
 
@@ -1581,6 +1699,10 @@ main() {
         exit 1
     fi
     
+    if [ "$REPLACE_TARGET_DATA" = "true" ] && [ "$INCREMENTAL_MODE" = "true" ]; then
+        log_warning "--increment requested but --replace-data also set; replace mode will override incremental data behaviour."
+    fi
+    
     # Load environment using the robust load_env function
     if [ ! -f "$ENV_FILE" ]; then
         log_error "Environment file not found: $ENV_FILE"
@@ -1597,6 +1719,9 @@ main() {
     fi
     
     log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
+
+    # Make auto-confirm setting available to component scripts
+    export AUTO_CONFIRM
 
     # Note: We don't cleanup before migration anymore
     # Cleanup happens AFTER migration completes to keep last 3 records

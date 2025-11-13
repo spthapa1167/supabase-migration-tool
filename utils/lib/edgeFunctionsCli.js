@@ -84,6 +84,40 @@ const resolveDownloadedPath = (workspace, functionName) => {
     return null;
 };
 
+const runSupabaseCommand = (executable, args, options) => {
+    try {
+        execFileSync(executable, args, options);
+        return { success: true };
+    } catch (err) {
+        return { success: false, error: err };
+    }
+};
+
+const runDockerSupabaseCommand = (tempRoot, projectRef, dbPassword, args, logger) => {
+    const baseArgs = [
+        'run',
+        '--rm',
+        '-v',
+        `${tempRoot}:/workspace`,
+        '-w',
+        '/workspace'
+    ];
+
+    if (process.env.SUPABASE_ACCESS_TOKEN) {
+        baseArgs.push('-e', `SUPABASE_ACCESS_TOKEN=${process.env.SUPABASE_ACCESS_TOKEN}`);
+    }
+
+    if (dbPassword) {
+        baseArgs.push('-e', `SUPABASE_DB_PASSWORD=${dbPassword}`);
+    }
+
+    const dockerArgs = baseArgs.concat(['supabase/cli:latest']).concat(args);
+    return runSupabaseCommand('docker', dockerArgs, {
+        stdio: 'pipe',
+        timeout: 120000
+    });
+};
+
 const downloadEdgeFunctionWithCli = (projectRef, functionName, destination, dbPassword, logger = defaultLogger) => {
     const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), `edge-cli-${functionName}-`));
     const originalCwd = process.cwd();
@@ -105,34 +139,101 @@ const downloadEdgeFunctionWithCli = (projectRef, functionName, destination, dbPa
             throw error;
         }
 
-        logger.info(`Downloading edge function ${functionName} via Supabase CLI...`);
-        try {
-            execFileSync('supabase', ['functions', 'download', functionName], {
+        const runDownload = (cliExecutable, extraArgs = []) => {
+            const args = ['functions', 'download', functionName, ...extraArgs];
+            const result = runSupabaseCommand(cliExecutable, args, {
                 stdio: 'pipe',
-                timeout: 60000
+                timeout: 90000
             });
-        } catch (err) {
-            const message = err.message || '';
-            if (message.includes('Function not found') || message.includes('does not exist')) {
-                const notFoundError = new Error(message);
-                notFoundError.notFound = true;
-                throw notFoundError;
-            }
-            logger.warning('Regular download failed, trying legacy bundle...');
-            try {
-                execFileSync('supabase', ['functions', 'download', '--legacy-bundle', functionName], {
-                    stdio: 'pipe',
-                    timeout: 60000
-                });
-            } catch (legacyErr) {
-                const legacyMessage = legacyErr.message || '';
-                if (legacyMessage.includes('Function not found') || legacyMessage.includes('does not exist')) {
-                    const notFoundError = new Error(legacyMessage);
+            if (!result.success) {
+                const message = result.error?.message || '';
+                if (message.includes('Function not found') || message.includes('does not exist')) {
+                    const notFoundError = new Error(message);
                     notFoundError.notFound = true;
                     throw notFoundError;
                 }
-                throw legacyErr;
+                return result.error;
             }
+            return null;
+        };
+
+        logger.info(`Downloading edge function ${functionName} via Supabase CLI...`);
+        let cliError = runDownload('supabase');
+        const errorMessages = [];
+
+        const formatError = (label, err) => {
+            if (!err) return '';
+            const stderr = err.stderr ? err.stderr.toString() : '';
+            const stdout = err.stdout ? err.stdout.toString() : '';
+            return `${label}:\n${err.message || ''}\n${stderr}\n${stdout}`;
+        };
+
+        if (cliError) {
+            errorMessages.push(formatError('Supabase CLI', cliError));
+            const combined = `${cliError.message || ''}\n${cliError.stderr ? cliError.stderr.toString() : ''}\n${cliError.stdout ? cliError.stdout.toString() : ''}`;
+            if (/invalid eszip/i.test(combined) || /legacy[- ]bundle/i.test(combined) || /eszip v2/i.test(combined) || /docker/i.test(combined)) {
+                logger.warning('Regular download failed, trying legacy bundle...');
+                const legacyError = runDownload('supabase', ['--legacy-bundle']);
+                if (!legacyError) {
+                    cliError = null;
+                } else {
+                    errorMessages.push(formatError('Supabase CLI --legacy-bundle', legacyError));
+                    logger.warning('Legacy bundle download failed; attempting Supabase CLI via npx (latest)...');
+                    const npmCacheDir = fs.mkdtempSync(path.join(os.tmpdir(), 'supabase-npm-cache-'));
+                    const env = {
+                        ...process.env,
+                        npm_config_cache: npmCacheDir
+                    };
+                    const npxArgs = ['--yes', 'supabase@latest', 'functions', 'download', functionName];
+                    const npxResult = runSupabaseCommand('npx', npxArgs, {
+                        stdio: 'pipe',
+                        timeout: 150000,
+                        env
+                    });
+                    if (!npxResult.success) {
+                        errorMessages.push(formatError('npx supabase@latest', npxResult.error));
+                        logger.warning('npx supabase@latest failed; attempting Supabase CLI via Docker...');
+
+                        const linkResult = runDockerSupabaseCommand(
+                            tempRoot,
+                            projectRef,
+                            dbPassword,
+                            ['link', '--project-ref', projectRef].concat(dbPassword ? ['--password', dbPassword] : []),
+                            logger
+                        );
+
+                        if (!linkResult.success) {
+                            errorMessages.push(formatError('Docker supabase link', linkResult.error));
+                        }
+
+                        const dockerResult = runDockerSupabaseCommand(
+                            tempRoot,
+                            projectRef,
+                            dbPassword,
+                            ['functions', 'download', functionName],
+                            logger
+                        );
+
+                        if (!dockerResult.success) {
+                            errorMessages.push(formatError('Docker supabase functions download', dockerResult.error));
+                            fs.rmSync(npmCacheDir, { recursive: true, force: true });
+                            throw new Error(`All Supabase CLI download attempts failed:\n${errorMessages.join('\n---\n')}`);
+                        }
+
+                        fs.rmSync(npmCacheDir, { recursive: true, force: true });
+                        cliError = null;
+                    } else {
+                        fs.rmSync(npmCacheDir, { recursive: true, force: true });
+                        cliError = null;
+                    }
+                }
+            } else {
+                throw cliError;
+            }
+        }
+
+        if (cliError) {
+            throw cliError;
         }
 
         const downloadedPath = resolveDownloadedPath(tempRoot, functionName);

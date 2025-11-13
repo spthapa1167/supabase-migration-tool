@@ -504,6 +504,26 @@ function formatFileSize(bytes) {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
 }
 
+function normalizeTimestamp(value) {
+    if (value === null || value === undefined) {
+        return null;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.floor(value);
+    }
+    if (typeof value === 'string') {
+        const numeric = Number(value);
+        if (!Number.isNaN(numeric) && Number.isFinite(numeric)) {
+            return Math.floor(numeric);
+        }
+        const parsed = Date.parse(value);
+        if (!Number.isNaN(parsed)) {
+            return Math.floor(parsed);
+        }
+    }
+    return null;
+}
+
 // Main migration function
 async function migrateStorage() {
     logSeparator();
@@ -631,7 +651,8 @@ async function migrateStorage() {
             // Create target file map for comparison
             const targetFileMap = new Map(targetFiles.map(f => [f.path, { 
                 etag: f.etag || f.metadata?.etag || '', 
-                size: f.metadata?.size || f.size || 0 
+                size: f.metadata?.size ?? f.size ?? 0,
+                updatedAt: normalizeTimestamp(f.updated_at ?? f.updatedAt ?? f.last_accessed_at ?? f.metadata?.last_modified ?? null)
             }]));
             
             // Compare files by ETag
@@ -643,8 +664,16 @@ async function migrateStorage() {
                 const sourceEtag = sourceFile.etag || sourceFile.metadata?.etag || '';
                 const targetFile = targetFileMap.get(filePath);
                 const targetEtag = targetFile?.etag || '';
+                const sourceSize = sourceFile.metadata?.size ?? sourceFile.size ?? 0;
+                const targetSize = targetFile?.size ?? 0;
+                const sourceUpdated = normalizeTimestamp(sourceFile.updated_at ?? sourceFile.updatedAt ?? sourceFile.last_accessed_at ?? sourceFile.metadata?.last_modified ?? null);
+                const targetUpdated = targetFile?.updatedAt ?? null;
                 
-                if (targetEtag && targetEtag === sourceEtag) {
+                const etagMatch = Boolean(targetEtag && sourceEtag && targetEtag === sourceEtag);
+                const sizeMatch = sourceSize === targetSize && sourceSize !== null;
+                const updatedMatch = sourceUpdated !== null && targetUpdated !== null && sourceUpdated === targetUpdated;
+                
+                if (etagMatch || (sizeMatch && updatedMatch)) {
                     identicalFiles++;
                 } else {
                     filesToMigrate.push(sourceFile);

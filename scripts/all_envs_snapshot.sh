@@ -103,6 +103,7 @@ query_database_counts() {
     
     local direct_host="db.${project_ref}.supabase.co"
     local tables views functions sequences indexes policies triggers types enums
+    local public_tables public_rows
 
     run_count_with_fallback() {
         local query=$1
@@ -143,8 +144,10 @@ query_database_counts() {
     triggers=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname IN ('public','storage','auth') AND NOT t.tgisinternal;" "triggers")
     types=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname IN ('public','storage','auth') AND t.typtype = 'c';" "types")
     enums=$(run_count_with_fallback "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname IN ('public','storage','auth') AND t.typtype = 'e';" "enums")
+    public_tables=$(run_count_with_fallback "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';" "public tables")
+    public_rows=$(run_count_with_fallback "WITH counted AS (SELECT (xpath('/row/cnt/text()', query_to_xml(format('SELECT COUNT(*) AS cnt FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS row_count FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE') SELECT COALESCE(SUM(row_count), 0) FROM counted;" "public table rows")
 
-    echo "{\"tables\":${tables:-0},\"views\":${views:-0},\"functions\":${functions:-0},\"sequences\":${sequences:-0},\"indexes\":${indexes:-0},\"policies\":${policies:-0},\"triggers\":${triggers:-0},\"types\":${types:-0},\"enums\":${enums:-0}}"
+    echo "{\"tables\":${tables:-0},\"views\":${views:-0},\"functions\":${functions:-0},\"sequences\":${sequences:-0},\"indexes\":${indexes:-0},\"policies\":${policies:-0},\"triggers\":${triggers:-0},\"types\":${types:-0},\"enums\":${enums:-0},\"publicTables\":${public_tables:-0},\"publicRows\":${public_rows:-0}}"
 }
 
 query_auth_users_count() {
@@ -370,7 +373,7 @@ collect_env_snapshot() {
     if [ -z "$project_ref" ] || [ -z "$password" ]; then
         log_warning "  Skipping $env_name: Missing project_ref or password"
         # Return empty but valid JSON structure
-        echo "{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"\",\"projectName\":\"\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":0,\"views\":0,\"functions\":0,\"sequences\":0,\"indexes\":0,\"policies\":0,\"triggers\":0,\"types\":0,\"enums\":0,\"authUsers\":0,\"edgeFunctions\":0,\"buckets\":0,\"secrets\":0,\"totalRows\":0,\"storageObjects\":0},\"tableRows\":[],\"storageBucketObjects\":[]}"
+        echo "{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"\",\"projectName\":\"\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":0,\"views\":0,\"functions\":0,\"sequences\":0,\"indexes\":0,\"policies\":0,\"triggers\":0,\"types\":0,\"enums\":0,\"publicTables\":0,\"publicRows\":0,\"authUsers\":0,\"edgeFunctions\":0,\"buckets\":0,\"secrets\":0,\"totalRows\":0,\"storageObjects\":0},\"tableRows\":[],\"storageBucketObjects\":[]}"
         return 0
     fi
     
@@ -423,7 +426,7 @@ collect_env_snapshot() {
     # Ensure db_counts is valid JSON
     if ! echo "$db_counts" | jq empty 2>/dev/null; then
         log_warning "  Invalid db_counts JSON, using defaults"
-        db_counts='{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0}'
+        db_counts='{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"publicTables":0,"publicRows":0}'
     fi
     
     # Build JSON snapshot
@@ -457,6 +460,8 @@ collect_env_snapshot() {
                     triggers: (.triggers // 0),
                     types: (.types // 0),
                     enums: (.enums // 0),
+                    publicTables: (.publicTables // 0),
+                    publicRows: (.publicRows // 0),
                     authUsers: $auth,
                     edgeFunctions: $edge,
                     buckets: $bucket,
@@ -487,10 +492,12 @@ collect_env_snapshot() {
         local triggers=$(echo "$db_counts" | grep -o '"triggers":[0-9]*' | cut -d: -f2 || echo "0")
         local types=$(echo "$db_counts" | grep -o '"types":[0-9]*' | cut -d: -f2 || echo "0")
         local enums=$(echo "$db_counts" | grep -o '"enums":[0-9]*' | cut -d: -f2 || echo "0")
+        local public_tables=$(echo "$db_counts" | grep -o '"publicTables":[0-9]*' | cut -d: -f2 || echo "0")
+        local public_rows=$(echo "$db_counts" | grep -o '"publicRows":[0-9]*' | cut -d: -f2 || echo "0")
         local total_rows=0
         local storage_total=0
 
-        snapshot_json="{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"$project_ref\",\"projectName\":\"$project_name\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":$tables,\"views\":$views,\"functions\":$functions,\"sequences\":$sequences,\"indexes\":$indexes,\"policies\":$policies,\"triggers\":$triggers,\"types\":$types,\"enums\":$enums,\"authUsers\":$auth_users,\"edgeFunctions\":$edge_functions,\"buckets\":$buckets,\"secrets\":$secrets,\"totalRows\":$total_rows,\"storageObjects\":$storage_total},\"tableRows\":$table_rows,\"storageBucketObjects\":$storage_objects}"
+        snapshot_json="{\"env\":\"$env\",\"name\":\"$env_name\",\"projectRef\":\"$project_ref\",\"projectName\":\"$project_name\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"counts\":{\"tables\":$tables,\"views\":$views,\"functions\":$functions,\"sequences\":$sequences,\"indexes\":$indexes,\"policies\":$policies,\"triggers\":$triggers,\"types\":$types,\"enums\":$enums,\"publicTables\":$public_tables,\"publicRows\":$public_rows,\"authUsers\":$auth_users,\"edgeFunctions\":$edge_functions,\"buckets\":$buckets,\"secrets\":$secrets,\"totalRows\":$total_rows,\"storageObjects\":$storage_total},\"tableRows\":$table_rows,\"storageBucketObjects\":$storage_objects}"
     fi
     
     echo "$snapshot_json"
@@ -520,19 +527,19 @@ if command -v jq >/dev/null 2>&1; then
     # Validate each snapshot
     if ! echo "$DEV_SNAPSHOT" | jq empty 2>/dev/null; then
         log_warning "DEV_SNAPSHOT is invalid JSON, using empty object"
-        DEV_SNAPSHOT='{"env":"dev","name":"Development","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
+        DEV_SNAPSHOT='{"env":"dev","name":"Development","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"publicTables":0,"publicRows":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
     fi
     if ! echo "$TEST_SNAPSHOT" | jq empty 2>/dev/null; then
         log_warning "TEST_SNAPSHOT is invalid JSON, using empty object"
-        TEST_SNAPSHOT='{"env":"test","name":"Test/Staging","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
+        TEST_SNAPSHOT='{"env":"test","name":"Test/Staging","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"publicTables":0,"publicRows":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
     fi
     if ! echo "$PROD_SNAPSHOT" | jq empty 2>/dev/null; then
         log_warning "PROD_SNAPSHOT is invalid JSON, using empty object"
-        PROD_SNAPSHOT='{"env":"prod","name":"Production","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
+        PROD_SNAPSHOT='{"env":"prod","name":"Production","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"publicTables":0,"publicRows":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
     fi
     if ! echo "$BACKUP_SNAPSHOT" | jq empty 2>/dev/null; then
         log_warning "BACKUP_SNAPSHOT is invalid JSON, using empty object"
-        BACKUP_SNAPSHOT='{"env":"backup","name":"Backup","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
+        BACKUP_SNAPSHOT='{"env":"backup","name":"Backup","projectRef":"","projectName":"","timestamp":"","counts":{"tables":0,"views":0,"functions":0,"sequences":0,"indexes":0,"policies":0,"triggers":0,"types":0,"enums":0,"publicTables":0,"publicRows":0,"authUsers":0,"edgeFunctions":0,"buckets":0,"secrets":0,"totalRows":0,"storageObjects":0},"tableRows":[],"storageBucketObjects":[]}'
     fi
     
     # Use jq to safely combine the JSON objects

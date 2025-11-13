@@ -408,13 +408,21 @@ get_supabase_connection_endpoints() {
     local pooler_region=${2:-aws-1-us-east-2}
     local pooler_port=${3:-6543}
 
-    local shared_pooler_host="${pooler_region}.pooler.supabase.com"
-    local dedicated_pooler_host="db.${project_ref}.supabase.co"
+    local shared_pooler_host=""
+
+    # Try to resolve pooler host via helpers (env variables / Management API)
+    shared_pooler_host=$(get_pooler_host "$project_ref" 2>/dev/null || true)
+    if [ -z "$shared_pooler_host" ]; then
+        shared_pooler_host="${pooler_region}.pooler.supabase.com"
+    fi
+
+    # Prefer explicit pooler port if provided via helper
+    if [ -z "$pooler_port" ]; then
+        pooler_port="6543"
+    fi
 
     echo "${shared_pooler_host}|${pooler_port}|postgres.${project_ref}|shared_pooler_${pooler_port}"
     echo "${shared_pooler_host}|5432|postgres.${project_ref}|shared_pooler_5432"
-    echo "${dedicated_pooler_host}|${pooler_port}|postgres|dedicated_pooler_${pooler_port}"
-    echo "${dedicated_pooler_host}|5432|postgres|dedicated_pooler_5432"
 }
 
 # Run a PostgreSQL tool (pg_dump, pg_restore, etc.) with fallback connections

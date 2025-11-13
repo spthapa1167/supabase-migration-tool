@@ -222,11 +222,15 @@ get_db_schema_info() {
     # Row counts (list)
     local row_counts_query="
         SELECT 
-            schemaname||'.'||relname as table_name,
-            COALESCE(n_live_tup::text, '0') as row_count
-        FROM pg_stat_user_tables 
-        WHERE schemaname IN ('public', 'storage', 'auth')
-        ORDER BY schemaname, relname;
+            table_schema||'.'||table_name AS table_name,
+            COALESCE((
+                SELECT reltuples::bigint 
+                FROM pg_class 
+                WHERE pg_class.oid = format('%I.%I', table_schema, table_name)::regclass
+            ), 0)::text AS row_count
+        FROM information_schema.tables
+        WHERE table_schema IN ('public', 'storage', 'auth')
+        ORDER BY table_schema, table_name;
     "
     run_psql_with_fallback "$output_file.row_counts" "table row counts" "$ref" "$password" "$pooler_region" "$pooler_port" "$row_counts_query"
     
@@ -256,7 +260,21 @@ get_db_schema_info() {
     local policies_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY schemaname, tablename, policyname), '[]'::json) FROM ( SELECT schemaname, tablename, policyname, permissive, roles, cmd, qual, with_check FROM pg_policies WHERE schemaname IN ('public','storage') ) t;"
     run_psql_with_fallback "$output_file.policies.json" "policy metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$policies_json_query"
 
-    local row_counts_json_query="SELECT COALESCE(json_agg(row_to_json(t) ORDER BY schemaname, relname), '[]'::json) FROM ( SELECT schemaname, relname AS table_name, COALESCE(n_live_tup,0) AS row_count FROM pg_stat_user_tables WHERE schemaname IN ('public','storage','auth') ) t;"
+    local row_counts_json_query="
+        SELECT COALESCE(json_agg(row_to_json(t) ORDER BY table_schema, table_name), '[]'::json)
+        FROM (
+            SELECT 
+                table_schema,
+                table_name,
+                COALESCE((
+                    SELECT reltuples::bigint 
+                    FROM pg_class 
+                    WHERE pg_class.oid = format('%I.%I', table_schema, table_name)::regclass
+                ), 0) AS row_count
+            FROM information_schema.tables
+            WHERE table_schema IN ('public','storage','auth')
+        ) t;
+    "
     run_psql_with_fallback "$output_file.row_counts.json" "row count metadata" "$ref" "$password" "$pooler_region" "$pooler_port" "$row_counts_json_query"
 
     rm -f "$output_file.triggers.tmp" "$output_file.sequences.tmp" "$output_file.tables.tmp" "$output_file.views.tmp" "$output_file.db_functions.tmp" "$output_file.row_counts.tmp" "$output_file.policies.tmp"
@@ -349,10 +367,10 @@ get_edge_functions_info() {
     
     local function_count
     function_count=$(jq 'length' "$raw_file" 2>/dev/null || echo 0)
-    if [ "$function_count" -eq 0 ] && [ "${ALLOW_EMPTY_EDGE_FUNCTIONS:-false}" != "true" ]; then
-        log_error "Edge function API returned zero functions for $env. Ensure the access token has appropriate permissions."
-        rm -f "$list_file"
-        return 1
+    if [ "$function_count" -eq 0 ]; then
+        log_warning "Edge function API returned zero functions for $env. Continuing with empty set."
+        : > "$list_file"
+        return 0
     fi
     
     if ! jq -r '.[].name' "$raw_file" 2>/dev/null | sort > "$list_file"; then
@@ -375,21 +393,21 @@ download_edge_functions_code() {
 
     if [ ! -f "$functions_list_file" ] || [ ! -s "$functions_list_file" ]; then
         log_warning "No edge function names available for $env; skipping code download"
-        return 1
+        return 0
     fi
 
     local functions_list
     functions_list=$(get_file_contents "$functions_list_file")
     if [ -z "$functions_list" ]; then
-        log_error "Edge function list for $env is empty"
-        return 1
+        log_warning "Edge function list for $env is empty; skipping code download"
+        return 0
     fi
 
     mkdir -p "$destination_dir"
 
     if ! node "$SCRIPT_DIR/../utils/download-edge-functions.js" "$ref" "$functions_list_file" "$destination_dir" "$env" "${password:-}"; then
-        log_error "Failed to download edge function code from $env"
-        return 1
+        log_warning "Failed to download edge function code from $env; continuing without function code"
+        return 0
     fi
 
     return 0

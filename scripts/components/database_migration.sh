@@ -129,11 +129,25 @@ INCLUDE_USERS=false
 BACKUP_TARGET=false
 MIGRATION_DIR=""
 REPLACE_TARGET_DATA=false
+INCREMENTAL_MODE=false
 TARGET_DATA_BACKUP=""
 TARGET_DATA_BACKUP_SQL=""
 TARGET_SCHEMA_BEFORE_FILE=""
 TARGET_SCHEMA_AFTER_FILE=""
 RELAXED_NOT_NULL_FILE=""
+
+AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
+SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
+
+# Supabase-managed schemas that are handled by dedicated scripts or platform defaults
+PROTECTED_SCHEMAS=(auth vault storage realtime pgbouncer graphql_public supabase_functions supabase_functions_api pgsodium supavisor)
+INCLUDE_TABLES=()
+
+PYTHON_BIN=$(command -v python3 || command -v python || true)
+if [ -z "$PYTHON_BIN" ]; then
+    log_error "python3 (or python) is required but not found in PATH."
+    exit 1
+fi
 
 # Parse arguments - extract flags first, then positional arguments
 SOURCE_ENV=""
@@ -153,6 +167,12 @@ for arg in "$@"; do
             ;;
         --replace-data|--force-data-replace)
             REPLACE_TARGET_DATA=true
+            ;;
+        --increment|--incremental)
+            INCREMENTAL_MODE=true
+            ;;
+        --auto-confirm|--yes|-y)
+            AUTO_CONFIRM_COMPONENT="true"
             ;;
         -h|--help)
             # Will show usage after it's defined
@@ -192,6 +212,7 @@ Default Behavior:
   By default, migrates SCHEMA ONLY (no data, no auth users).
   Use --data flag to include data migration.
   Use --users flag to include authentication users, roles, and policies.
+  Use --increment to prefer incremental/delta operations (non-destructive) when possible.
 
 Arguments:
   source_env     Source environment (prod, test, dev, backup)
@@ -201,6 +222,7 @@ Arguments:
   --replace-data Replace target data (destructive). Without this flag, data migrations run in append/delta mode.
   --users        Include authentication users, roles, and policies
   --backup       Create backup of target before migration (optional)
+  --increment    Prefer incremental/delta operations (default: disabled)
 
 Examples:
   $0 prod test                          # Migrate schema only (default)
@@ -215,6 +237,30 @@ Returns:
 
 EOF
     exit 1
+}
+
+component_prompt_proceed() {
+    local title=$1
+    local message=${2:-"Proceed?"}
+
+    if [ "${AUTO_CONFIRM_COMPONENT}" = "true" ] || [ "${SKIP_COMPONENT_CONFIRM}" = "true" ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  ${title}"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    log_warning "$message"
+    read -r -p "Proceed? [y/N]: " response
+    response=$(echo "$response" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    echo ""
+
+    if [ "$response" = "y" ] || [ "$response" = "yes" ]; then
+        return 0
+    fi
+    return 1
 }
 
 # Check if help was requested
@@ -298,11 +344,25 @@ else
     log_info "📊 Database Schema-Only Migration"
 fi
 
+if [ "$INCREMENTAL_MODE" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
+    log_warning "Incremental mode requested but --replace-data supplied; replace mode will override incremental behaviour for data sections."
+fi
+
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR"
 log_info "Mode: $MIGRATION_MODE"
+log_info "Incremental mode: $INCREMENTAL_MODE"
+log_to_file "$LOG_FILE" "Incremental mode: $INCREMENTAL_MODE"
 echo ""
+
+if [ "$SKIP_COMPONENT_CONFIRM" != "true" ]; then
+    if ! component_prompt_proceed "Database Migration" "Proceed with database migration from $SOURCE_ENV to $TARGET_ENV?"; then
+        log_warning "Database migration skipped by user request."
+        log_to_file "$LOG_FILE" "Database migration skipped by user."
+        exit 0
+    fi
+fi
 
 # Source rollback utilities
 source "$PROJECT_ROOT/lib/rollback_utils.sh" 2>/dev/null || true
@@ -323,14 +383,20 @@ if [ "$BACKUP_TARGET" = "--backup" ] || [ "$BACKUP_TARGET" = "true" ]; then
         
         # Capture target state as SQL for manual rollback
         log_info "Creating rollback SQL script..."
+        rollback_mode="schema"
         if [ "$INCLUDE_DATA" = "true" ]; then
-            if capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "full"; then
-                log_success "Rollback SQL script created: $MIGRATION_DIR/rollback_db.sql"
+            rollback_mode="full"
+        fi
+        if ! capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "$rollback_mode"; then
+            if [ "$rollback_mode" = "full" ]; then
+                log_warning "Full rollback capture failed, attempting schema-only fallback..."
+                capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "schema" || \
+                    log_warning "Schema-only rollback capture also failed."
+            else
+                log_warning "Schema-only rollback capture failed."
             fi
         else
-            if capture_target_state_for_rollback "$TARGET_REF" "$TARGET_PASSWORD" "$MIGRATION_DIR/rollback_db.sql" "schema"; then
-                log_success "Rollback SQL script created: $MIGRATION_DIR/rollback_db.sql"
-            fi
+            log_success "Rollback SQL script created: $MIGRATION_DIR/rollback_db.sql"
         fi
         
         supabase unlink --yes 2>/dev/null || true
@@ -355,18 +421,15 @@ if [ "$INCLUDE_DATA" = "true" ]; then
         POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
     fi
     
-    if [ "$INCLUDE_USERS" = "true" ]; then
-         log_info "Creating full database dump (excluding auth schema - will be handled separately)..."
-        if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
-            -d postgres -Fc --verbose --exclude-schema=auth -f "$DUMP_FILE"; then
-            log_warning "Failed to create full dump via any connection"
-        fi
-    else
-        log_info "Creating full database dump..."
-        if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
-            -d postgres -Fc --verbose -f "$DUMP_FILE"; then
-            log_warning "Failed to create full dump via any connection"
-        fi
+    PG_DUMP_ARGS=(-d postgres -Fc --verbose -f "$DUMP_FILE")
+    for schema in "${PROTECTED_SCHEMAS[@]}"; do
+        PG_DUMP_ARGS+=(--exclude-schema="$schema")
+    done
+
+    log_info "Creating full database dump (protected schemas excluded: ${PROTECTED_SCHEMAS[*]})..."
+    if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
+        "${PG_DUMP_ARGS[@]}"; then
+        log_warning "Failed to create full dump via any connection"
     fi
 else
     log_info "Step 1/3: Dumping source schema (structure only)..."
@@ -385,9 +448,14 @@ else
         POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
     fi
     
-    log_info "Creating schema-only dump (no data)..."
+    PG_DUMP_ARGS=(-d postgres -Fc --schema-only --no-owner --no-acl --verbose -f "$DUMP_FILE")
+    for schema in "${PROTECTED_SCHEMAS[@]}"; do
+        PG_DUMP_ARGS+=(--exclude-schema="$schema")
+    done
+
+    log_info "Creating schema-only dump (protected schemas excluded: ${PROTECTED_SCHEMAS[*]})..."
     if ! run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
-        -d postgres -Fc --schema-only --no-owner --no-acl --verbose -f "$DUMP_FILE"; then
+        "${PG_DUMP_ARGS[@]}"; then
         log_warning "Failed to create schema-only dump via any connection"
     fi
  fi
@@ -544,19 +612,26 @@ else
 fi
 
 # Restore dump
-RESTORE_ARGS=(--verbose)
+RESTORE_ARGS=(--verbose "--role=supabase_admin")
 RESTORE_SUCCESS=false
 RESTORE_OUTPUT=$(mktemp)
 
+RESTORE_ARGS+=(--schema-only --no-owner --no-acl)
 if [ "$INCLUDE_DATA" = "true" ]; then
     log_info "Step 3/3: Restoring dump to target..."
-    RESTORE_ARGS+=(--clean --if-exists --schema-only --no-owner --no-acl)
 else
     log_info "Step 3/3: Restoring schema dump to target..."
-    RESTORE_ARGS+=(--clean --if-exists --schema-only --no-owner --no-acl)
+fi
+if [ "$INCREMENTAL_MODE" = "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
+    log_info "Incremental mode: skipping --clean on schema restore to avoid dropping target objects."
+else
+    RESTORE_ARGS+=(--clean --if-exists)
 fi
 
 DUPLICATE_ALLOWED=false
+if [ "$INCREMENTAL_MODE" = "true" ]; then
+    DUPLICATE_ALLOWED=true
+fi
 
 # Preserve target data when running schema-only delta migrations
 if [ "$INCLUDE_DATA" != "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
@@ -583,7 +658,7 @@ if [ "$INCLUDE_DATA" != "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
     fi
 
     log_info "Creating fallback SQL backup for preserved data..."
-    SQL_BACKUP_ARGS=(-d postgres --data-only --inserts --column-inserts --no-owner --no-acl --disable-triggers -f "$TARGET_DATA_BACKUP_SQL")
+    SQL_BACKUP_ARGS=(-d postgres --data-only --inserts --column-inserts --no-owner --no-acl -f "$TARGET_DATA_BACKUP_SQL")
     if [ "$INCLUDE_USERS" = "true" ]; then
         SQL_BACKUP_ARGS+=(--exclude-schema=auth)
     fi
@@ -640,7 +715,7 @@ fi
 # Check for actual errors (not "errors ignored on restore")
 if grep -qiE "error:" "$RESTORE_OUTPUT" 2>/dev/null && ! grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; then
     # Check if there are errors other than expected ones
-    error_lines=$(grep -iE "error:" "$RESTORE_OUTPUT" 2>/dev/null | grep -viE "(errors ignored|already exists|does not exist)" || echo "")
+    error_lines=$(grep -iE "error:" "$RESTORE_OUTPUT" 2>/dev/null | grep -viE "(errors ignored|already exists|does not exist|permission denied to set role|must be owner of)" || echo "")
     if [ "$DUPLICATE_ALLOWED" = "true" ]; then
         error_lines=$(echo "$error_lines" | grep -viE "duplicate key value violates unique constraint|Key \\(" || echo "")
         if grep -qiE "duplicate key value violates unique constraint" "$RESTORE_OUTPUT" 2>/dev/null; then
@@ -851,58 +926,95 @@ fi
 if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
     log_info "Step 3b/3: Applying data changes from source dump..."
     
-    DATA_DUPLICATE_ALLOWED=false
-    if [ "$REPLACE_TARGET_DATA" != "true" ]; then
-        DATA_DUPLICATE_ALLOWED=true
-    fi
-    
-    DATA_RESTORE_ARGS=(--verbose --no-owner --no-acl --disable-triggers --data-only -d postgres)
-    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
-        DATA_RESTORE_ARGS+=(--clean)
-    fi
+    DATA_RESTORE_ARGS=(--verbose --no-owner --no-acl --data-only -d postgres "--role=supabase_admin")
+    for schema in "${PROTECTED_SCHEMAS[@]}"; do
+        DATA_RESTORE_ARGS+=(--exclude-schema="$schema")
+    done
+    for table in "${INCLUDE_TABLES[@]}"; do
+        DATA_RESTORE_ARGS+=(--table="$table")
+    done
     
     DATA_RESTORE_SUCCESS=false
-    while IFS='|' read -r host port user label; do
-        [ -z "$host" ] && continue
-        
-        log_info "Restoring source data via ${label} (${host}:${port})..."
-        restore_log=$(mktemp)
-        set +e
-        PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
-            -h "$host" \
-            -p "$port" \
-            -U "$user" \
-            "${DATA_RESTORE_ARGS[@]}" \
-            "$DUMP_FILE" \
-            2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
-        DATA_RESTORE_EXIT=${PIPESTATUS[0]}
-        set -e
-        
-        if [ $DATA_RESTORE_EXIT -eq 0 ]; then
-            DATA_RESTORE_SUCCESS=true
-            log_success "Data restore from source succeeded via ${label}"
-            rm -f "$restore_log"
-            break
-        fi
-        
-        if [ "$DATA_DUPLICATE_ALLOWED" = "true" ] && \
-            { grep -qiE "duplicate key value violates unique constraint" "$restore_log" || grep -qiE "errors ignored on restore" "$restore_log"; }; then
-            DATA_RESTORE_SUCCESS=true
-            log_warning "Data restore via ${label} completed with duplicate key warnings; existing rows were preserved."
-            rm -f "$restore_log"
-            break
-        fi
-        
-        log_warning "Data restore via ${label} failed (exit code $DATA_RESTORE_EXIT)"
-        if [ -s "$restore_log" ]; then
-            tail -n 5 "$restore_log" | while read line; do
-                log_warning "  $line"
-            done
-        fi
-        rm -f "$restore_log"
-    done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
     
-    rm -f "$DATA_RESTORE_OUTPUT"
+    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        while IFS='|' read -r host port user label; do
+            [ -z "$host" ] && continue
+            
+            log_info "Restoring source data via ${label} (${host}:${port})..."
+            restore_log=$(mktemp)
+            set +e
+            PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
+                -h "$host" \
+                -p "$port" \
+                -U "$user" \
+                "${DATA_RESTORE_ARGS[@]}" \
+                "$DUMP_FILE" \
+                2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
+            DATA_RESTORE_EXIT=${PIPESTATUS[0]}
+            set -e
+            
+            if [ $DATA_RESTORE_EXIT -eq 0 ]; then
+                DATA_RESTORE_SUCCESS=true
+                log_success "Data restore from source succeeded via ${label}"
+                rm -f "$restore_log"
+                break
+            fi
+            
+            log_warning "Data restore via ${label} failed (exit code $DATA_RESTORE_EXIT)"
+            if [ -s "$restore_log" ]; then
+                tail -n 5 "$restore_log" | while read line; do
+                    log_warning "  $line"
+                done
+            fi
+            rm -f "$restore_log"
+        done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    fi
+    
+    if [ "$DATA_RESTORE_SUCCESS" != "true" ]; then
+        log_info "Using incremental SQL restore with ON CONFLICT DO NOTHING..."
+        incremental_sql=$(mktemp)
+        processed_sql=$(mktemp)
+        if pg_restore --data-only --no-owner --no-privileges $(for t in "${INCLUDE_TABLES[@]}"; do printf -- "--table=%s " "$t"; done) -f "$incremental_sql" "$DUMP_FILE"; then
+            if [ "${#INCLUDE_TABLES[@]}" -gt 0 ]; then
+                TARGET_TABLE_LIST=$(for t in "${INCLUDE_TABLES[@]}"; do printf "'%s'," "$t"; done)
+                TARGET_TABLE_LIST="${TARGET_TABLE_LIST%,}"
+                prune_sql=$(mktemp)
+                {
+                    echo "DELETE FROM public._policy_dump_queue;"
+                    echo "CREATE TEMP TABLE _inserted_tables(table_name text primary key);"
+                } >"$prune_sql"
+                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
+                cat <<'SQL' >>"$processed_sql"
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN SELECT DISTINCT table_schema || '.' || table_name AS full_name
+             FROM information_schema.tables
+             WHERE table_schema NOT IN ('pg_catalog','information_schema') LOOP
+        BEGIN
+            EXECUTE 'INSERT INTO _inserted_tables(table_name) VALUES ($1)' USING r.full_name;
+        EXCEPTION WHEN unique_violation THEN
+            NULL;
+        END;
+    END LOOP;
+END $$;
+
+SQL
+            else
+                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
+            fi
+            if run_psql_script_with_fallback "Incremental data restore" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$processed_sql"; then
+                log_success "Incremental data restore completed successfully."
+                DATA_RESTORE_SUCCESS=true
+            else
+                log_error "Incremental SQL restore failed."
+            fi
+        else
+            log_error "pg_restore could not produce SQL dump for incremental restore."
+        fi
+        rm -f "$incremental_sql" "$processed_sql"
+    fi
     
     if [ "$DATA_RESTORE_SUCCESS" = "true" ]; then
         log_success "Source data restored successfully."
@@ -930,7 +1042,6 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" != "true" ] && [ -n "$TA
             --data-only \
             --no-owner \
             --no-acl \
-            --disable-triggers \
             -d postgres \
             "$TARGET_DATA_BACKUP" \
             2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"
@@ -1192,7 +1303,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                 --no-owner \
                 --no-acl \
                 --data-only \
-                --disable-triggers \
+                --role=supabase_auth_admin \
                 "$AUTH_USERS_DUMP" \
                 2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
             RESTORE_EXIT_CODE=${PIPESTATUS[0]}
@@ -1254,7 +1365,7 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
                         --no-owner \
                         --no-acl \
                         --data-only \
-                        --disable-triggers \
+            --role=supabase_auth_admin \
                         "$AUTH_USERS_DUMP" \
                         2>&1 | tee -a "$LOG_FILE" | tee "$RESTORE_OUTPUT"
                     RESTORE_EXIT_CODE=${PIPESTATUS[0]}

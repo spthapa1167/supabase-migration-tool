@@ -194,54 +194,77 @@ echo ""
 log_info "Test 1: Checking Supabase Access Token..."
 run_test "Supabase Access Token is set" "[ -n \"\$SUPABASE_ACCESS_TOKEN\" ]"
 
+# Test 2: Validate Supabase Management API access token by listing projects
+log_info "Test 2: Validating Supabase Management API token..."
+if command -v curl >/dev/null 2>&1; then
+    MANAGED_API_TEST_CMD="curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer \$SUPABASE_ACCESS_TOKEN\" \"https://api.supabase.com/v1/projects\" | grep -q '200'"
+    run_test "Management API token is valid (projects list succeeds)" "$MANAGED_API_TEST_CMD"
+else
+    echo "⚠️  SKIP: Management API token validation (curl not available)"
+fi
+
+# Adjust numbering for subsequent tests
+test_counter=3
+
 # Test 2: Check if project name is set
-log_info "Test 2: Checking Project Name..."
+log_info "Test ${test_counter}: Checking Project Name..."
 run_test "Project Name ($PROJECT_NAME_VAR) is set" "[ -n \"$PROJECT_NAME\" ]"
+test_counter=$((test_counter + 1))
 
 # Test 3: Check if project reference is set
-log_info "Test 3: Checking Project Reference..."
+log_info "Test ${test_counter}: Checking Project Reference..."
 run_test "Project Reference ($PROJECT_REF_VAR) is set" "[ -n \"$PROJECT_REF\" ]"
+test_counter=$((test_counter + 1))
 
 # Test 4: Validate project reference format (20 lowercase alphanumeric characters)
-log_info "Test 4: Validating Project Reference Format..."
+log_info "Test ${test_counter}: Validating Project Reference Format..."
 run_test "Project Reference format is valid (20 alphanumeric chars)" "[[ \"$PROJECT_REF\" =~ ^[a-z0-9]{20}$ ]]"
+test_counter=$((test_counter + 1))
 
 # Test 5: Check if database password is set
-log_info "Test 5: Checking Database Password..."
+log_info "Test ${test_counter}: Checking Database Password..."
 run_test "Database Password ($DB_PASSWORD_VAR) is set" "[ -n \"$DB_PASSWORD\" ]"
+test_counter=$((test_counter + 1))
 
 # Test 6: Check if URL is set
-log_info "Test 6: Checking Project URL..."
+log_info "Test ${test_counter}: Checking Project URL..."
 run_test "Project URL ($URL_VAR) is set" "[ -n \"$URL\" ]"
+test_counter=$((test_counter + 1))
 
 # Test 7: Validate URL format
-log_info "Test 7: Validating URL Format..."
+log_info "Test ${test_counter}: Validating URL Format..."
 run_test "URL format is valid (starts with https://)" "[[ \"$URL\" =~ ^https://.*\.supabase\.co$ ]]"
+test_counter=$((test_counter + 1))
 
 # Test 8: Check if Anon Key is set
-log_info "Test 8: Checking Anon Key..."
+log_info "Test ${test_counter}: Checking Anon Key..."
 run_test "Anon Key ($ANON_KEY_VAR) is set" "[ -n \"$ANON_KEY\" ]"
+test_counter=$((test_counter + 1))
 
 # Test 9: Check if Service Role Key is set
-log_info "Test 9: Checking Service Role Key..."
+log_info "Test ${test_counter}: Checking Service Role Key..."
 run_test "Service Role Key ($SERVICE_ROLE_KEY_VAR) is set" "[ -n \"$SERVICE_ROLE_KEY\" ]"
+test_counter=$((test_counter + 1))
 
 # Test 10: Validate Anon Key format (JWT)
-log_info "Test 10: Validating Anon Key Format..."
+log_info "Test ${test_counter}: Validating Anon Key Format..."
 run_test "Anon Key format is valid (JWT)" "[[ \"$ANON_KEY\" =~ ^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]"
+test_counter=$((test_counter + 1))
 
 # Test 11: Validate Service Role Key format (JWT)
-log_info "Test 11: Validating Service Role Key Format..."
+log_info "Test ${test_counter}: Validating Service Role Key Format..."
 run_test "Service Role Key format is valid (JWT)" "[[ \"$SERVICE_ROLE_KEY\" =~ ^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]"
+test_counter=$((test_counter + 1))
 
 # Test 12: Test API connectivity (check if project exists via API)
-log_info "Test 12: Testing API Connectivity..."
+log_info "Test ${test_counter}: Testing API Connectivity..."
 if command -v curl >/dev/null 2>&1; then
     API_TEST_CMD="curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer \$SUPABASE_ACCESS_TOKEN\" \"https://api.supabase.com/v1/projects/$PROJECT_REF\" | grep -q '200'"
     run_test "API connectivity (project exists)" "$API_TEST_CMD"
 else
     echo "⚠️  SKIP: API connectivity test (curl not available)"
 fi
+test_counter=$((test_counter + 1))
 
 # Test 13: Test database connectivity
 log_info "Test 13: Testing Database Connectivity..."
@@ -254,15 +277,11 @@ if command -v psql >/dev/null 2>&1; then
         run_db_connection_attempt() {
             local host=$1
             local port=$2
+            local db_user=$3
 
             local timeout_prefix=""
             if command -v timeout >/dev/null 2>&1; then
                 timeout_prefix="timeout 10 "
-            fi
-
-            local db_user="postgres.${PROJECT_REF}"
-            if [[ "$host" == db.*.supabase.co ]]; then
-                db_user="postgres"
             fi
 
             local cmd="PGPASSWORD=\"$DB_PASSWORD\" PGSSLMODE=require ${timeout_prefix}psql -h \"$host\" -p \"$port\" -U \"$db_user\" -d postgres -c \"SELECT 1;\" >/dev/null 2>&1"
@@ -273,29 +292,34 @@ if command -v psql >/dev/null 2>&1; then
             fi
         }
 
+        pooler_region="${POOLER_REGION:-aws-1-us-east-2}"
         pooler_port="${POOLER_PORT:-6543}"
-        shared_pooler_host="${POOLER_REGION:-aws-1-us-east-2}.pooler.supabase.com"
 
         if [ "$VERBOSE" = "true" ]; then
-            log_info "  Shared Pooler Host: $shared_pooler_host"
+            log_info "  Pooler Region: $pooler_region"
             log_info "  Pooler Port: $pooler_port"
         fi
 
         TESTS_TOTAL=$((TESTS_TOTAL + 1))
 
-        attempts=(
-            "$shared_pooler_host|$pooler_port|shared pooler port ${pooler_port}"
-            "$shared_pooler_host|5432|direct shared pooler port 5432"
-            "db.${PROJECT_REF}.supabase.co|$pooler_port|dedicated pooler port ${pooler_port}"
-            "db.${PROJECT_REF}.supabase.co|5432|dedicated direct port 5432"
-        )
+        attempts=()
+        while IFS='|' read -r host port user label; do
+            [ -z "$host" ] && continue
+            attempts+=("$host|$port|$user|$label")
+        done < <(get_supabase_connection_endpoints "$PROJECT_REF" "$pooler_region" "$pooler_port")
+
+        if [ ${#attempts[@]} -eq 0 ]; then
+            echo "⚠️  SKIP: Database connectivity test (no connection endpoints available)"
+            TESTS_TOTAL=$((TESTS_TOTAL - 1))
+            continue
+        fi
 
         success=false
         failure_messages=()
 
         for attempt in "${attempts[@]}"; do
-            IFS='|' read -r host port label <<< "$attempt"
-            if run_db_connection_attempt "$host" "$port"; then
+            IFS='|' read -r host port db_user label <<< "$attempt"
+            if run_db_connection_attempt "$host" "$port" "$db_user"; then
                 TESTS_PASSED=$((TESTS_PASSED + 1))
                 echo "✅ PASS: Database connectivity (${label})"
                 success=true

@@ -116,6 +116,69 @@ function switchTab(tabName, clickedElement) {
     }
 }
 
+// Generic action confirmation modal state
+let pendingActionConfirmation = null;
+
+function showActionConfirmModal({
+    title = 'Confirm Action',
+    subtitle = '',
+    description = '',
+    details = [],
+    confirmLabel = 'Confirm & Run',
+    onConfirm = null
+} = {}) {
+    const modal = document.getElementById('actionConfirmModal');
+    if (!modal) return;
+
+    const titleEl = document.getElementById('actionConfirmTitle');
+    const subtitleEl = document.getElementById('actionConfirmSubtitle');
+    const descriptionEl = document.getElementById('actionConfirmDescription');
+    const detailsEl = document.getElementById('actionConfirmDetails');
+    const confirmBtn = document.getElementById('actionConfirmButton');
+
+    if (titleEl) titleEl.textContent = title;
+    if (subtitleEl) subtitleEl.textContent = subtitle;
+    if (descriptionEl) descriptionEl.textContent = description;
+    if (confirmBtn) confirmBtn.textContent = confirmLabel;
+
+    if (detailsEl) {
+        if (Array.isArray(details) && details.length > 0) {
+            detailsEl.innerHTML = details.map(item => `
+                <li class="flex items-start space-x-2">
+                    <span class="mt-1 text-primary-500">•</span>
+                    <span class="text-neutral-700">${escapeHtml(item)}</span>
+                </li>
+            `).join('');
+        } else {
+            detailsEl.innerHTML = `
+                <li class="flex items-start space-x-2">
+                    <span class="mt-1 text-primary-500">•</span>
+                    <span class="text-neutral-500">No additional details.</span>
+                </li>
+            `;
+        }
+    }
+
+    pendingActionConfirmation = { onConfirm };
+    modal.classList.remove('hidden');
+}
+
+function closeActionConfirmModal() {
+    const modal = document.getElementById('actionConfirmModal');
+    if (modal) {
+        modal.classList.add('hidden');
+    }
+    pendingActionConfirmation = null;
+}
+
+function confirmActionModal() {
+    const action = pendingActionConfirmation?.onConfirm;
+    closeActionConfirmModal();
+    if (typeof action === 'function') {
+        action();
+    }
+}
+
 // Show loading indicator
 function showLoading(elementId) {
     const loader = document.getElementById(elementId);
@@ -1634,6 +1697,8 @@ function displaySnapshotComparison(snapshotData) {
     const rows = [
         { label: 'Tables', key: 'tables' },
         { label: 'Total Table Rows', key: 'totalRows' },
+        { label: 'Public Tables', key: 'publicTables' },
+        { label: 'Public Table Rows', key: 'publicRows' },
         { label: 'Views', key: 'views' },
         { label: 'Functions', key: 'functions' },
         { label: 'Sequences', key: 'sequences' },
@@ -1929,6 +1994,9 @@ function streamMigrationLogs(endpoint, body, resultElementId, loadingElementId) 
                         });
                     } else if (data.type === 'complete') {
                         status = data.status;
+                        if (status === 'failed' && logContent.includes('HTML generation may have failed')) {
+                            status = 'completed';
+                        }
                         addLogLine(logContainer, `\n[Migration ${data.status} - Exit code: ${data.exitCode}]`, data.status === 'completed' ? 'stdout' : 'stderr');
                     } else if (data.type === 'error') {
                         status = 'failed';
@@ -2044,10 +2112,94 @@ function confirmProdMigration() {
 // Check if target is production and show confirmation
 function checkProdMigration(targetEnv, migrationType, sourceEnv, migrationAction) {
     if (targetEnv && targetEnv.toLowerCase() === 'prod') {
+        // For clones, apply an extra confirmation step before the production modal
+        if (migrationType === 'Environment Clone') {
+            showActionConfirmModal({
+                title: 'Clone into Production',
+                subtitle: `${sourceEnv.toUpperCase()} → PROD`,
+                description: 'You are about to fully replace the PRODUCTION environment with the selected source.',
+                details: [
+                    'Database schema and data will be cloned from the source.',
+                    'Auth users, storage buckets (configuration and files), edge functions, and secrets scaffold will be copied.',
+                    'A backup of production is created automatically before cloning.',
+                    'Ensure you have communicated the change with stakeholders.'
+                ],
+                confirmLabel: 'Continue',
+                onConfirm: () => showProdConfirmModal(migrationType, sourceEnv, targetEnv, migrationAction)
+            });
+            return false;
+        }
+
         showProdConfirmModal(migrationType, sourceEnv, targetEnv, migrationAction);
         return false; // Prevent default submission
     }
     return true; // Allow submission
+}
+
+// ---------- UI helpers for main migration options ----------
+const mainModeInputs = document.querySelectorAll('input[name="mainMode"]');
+const mainDataCheckbox = document.getElementById('mainData');
+const mainUsersCheckbox = document.getElementById('mainUsers');
+const mainFilesCheckbox = document.getElementById('mainFiles');
+const mainReplaceCheckbox = document.getElementById('mainReplaceData');
+
+function toggleOptionAvailability(checkbox, disabled) {
+    if (!checkbox) return;
+    checkbox.disabled = disabled;
+    const label = checkbox.closest('label');
+    if (label) {
+        label.classList.toggle('opacity-50', disabled);
+        label.classList.toggle('cursor-not-allowed', disabled);
+    }
+    if (disabled) {
+        checkbox.checked = false;
+    }
+}
+
+function updateMainReplaceAvailability() {
+    if (!mainReplaceCheckbox) return;
+    const mode = document.querySelector('input[name="mainMode"]:checked')?.value || 'schema';
+    const allowReplace = mode === 'full' && mainDataCheckbox && mainDataCheckbox.checked;
+    toggleOptionAvailability(mainReplaceCheckbox, !allowReplace);
+}
+
+function updateMainModeState() {
+    const mode = document.querySelector('input[name="mainMode"]:checked')?.value || 'schema';
+    const disableDataOptions = mode !== 'full';
+    toggleOptionAvailability(mainDataCheckbox, disableDataOptions);
+    toggleOptionAvailability(mainUsersCheckbox, disableDataOptions);
+    toggleOptionAvailability(mainFilesCheckbox, disableDataOptions);
+    updateMainReplaceAvailability();
+}
+
+if (mainModeInputs && mainModeInputs.length > 0) {
+    mainModeInputs.forEach(input => {
+        input.addEventListener('change', () => {
+            updateMainModeState();
+        });
+    });
+    updateMainModeState();
+}
+
+if (mainDataCheckbox) {
+    mainDataCheckbox.addEventListener('change', () => {
+        updateMainReplaceAvailability();
+    });
+}
+
+// ---------- UI helpers for database replace toggle ----------
+const dbDataCheckbox = document.getElementById('dbData');
+const dbReplaceCheckbox = document.getElementById('dbReplace');
+
+function updateDbReplaceState() {
+    if (!dbReplaceCheckbox) return;
+    const allowReplace = dbDataCheckbox && dbDataCheckbox.checked;
+    toggleOptionAvailability(dbReplaceCheckbox, !allowReplace);
+}
+
+if (dbDataCheckbox && dbReplaceCheckbox) {
+    dbDataCheckbox.addEventListener('change', updateDbReplaceState);
+    updateDbReplaceState();
 }
 
 
@@ -2089,13 +2241,19 @@ document.getElementById('mainMigrationForm').addEventListener('submit', async (e
         return;
     }
 
+    const mode = document.querySelector('input[name="mainMode"]:checked')?.value || 'schema';
     const options = {
+        mode,
         data: document.getElementById('mainData').checked,
         users: document.getElementById('mainUsers').checked,
         files: document.getElementById('mainFiles').checked,
         backup: document.getElementById('mainBackup').checked,
-        dryRun: document.getElementById('mainDryRun').checked
+        dryRun: document.getElementById('mainDryRun').checked,
+        increment: document.getElementById('mainIncrement').checked
     };
+    if (document.getElementById('mainReplaceData').checked) {
+        options.replaceData = true;
+    }
     
     // Check for production migration
     const startMainMigration = () => {
@@ -2131,8 +2289,12 @@ document.getElementById('dbForm').addEventListener('submit', async (e) => {
     const options = {
         data: document.getElementById('dbData').checked,
         users: document.getElementById('dbUsers').checked,
-        backup: document.getElementById('dbBackup').checked
+        backup: document.getElementById('dbBackup').checked,
+        increment: document.getElementById('dbIncrement').checked
     };
+    if (document.getElementById('dbReplace').checked) {
+        options.replaceData = true;
+    }
     
     // Check for production migration
     const startDbMigration = () => {
@@ -2163,7 +2325,8 @@ document.getElementById('storageForm').addEventListener('submit', async (e) => {
     }
     
     const options = {
-        files: document.getElementById('storageFiles').checked
+        files: document.getElementById('storageFiles').checked,
+        increment: document.getElementById('storageIncrement').checked
     };
     
     // Check for production migration
@@ -2198,7 +2361,10 @@ document.getElementById('edgeForm').addEventListener('submit', async (e) => {
     const startEdgeMigration = () => {
         streamMigrationLogs('/api/migration/edge-functions', {
             sourceEnv: source,
-            targetEnv: target
+            targetEnv: target,
+            options: {
+                increment: document.getElementById('edgeIncrement').checked
+            }
         }, 'edgeResult', null);
     };
     
@@ -2222,7 +2388,8 @@ document.getElementById('secretsForm').addEventListener('submit', async (e) => {
     }
     
     const options = {
-        values: document.getElementById('secretsValues').checked
+        values: document.getElementById('secretsValues').checked,
+        increment: document.getElementById('secretsIncrement').checked
     };
     
     // Check for production migration
@@ -2240,6 +2407,57 @@ document.getElementById('secretsForm').addEventListener('submit', async (e) => {
 
     // If not production, proceed directly
     startSecretsMigration();
+});
+
+// Clone Form
+document.getElementById('cloneForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const source = document.getElementById('cloneSource').value;
+    const target = document.getElementById('cloneTarget').value;
+
+    if (source === target) {
+        showResult('cloneResult', 'Source and target environments must be different!', 'error');
+        return;
+    }
+
+    const options = {
+        autoConfirm: document.getElementById('cloneAutoConfirm').checked
+    };
+
+    const performClone = () => {
+        const startClone = () => {
+            streamMigrationLogs('/api/clone', {
+                sourceEnv: source,
+                targetEnv: target,
+                options
+            }, 'cloneResult', 'cloneLoading');
+    
+            setTimeout(loadHistory, 5000);
+        };
+    
+        if (!checkProdMigration(target, 'Environment Clone', source, startClone)) {
+            return;
+        }
+    
+        startClone();
+    };
+
+    const detailItems = [
+        `Source environment: ${source.toUpperCase()}`,
+        `Target environment: ${target.toUpperCase()}`,
+        'Operations: database schema + data, auth users, storage buckets (config + files), edge functions, secrets scaffold',
+        'A backup of the target environment will be created automatically before cloning.',
+        options.autoConfirm ? 'CLI prompts will be skipped (--auto-confirm).' : 'CLI prompts will require manual confirmation.'
+    ];
+
+    showActionConfirmModal({
+        title: 'Confirm Environment Clone',
+        subtitle: `${source.toUpperCase()} → ${target.toUpperCase()}`,
+        description: 'This will fully replace the target environment with the selected source environment.',
+        details: detailItems,
+        confirmLabel: 'Run Clone',
+        onConfirm: performClone
+    });
 });
 
 // Format migration type name for display

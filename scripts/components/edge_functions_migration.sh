@@ -19,6 +19,20 @@ source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 SOURCE_ENV=${1:-}
 TARGET_ENV=${2:-}
 MIGRATION_DIR=${3:-""}
+INCREMENTAL_MODE="false"
+AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
+SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
+# Parse optional flags (beyond the first three positionals)
+for arg in "$@"; do
+    case "$arg" in
+        --increment|--incremental)
+            INCREMENTAL_MODE="true"
+            ;;
+        --auto-confirm|--yes|-y)
+            AUTO_CONFIRM_COMPONENT="true"
+            ;;
+    esac
+done
 
 # Usage
 usage() {
@@ -31,6 +45,7 @@ Arguments:
   source_env     Source environment (prod, test, dev, backup)
   target_env     Target environment (prod, test, dev, backup)
   migration_dir  Directory to store migration files (optional, auto-generated if not provided)
+  --increment    Prefer incremental/delta operations (default behaviour)
 
 Examples:
   $0 prod test                          # Migrate edge functions from prod to test
@@ -41,6 +56,30 @@ Returns:
 
 EOF
     exit 1
+}
+
+component_prompt_proceed() {
+    local title=$1
+    local message=${2:-"Proceed?"}
+
+    if [ "${AUTO_CONFIRM_COMPONENT}" = "true" ] || [ "${SKIP_COMPONENT_CONFIRM}" = "true" ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  ${title}"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    log_warning "$message"
+    read -r -p "Proceed? [y/N]: " response
+    response=$(echo "$response" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    echo ""
+
+    if [ "$response" = "y" ] || [ "$response" = "yes" ]; then
+        return 0
+    fi
+    return 1
 }
 
 # Check arguments
@@ -68,19 +107,29 @@ fi
 
 # Ensure directory exists
 mkdir -p "$MIGRATION_DIR"
+MIGRATION_DIR_ABS="$(cd "$MIGRATION_DIR" && pwd)"
 
 # Cleanup old backups of the same type
 cleanup_old_backups "$BACKUP_TYPE" "$SOURCE_ENV" "$TARGET_ENV" "$MIGRATION_DIR"
 
 # Set log file
-LOG_FILE="${LOG_FILE:-$MIGRATION_DIR/migration.log}"
+LOG_FILE="${LOG_FILE:-$MIGRATION_DIR_ABS/migration.log}"
 log_to_file "$LOG_FILE" "Starting edge functions migration from $SOURCE_ENV to $TARGET_ENV"
 
 log_info "⚡ Edge Functions Migration"
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
-log_info "Migration directory: $MIGRATION_DIR"
+log_info "Migration directory: $MIGRATION_DIR_ABS"
+log_info "Incremental mode: $INCREMENTAL_MODE (edge functions utility performs delta comparisons by default)"
 echo ""
+
+if [ "$SKIP_COMPONENT_CONFIRM" != "true" ]; then
+    if ! component_prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $SOURCE_ENV to $TARGET_ENV?"; then
+        log_warning "Edge functions migration skipped by user request."
+        log_to_file "$LOG_FILE" "Edge functions migration skipped by user."
+        exit 0
+    fi
+fi
 
 # Check for Node.js
 if ! command -v node >/dev/null 2>&1; then
@@ -122,17 +171,18 @@ log_info "  Target: $TARGET_REF"
 log_info "  Note: Using Supabase Management API and CLI"
 log_info ""
 
+# Assemble Node.js command arguments
+node_args=("$EDGE_FUNCTIONS_UTIL" "$SOURCE_REF" "$TARGET_REF" "$MIGRATION_DIR_ABS")
+if [ "$INCREMENTAL_MODE" = "true" ]; then
+    node_args+=("--incremental")
+fi
+
 # Run Node.js utility and capture output
-# Pass: source_ref, target_ref, migration_dir
 # Environment variables are loaded from .env.local by the Node.js script
 MIGRATION_SUCCESS=false
 # Use PIPESTATUS to properly capture exit code when using pipes
 set +o pipefail  # Temporarily disable pipefail to check exit code manually
-if node "$EDGE_FUNCTIONS_UTIL" \
-    "$SOURCE_REF" \
-    "$TARGET_REF" \
-    "$MIGRATION_DIR" \
-    2>&1 | tee -a "${LOG_FILE:-$MIGRATION_DIR/migration.log}"; then
+if node "${node_args[@]}" 2>&1 | tee -a "${LOG_FILE:-$MIGRATION_DIR/migration.log}"; then
     NODE_EXIT_CODE=${PIPESTATUS[0]}
     if [ "$NODE_EXIT_CODE" -eq 0 ]; then
         MIGRATION_SUCCESS=true
@@ -153,6 +203,17 @@ else
     log_to_file "$LOG_FILE" "Edge functions migration had errors (exit code: $NODE_EXIT_CODE)"
 fi
 set -o pipefail  # Re-enable pipefail
+
+FAILED_FUNCTIONS_FILE="$MIGRATION_DIR_ABS/edge_functions_failed.txt"
+if [ -f "$FAILED_FUNCTIONS_FILE" ]; then
+    if [ -s "$FAILED_FUNCTIONS_FILE" ]; then
+        log_warning "Some edge functions failed to deploy. See: $FAILED_FUNCTIONS_FILE"
+        log_info "Retry only the failed functions with:"
+        log_info "  ./scripts/retry_edge_functions.sh $SOURCE_ENV $TARGET_ENV \"$MIGRATION_DIR_ABS\""
+    else
+        log_info "No edge function failures recorded (empty failure list)."
+    fi
+fi
 
 # Generate HTML report
 if [ "$MIGRATION_SUCCESS" = "true" ]; then

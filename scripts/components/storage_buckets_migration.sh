@@ -29,6 +29,7 @@ Migrates storage buckets (configuration + files) from source to target using del
 Default Behavior:
   By default, migrates BUCKET CONFIGURATION ONLY (no files).
   Use --file or --files flag to include file migration.
+  Use --increment to explicitly request incremental/delta mode (default behaviour).
 
 Arguments:
   source_env     Source environment (prod, test, dev, backup)
@@ -37,6 +38,7 @@ Arguments:
   --file, --files  Include file migration (migrates buckets + files)
   --include-files  Include file migration (same as --file/--files)
   --exclude-files  Exclude file migration (default, migrates bucket config only)
+  --increment      Prefer incremental/delta operations (default: enabled)
 
 Examples:
   $0 dev test                          # Migrate buckets only (default - no files)
@@ -52,6 +54,30 @@ EOF
     exit 1
 }
 
+component_prompt_proceed() {
+    local title=$1
+    local message=${2:-"Proceed?"}
+
+    if [ "${AUTO_CONFIRM_COMPONENT}" = "true" ] || [ "${SKIP_COMPONENT_CONFIRM}" = "true" ]; then
+        return 0
+    fi
+
+    echo ""
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  ${title}"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    log_warning "$message"
+    read -r -p "Proceed? [y/N]: " response
+    response=$(echo "$response" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    echo ""
+
+    if [ "$response" = "y" ] || [ "$response" = "yes" ]; then
+        return 0
+    fi
+    return 1
+}
+
 # Parse arguments
 if [ -z "$SOURCE_ENV" ] || [ -z "$TARGET_ENV" ]; then
     usage
@@ -59,6 +85,9 @@ fi
 
 # Default: bucket configuration only (no files)
 INCLUDE_FILES="false"
+INCREMENTAL_MODE="false"
+AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
+SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
 
 # Parse arguments for flags
 for arg in "$@"; do
@@ -72,6 +101,12 @@ for arg in "$@"; do
         --exclude-files)
             INCLUDE_FILES="false"
             ;;
+        --increment|--incremental)
+            INCREMENTAL_MODE="true"
+            ;;
+        --auto-confirm|--yes|-y)
+            AUTO_CONFIRM_COMPONENT="true"
+            ;;
     esac
 done
 
@@ -83,6 +118,12 @@ if [ -n "$MIGRATION_DIR" ]; then
     elif [ "$MIGRATION_DIR" = "--exclude-files" ]; then
         INCLUDE_FILES="false"
         MIGRATION_DIR=""
+    elif [ "$MIGRATION_DIR" = "--increment" ] || [ "$MIGRATION_DIR" = "--incremental" ]; then
+        INCREMENTAL_MODE="true"
+        MIGRATION_DIR=""
+    elif [ "$MIGRATION_DIR" = "--auto-confirm" ] || [ "$MIGRATION_DIR" = "--yes" ] || [ "$MIGRATION_DIR" = "-y" ]; then
+        AUTO_CONFIRM_COMPONENT="true"
+        MIGRATION_DIR=""
     fi
 fi
 
@@ -92,6 +133,10 @@ if [ -n "${4:-}" ]; then
         INCLUDE_FILES="true"
     elif [ "$4" = "--exclude-files" ]; then
         INCLUDE_FILES="false"
+    elif [ "$4" = "--increment" ] || [ "$4" = "--incremental" ]; then
+        INCREMENTAL_MODE="true"
+    elif [ "$4" = "--auto-confirm" ] || [ "$4" = "--yes" ] || [ "$4" = "-y" ]; then
+        AUTO_CONFIRM_COMPONENT="true"
     fi
 fi
 
@@ -129,7 +174,16 @@ log_info "🗄️  Storage Buckets Migration"
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR"
+log_info "Incremental mode: $INCREMENTAL_MODE (storage migration utility performs delta syncs by default)"
 echo ""
+
+if [ "$SKIP_COMPONENT_CONFIRM" != "true" ]; then
+    if ! component_prompt_proceed "Storage Buckets Migration" "Proceed with storage bucket migration from $SOURCE_ENV to $TARGET_ENV?"; then
+        log_warning "Storage buckets migration skipped by user request."
+        log_to_file "$LOG_FILE" "Storage buckets migration skipped by user."
+        exit 0
+    fi
+fi
 
 # Check for Node.js and storage migration utility
 if ! command -v node >/dev/null 2>&1; then

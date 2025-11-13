@@ -9,8 +9,11 @@
 
 const https = require('https');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const { execSync } = require('child_process');
+const { createManagementClient } = require('./lib/edgeFunctionsClient');
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 // ANSI color codes for console output
 const colors = {
@@ -50,6 +53,56 @@ function logSeparator() {
     console.log('━'.repeat(70));
 }
 
+function mergeDirectories(srcDir, destDir) {
+    if (!fs.existsSync(srcDir)) {
+        return;
+    }
+    fs.mkdirSync(destDir, { recursive: true });
+    const entries = fs.readdirSync(srcDir, { withFileTypes: true });
+    for (const entry of entries) {
+        const srcPath = path.join(srcDir, entry.name);
+        const destPath = path.join(destDir, entry.name);
+        if (entry.isDirectory()) {
+            mergeDirectories(srcPath, destPath);
+        } else if (entry.isFile()) {
+            fs.mkdirSync(path.dirname(destPath), { recursive: true });
+            fs.copyFileSync(srcPath, destPath);
+        }
+    }
+}
+
+function normalizeFunctionLayout(functionDir, downloadRoot) {
+    const sharedDest = path.join(downloadRoot, '_shared');
+    try {
+        const nestedFunctionsDir = path.join(functionDir, 'functions');
+        if (fs.existsSync(nestedFunctionsDir) && fs.lstatSync(nestedFunctionsDir).isDirectory()) {
+            const nestedEntries = fs.readdirSync(nestedFunctionsDir, { withFileTypes: true });
+            for (const entry of nestedEntries) {
+                const entryPath = path.join(nestedFunctionsDir, entry.name);
+                if (entry.name === '_shared') {
+                    mergeDirectories(entryPath, sharedDest);
+                } else {
+                    const destPath = path.join(functionDir, entry.name);
+                    if (fs.existsSync(destPath)) {
+                        fs.rmSync(destPath, { recursive: true, force: true });
+                    }
+                    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+                    fs.cpSync(entryPath, destPath, { recursive: true });
+                }
+            }
+            fs.rmSync(nestedFunctionsDir, { recursive: true, force: true });
+        }
+
+        const localSharedDir = path.join(functionDir, '_shared');
+        if (fs.existsSync(localSharedDir) && fs.lstatSync(localSharedDir).isDirectory()) {
+            mergeDirectories(localSharedDir, sharedDest);
+            fs.rmSync(localSharedDir, { recursive: true, force: true });
+        }
+    } catch (err) {
+        logWarning(`    ⚠ Unable to normalize layout for ${path.basename(functionDir)}: ${err.message}`);
+    }
+}
+
 // Load environment variables from .env.local or .env file
 function loadEnvFile() {
     const envFiles = ['.env.local', '.env'];
@@ -87,10 +140,88 @@ function loadEnvFile() {
 // Load environment variables
 loadEnvFile();
 
+let managementClient = null;
+try {
+    if (process.env.SUPABASE_ACCESS_TOKEN) {
+        managementClient = createManagementClient(process.env.SUPABASE_ACCESS_TOKEN);
+    }
+} catch (clientError) {
+    logWarning(`Unable to initialize Management API client: ${clientError.message}`);
+    managementClient = null;
+}
+
 // Configuration from arguments
 const SOURCE_REF = process.argv[2];
 const TARGET_REF = process.argv[3];
-const MIGRATION_DIR = process.argv[4];
+const MIGRATION_DIR_INPUT = process.argv[4];
+const MIGRATION_DIR = MIGRATION_DIR_INPUT ? path.resolve(process.cwd(), MIGRATION_DIR_INPUT) : undefined;
+
+const additionalArgs = process.argv.slice(5);
+let filterList = [];
+let filterFilePath = null;
+let allowPartialFilter = false;
+let incrementalMode = false;
+
+for (const rawArg of additionalArgs) {
+    if (!rawArg) continue;
+    if (rawArg.startsWith('--functions=')) {
+        const csv = rawArg.split('=')[1] || '';
+        const names = csv.split(',').map((item) => item.trim()).filter(Boolean);
+        filterList = filterList.concat(names);
+    } else if (rawArg.startsWith('--filter-file=')) {
+        filterFilePath = rawArg.split('=')[1] || '';
+    } else if (rawArg === '--allow-missing') {
+        allowPartialFilter = true;
+    } else if (rawArg === '--incremental' || rawArg === '--increment') {
+        incrementalMode = true;
+    } else if (rawArg.trim().length > 0) {
+        logWarning(`Unknown argument ignored: ${rawArg}`);
+    }
+}
+
+if (filterFilePath) {
+    const resolvedPath = path.resolve(process.cwd(), filterFilePath);
+    if (fs.existsSync(resolvedPath)) {
+        const fileContents = fs.readFileSync(resolvedPath, 'utf8');
+        const names = fileContents
+            .split('\n')
+            .map((line) => line.trim())
+            .filter((line) => line.length > 0 && !line.startsWith('#'));
+        filterList = filterList.concat(names);
+    } else {
+        logWarning(`Filter file not found: ${resolvedPath}. Continuing without it.`);
+    }
+}
+
+const uniqueFilterSet = filterList.length > 0 ? new Set(filterList) : null;
+const requestedFilterNames = uniqueFilterSet ? Array.from(uniqueFilterSet) : [];
+const filterNamesFound = new Set();
+const missingFilterFunctions = [];
+
+const migratedFunctions = [];
+const failedFunctions = [];
+const skippedFunctions = [];
+const identicalFunctions = [];
+
+const normalizeTimestamp = (value) => {
+    if (value === null || value === undefined) {
+        return null;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.floor(value);
+    }
+    if (typeof value === 'string') {
+        const numeric = Number(value);
+        if (!Number.isNaN(numeric) && Number.isFinite(numeric)) {
+            return Math.floor(numeric);
+        }
+        const parsed = Date.parse(value);
+        if (!Number.isNaN(parsed)) {
+            return Math.floor(parsed);
+        }
+    }
+    return null;
+};
 
 // Get Supabase URLs, access token, and database password from environment
 function getSupabaseConfig(projectRef) {
@@ -278,94 +409,179 @@ function linkProject(projectRef, dbPassword) {
     }
 }
 
-// Download edge function code using Supabase CLI
-function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword) {
+// Download edge function code (Management API preferred, CLI fallback)
+function findFunctionDirectory(rootDir, functionName) {
+    if (!rootDir || !fs.existsSync(rootDir)) {
+        return null;
+    }
+
+    const candidates = [
+        path.join(rootDir, 'supabase', 'functions', functionName),
+        path.join(rootDir, functionName),
+        rootDir
+    ];
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate) && fs.lstatSync(candidate).isDirectory()) {
+            const contents = fs.readdirSync(candidate);
+            if (contents.length > 0) {
+                return candidate;
+            }
+        }
+    }
+
+    const queue = [rootDir];
+    const visited = new Set();
+
+    while (queue.length > 0) {
+        const current = queue.shift();
+        if (!current || visited.has(current)) continue;
+        visited.add(current);
+
+        let entries = [];
+        try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+
+        const hasEntryPoint = entries.some((entry) => {
+            if (!entry.isFile()) return false;
+            const lower = entry.name.toLowerCase();
+            return lower === 'index.ts' ||
+                lower === 'index.js' ||
+                lower === 'main.ts' ||
+                lower === 'main.js' ||
+                lower === 'deno.json';
+        });
+
+        if (hasEntryPoint) {
+            return current;
+        }
+
+        for (const entry of entries) {
+            if (entry.isDirectory()) {
+                queue.push(path.join(current, entry.name));
+            }
+        }
+    }
+
+    return null;
+}
+
+async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword) {
+    let finalFunctionPath = path.join(downloadDir, functionName);
     try {
         logInfo(`    Downloading function code: ${functionName}...`);
-        
-        // Check if Docker is running (required for function download)
+
+        if (managementClient) {
+            const maxAttempts = 3;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                const apiTempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-api-${functionName}-${attempt}-`));
+                try {
+                    logInfo(`    Attempting Management API bundle download (attempt ${attempt}/${maxAttempts})...`);
+                    await managementClient.downloadFunctionCode(projectRef, functionName, apiTempDir);
+                    const apiFunctionDir = findFunctionDirectory(apiTempDir, functionName);
+                    if (apiFunctionDir) {
+                        fs.rmSync(finalFunctionPath, { recursive: true, force: true });
+                        fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
+                        fs.cpSync(apiFunctionDir, finalFunctionPath, { recursive: true });
+                        normalizeFunctionLayout(finalFunctionPath, downloadDir);
+                        logSuccess(`    ✓ Downloaded function via Management API: ${functionName}`);
+                        fs.rmSync(apiTempDir, { recursive: true, force: true });
+                        return true;
+                    }
+                    logWarning(`    Management API download succeeded but function files were not located; retrying...`);
+                } catch (apiError) {
+                    logWarning(`    Management API download attempt ${attempt}/${maxAttempts} failed (${apiError.message})`);
+                } finally {
+                    fs.rmSync(apiTempDir, { recursive: true, force: true });
+                }
+            }
+            logWarning(`    Management API download failed after retries; falling back to CLI options`);
+        }
+
         if (!checkDocker()) {
-            logError(`    ✗ Docker is not running - required for downloading functions`);
-            logError(`    Please start Docker Desktop and try again`);
+            logError(`    ✗ Docker is not running - required for downloading functions via CLI`);
             throw new Error('Docker is not running');
         }
-        
-        // Create temporary directory for download
-        const tempDir = path.join(downloadDir, '.temp');
-        if (!fs.existsSync(tempDir)) {
-            fs.mkdirSync(tempDir, { recursive: true });
-        }
-        
-        // Create supabase functions directory structure
-        const functionsDir = path.join(tempDir, 'supabase', 'functions');
-        if (!fs.existsSync(functionsDir)) {
-            fs.mkdirSync(functionsDir, { recursive: true });
-        }
-        
-        // Create a minimal config.toml for supabase link
-        const configTomlPath = path.join(tempDir, 'supabase', 'config.toml');
-        if (!fs.existsSync(path.dirname(configTomlPath))) {
-            fs.mkdirSync(path.dirname(configTomlPath), { recursive: true });
-        }
-        fs.writeFileSync(configTomlPath, `project_id = "${projectRef}"\n`);
-        
-        // Change to temp directory and link
+
+        const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-cli-${functionName}-`));
         const originalCwd = process.cwd();
-        process.chdir(tempDir);
-        
         try {
-            // Link to project (in temp directory)
-            logInfo(`    Linking to source project...`);
+            const supabaseDir = path.join(tempDir, 'supabase');
+            const functionsDir = path.join(supabaseDir, 'functions');
+            fs.mkdirSync(functionsDir, { recursive: true });
+            fs.writeFileSync(path.join(supabaseDir, 'config.toml'), `project_id = "${projectRef}"\n`);
+
+            process.chdir(tempDir);
+
+            logInfo(`    Linking to source project for CLI download...`);
             if (!linkProject(projectRef, dbPassword)) {
                 throw new Error('Failed to link to project');
             }
-            
-            // Download function (project is now linked)
-            // Try regular download first, then legacy bundle if that fails
+
             try {
                 execSync(`supabase functions download ${functionName}`, {
                     stdio: 'pipe',
                     timeout: 60000
                 });
             } catch (e) {
-                // If regular download fails, try legacy bundle (for functions deployed with older CLI)
-                if (e.message && (e.message.includes('Docker') || e.message.includes('docker'))) {
+                const stderr = e.stderr ? e.stderr.toString() : '';
+                const stdout = e.stdout ? e.stdout.toString() : '';
+                const combinedOutput = `${e.message || ''}\n${stderr}\n${stdout}`;
+                const needsLegacyBundle = /docker/i.test(combinedOutput) ||
+                    /legacy[- ]bundle/i.test(combinedOutput) ||
+                    /invalid eszip/i.test(combinedOutput) ||
+                    /eszip v2/i.test(combinedOutput);
+
+                if (needsLegacyBundle) {
                     logInfo(`    Regular download failed, trying legacy bundle...`);
-                    execSync(`supabase functions download --legacy-bundle ${functionName}`, {
-                        stdio: 'pipe',
-                        timeout: 60000
-                    });
+                    try {
+                        execSync(`supabase functions download --legacy-bundle ${functionName}`, {
+                            stdio: 'pipe',
+                            timeout: 60000
+                        });
+                    } catch (legacyError) {
+                        const legacyStderr = legacyError.stderr ? legacyError.stderr.toString() : '';
+                        const legacyStdout = legacyError.stdout ? legacyError.stdout.toString() : '';
+                        const legacyCombined = `${legacyError.message || ''}\n${legacyStderr}\n${legacyStdout}`;
+                        throw new Error(`Regular and legacy download attempts failed.\nOriginal error:\n${combinedOutput}\nLegacy attempt error:\n${legacyCombined}`);
+                    }
                 } else {
-                    throw e;
+                    throw new Error(combinedOutput.trim() || e.message);
                 }
             }
-        } catch (e) {
-            process.chdir(originalCwd);
-            throw new Error(`Failed to download function: ${e.message}`);
+
+            const downloadedFunctionPath = findFunctionDirectory(tempDir, functionName) ||
+                path.join(tempDir, 'supabase', 'functions', functionName);
+
+            if (!downloadedFunctionPath || !fs.existsSync(downloadedFunctionPath)) {
+                throw new Error(`Downloaded function directory not found`);
+            }
+
+            fs.rmSync(finalFunctionPath, { recursive: true, force: true });
+            fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
+            fs.cpSync(downloadedFunctionPath, finalFunctionPath, { recursive: true });
+            normalizeFunctionLayout(finalFunctionPath, downloadDir);
+
+            logSuccess(`    ✓ Downloaded function via CLI: ${functionName}`);
+            return true;
         } finally {
             process.chdir(originalCwd);
-        }
-        
-        // Check if download was successful
-        const downloadedFunctionPath = path.join(functionsDir, functionName);
-        if (fs.existsSync(downloadedFunctionPath)) {
-            // Move to final location
-            const finalFunctionPath = path.join(downloadDir, functionName);
-            if (fs.existsSync(finalFunctionPath)) {
-                fs.rmSync(finalFunctionPath, { recursive: true, force: true });
-            }
-            fs.renameSync(downloadedFunctionPath, finalFunctionPath);
-            
-            // Cleanup temp directory
             fs.rmSync(tempDir, { recursive: true, force: true });
-            
-            logSuccess(`    ✓ Downloaded function: ${functionName}`);
-            return true;
-        } else {
-            fs.rmSync(tempDir, { recursive: true, force: true });
-            throw new Error(`Downloaded function directory not found`);
         }
     } catch (error) {
+        const fallbackDir = path.join(PROJECT_ROOT, 'supabase', 'functions', functionName);
+        if (fs.existsSync(fallbackDir)) {
+            logWarning(`    Using local repository copy for ${functionName} (remote download failed)`);
+            fs.rmSync(finalFunctionPath, { recursive: true, force: true });
+            fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
+            fs.cpSync(fallbackDir, finalFunctionPath, { recursive: true });
+            normalizeFunctionLayout(finalFunctionPath, downloadDir);
+            logSuccess(`    ✓ Copied local function source for ${functionName}`);
+            return true;
+        }
         logError(`    ✗ Failed to download function ${functionName}: ${error.message}`);
         return false;
     }
@@ -381,6 +597,8 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
             throw new Error(`Function directory not found: ${functionDir}`);
         }
         
+        normalizeFunctionLayout(functionDir, path.dirname(functionDir));
+
         // Check if function has index file
         const hasIndex = fs.existsSync(path.join(functionDir, 'index.ts')) ||
                         fs.existsSync(path.join(functionDir, 'index.js')) ||
@@ -414,6 +632,19 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
             fs.rmSync(tempFunctionPath, { recursive: true, force: true });
         }
         fs.cpSync(functionDir, tempFunctionPath, { recursive: true });
+
+        const globalSharedDir = path.join(functionsParentDir, '_shared');
+        const localSharedDir = path.join(functionDir, '_shared');
+        const sharedDestDir = path.join(supabaseDir, '_shared');
+        if (fs.existsSync(sharedDestDir)) {
+            fs.rmSync(sharedDestDir, { recursive: true, force: true });
+        }
+        if (fs.existsSync(globalSharedDir)) {
+            mergeDirectories(globalSharedDir, sharedDestDir);
+        }
+        if (fs.existsSync(localSharedDir)) {
+            mergeDirectories(localSharedDir, sharedDestDir);
+        }
         
         // Change to supabase directory and link
         process.chdir(supabaseConfigDir);
@@ -475,6 +706,33 @@ async function migrateEdgeFunctions() {
         logError('Failed to fetch source edge functions - cannot continue migration');
         throw error;
     }
+
+    if (uniqueFilterSet) {
+        logInfo(`Function filter enabled (${requestedFilterNames.length} requested).`);
+        sourceFunctions = sourceFunctions.filter((func) => {
+            const name = func?.name;
+            if (!name) return false;
+            if (uniqueFilterSet.has(name)) {
+                filterNamesFound.add(name);
+                return true;
+            }
+            return false;
+        });
+
+        const missingNames = requestedFilterNames.filter((name) => !filterNamesFound.has(name));
+        if (missingNames.length > 0) {
+            missingFilterFunctions.push(...missingNames);
+            logWarning(`Requested ${missingNames.length} function(s) not present in source: ${missingNames.join(', ')}`);
+            if (!allowPartialFilter) {
+                logWarning('To ignore missing functions, pass --allow-missing (used by retry script).');
+            }
+        }
+
+        logInfo(`Filter result: ${sourceFunctions.length} function(s) available for migration.`);
+        if (sourceFunctions.length === 0) {
+            logWarning('No source functions remain after filtering; exiting early.');
+        }
+    }
     
     console.log('');
     
@@ -511,30 +769,69 @@ async function migrateEdgeFunctions() {
     logInfo(`Function comparison:`);
     logInfo(`  Source: ${sourceFunctions.length} function(s)`);
     logInfo(`  Target: ${targetFunctions.length} function(s)`);
+    logInfo(`  Incremental mode: ${incrementalMode ? 'enabled' : 'disabled (will redeploy existing functions)'}`);
     console.log('');
     
     // Determine which functions need migration
     const functionsToMigrate = [];
-    const functionsToSkip = [];
     
     for (const sourceFunction of sourceFunctions) {
         const functionName = sourceFunction.name;
         const existingFunction = targetFunctionMap.get(functionName);
         
+        if (!functionName) {
+            failedFunctions.push('(unnamed)');
+            continue;
+        }
+        
         if (existingFunction) {
-            // Function exists - we'll download and redeploy to ensure it's up to date
-            // Note: We can't easily compare code versions, so we redeploy
-            functionsToMigrate.push({ function: sourceFunction, isNew: false });
+            const sourceVersion = typeof sourceFunction.version === 'number' ? sourceFunction.version : Number(sourceFunction.version);
+            const targetVersion = typeof existingFunction.version === 'number' ? existingFunction.version : Number(existingFunction.version);
+            const versionMatches = Number.isFinite(sourceVersion) && Number.isFinite(targetVersion) && sourceVersion === targetVersion;
+            
+            const sourceUpdated = normalizeTimestamp(sourceFunction.updated_at ?? sourceFunction.updatedAt);
+            const targetUpdated = normalizeTimestamp(existingFunction.updated_at ?? existingFunction.updatedAt);
+            const updatedMatches = sourceUpdated !== null && targetUpdated !== null && sourceUpdated === targetUpdated;
+            
+            const identical = versionMatches || updatedMatches;
+            
+            if (incrementalMode && identical) {
+                identicalFunctions.push(functionName);
+                skippedFunctions.push(functionName);
+                continue;
+            }
+            
+            functionsToMigrate.push({
+                function: sourceFunction,
+                isNew: false,
+                existing: existingFunction,
+                versionMatches,
+                updatedMatches
+            });
         } else {
             // New function - needs deployment
             functionsToMigrate.push({ function: sourceFunction, isNew: true });
         }
     }
     
-    // Check if all functions are already in target
+    if (incrementalMode && identicalFunctions.length > 0) {
+        logSuccess(`Identical functions skipped (incremental mode): ${identicalFunctions.length}`);
+        const previewCount = Math.min(identicalFunctions.length, 10);
+        const previewList = identicalFunctions.slice(0, previewCount).join(', ');
+        logInfo(`  Skipped: ${previewList}${identicalFunctions.length > previewCount ? ', …' : ''}`);
+        console.log('');
+    }
+    
+    // Check if all functions are already in target (or skipped due to identical versions)
     if (functionsToMigrate.length === 0) {
-        logSuccess(`✓ All source functions already exist in target - no migration needed`);
-        skippedCount = sourceFunctions.length;
+        if (sourceFunctions.length === 0) {
+            logWarning('No edge functions found in source project.');
+        } else {
+            logSuccess(`✓ No edge function updates required for target.`);
+            if (skippedFunctions.length === 0) {
+                skippedFunctions.push(...sourceFunctions.map((fn) => fn?.name).filter(Boolean));
+            }
+        }
     } else {
         logInfo(`Functions to migrate: ${functionsToMigrate.length}`);
         logInfo(`  - New functions: ${functionsToMigrate.filter(f => f.isNew).length}`);
@@ -543,33 +840,39 @@ async function migrateEdgeFunctions() {
         
         // Process each function
         for (let i = 0; i < functionsToMigrate.length; i++) {
-            const { function: sourceFunction, isNew } = functionsToMigrate[i];
+            const { function: sourceFunction, isNew, existing, versionMatches, updatedMatches } = functionsToMigrate[i];
             const functionName = sourceFunction.name;
+            const indexLabel = `${i + 1}/${functionsToMigrate.length}`;
             
             if (!functionName) {
-                logError(`Function ${i + 1} has no name: ${JSON.stringify(sourceFunction)}`);
+                logError(`Function ${indexLabel} has no name: ${JSON.stringify(sourceFunction)}`);
+                failedFunctions.push('(unknown)');
                 continue;
             }
             
-            logInfo(`${colors.bright}Function ${i + 1}/${functionsToMigrate.length}: ${functionName}${colors.reset}`);
+            logInfo(`${colors.bright}Function ${indexLabel}: ${functionName}${colors.reset}`);
             
             if (isNew) {
                 logInfo(`  Status: NEW - will create in target`);
             } else {
                 logInfo(`  Status: EXISTS - will update in target`);
-                const existingFunction = targetFunctionMap.get(functionName);
                 logInfo(`  Source ID: ${sourceFunction.id || 'N/A'}`);
-                logInfo(`  Target ID: ${existingFunction.id || 'N/A'}`);
+                logInfo(`  Target ID: ${existing?.id || 'N/A'}`);
+                if (versionMatches) {
+                    logInfo(`  Note: Versions match; redeploying due to full-sync mode`);
+                } else if (updatedMatches) {
+                    logInfo(`  Note: Last updated timestamps match; redeploy required (full-sync mode)`);
+                }
             }
             
             // Download function from source
             const functionDir = path.join(functionsDir, functionName);
-            const downloadSuccess = downloadEdgeFunction(functionName, SOURCE_REF, functionsDir, sourceConfig.dbPassword);
+            const downloadSuccess = await downloadEdgeFunction(functionName, SOURCE_REF, functionsDir, sourceConfig.dbPassword);
             
             if (!downloadSuccess) {
                 logWarning(`  ⚠ Could not download function code - skipping deployment`);
                 logWarning(`    Function may need to be deployed manually from codebase`);
-                failedCount++;
+                failedFunctions.push(functionName);
                 console.log('');
                 continue;
             }
@@ -577,7 +880,7 @@ async function migrateEdgeFunctions() {
             // Check if function directory was created
             if (!fs.existsSync(functionDir)) {
                 logWarning(`  ⚠ Function directory not found after download - skipping`);
-                failedCount++;
+                failedFunctions.push(functionName);
                 console.log('');
                 continue;
             }
@@ -586,10 +889,10 @@ async function migrateEdgeFunctions() {
             const deploySuccess = deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword);
             
             if (deploySuccess) {
-                migratedCount++;
+                migratedFunctions.push(functionName);
                 logSuccess(`  ✓ Function ${isNew ? 'created' : 'updated'} successfully`);
             } else {
-                failedCount++;
+                failedFunctions.push(functionName);
                 logError(`  ✗ Function migration failed`);
             }
             
@@ -597,6 +900,52 @@ async function migrateEdgeFunctions() {
         }
     }
     
+    const dedupe = (arr) => Array.from(new Set(arr.filter(Boolean)));
+    const attemptedFunctionNames = functionsToMigrate.map(({ function: func }) => func?.name).filter(Boolean);
+    const uniqueMigratedFunctions = dedupe(migratedFunctions);
+    const uniqueFailedFunctions = dedupe([...failedFunctions, ...missingFilterFunctions]);
+    const uniqueSkippedFunctions = dedupe(skippedFunctions);
+
+    migratedCount = uniqueMigratedFunctions.length;
+    failedCount = uniqueFailedFunctions.length;
+    skippedCount = uniqueSkippedFunctions.length;
+
+    const summary = {
+        timestamp: new Date().toISOString(),
+        sourceRef: SOURCE_REF,
+        targetRef: TARGET_REF,
+        requested: uniqueFilterSet ? requestedFilterNames : null,
+        allowMissing: allowPartialFilter,
+        attempted: attemptedFunctionNames,
+        migrated: uniqueMigratedFunctions,
+        failed: uniqueFailedFunctions,
+    skipped: uniqueSkippedFunctions,
+    identical: dedupe(identicalFunctions),
+    incrementalMode,
+    missingInSource: dedupe(missingFilterFunctions)
+    };
+
+    const failedFilePath = path.join(MIGRATION_DIR, 'edge_functions_failed.txt');
+    const migratedFilePath = path.join(MIGRATION_DIR, 'edge_functions_migrated.txt');
+    const skippedFilePath = path.join(MIGRATION_DIR, 'edge_functions_skipped.txt');
+    const summaryJsonPath = path.join(MIGRATION_DIR, 'edge_functions_summary.json');
+
+    const writeListFile = (filePath, list) => {
+        const content = list.length > 0 ? `${list.join('\n')}\n` : '';
+        fs.writeFileSync(filePath, content, 'utf8');
+    };
+
+    writeListFile(failedFilePath, uniqueFailedFunctions);
+    writeListFile(migratedFilePath, uniqueMigratedFunctions);
+    writeListFile(skippedFilePath, uniqueSkippedFunctions);
+    fs.writeFileSync(summaryJsonPath, JSON.stringify(summary, null, 2), 'utf8');
+
+    if (uniqueFailedFunctions.length > 0) {
+        logWarning(`Failed edge functions recorded in: ${failedFilePath}`);
+    } else {
+        logSuccess('No edge function failures recorded.');
+    }
+
     // Create README
     const readmePath = path.join(functionsDir, 'README.md');
     const readmeContent = `# Edge Functions Backup
