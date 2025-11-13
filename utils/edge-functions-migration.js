@@ -160,6 +160,7 @@ const additionalArgs = process.argv.slice(5);
 let filterList = [];
 let filterFilePath = null;
 let allowPartialFilter = false;
+let incrementalMode = false;
 
 for (const rawArg of additionalArgs) {
     if (!rawArg) continue;
@@ -171,6 +172,8 @@ for (const rawArg of additionalArgs) {
         filterFilePath = rawArg.split('=')[1] || '';
     } else if (rawArg === '--allow-missing') {
         allowPartialFilter = true;
+    } else if (rawArg === '--incremental' || rawArg === '--increment') {
+        incrementalMode = true;
     } else if (rawArg.trim().length > 0) {
         logWarning(`Unknown argument ignored: ${rawArg}`);
     }
@@ -198,6 +201,27 @@ const missingFilterFunctions = [];
 const migratedFunctions = [];
 const failedFunctions = [];
 const skippedFunctions = [];
+const identicalFunctions = [];
+
+const normalizeTimestamp = (value) => {
+    if (value === null || value === undefined) {
+        return null;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        return Math.floor(value);
+    }
+    if (typeof value === 'string') {
+        const numeric = Number(value);
+        if (!Number.isNaN(numeric) && Number.isFinite(numeric)) {
+            return Math.floor(numeric);
+        }
+        const parsed = Date.parse(value);
+        if (!Number.isNaN(parsed)) {
+            return Math.floor(parsed);
+        }
+    }
+    return null;
+};
 
 // Get Supabase URLs, access token, and database password from environment
 function getSupabaseConfig(projectRef) {
@@ -745,6 +769,7 @@ async function migrateEdgeFunctions() {
     logInfo(`Function comparison:`);
     logInfo(`  Source: ${sourceFunctions.length} function(s)`);
     logInfo(`  Target: ${targetFunctions.length} function(s)`);
+    logInfo(`  Incremental mode: ${incrementalMode ? 'enabled' : 'disabled (will redeploy existing functions)'}`);
     console.log('');
     
     // Determine which functions need migration
@@ -754,20 +779,59 @@ async function migrateEdgeFunctions() {
         const functionName = sourceFunction.name;
         const existingFunction = targetFunctionMap.get(functionName);
         
+        if (!functionName) {
+            failedFunctions.push('(unnamed)');
+            continue;
+        }
+        
         if (existingFunction) {
-            // Function exists - we'll download and redeploy to ensure it's up to date
-            // Note: We can't easily compare code versions, so we redeploy
-            functionsToMigrate.push({ function: sourceFunction, isNew: false });
+            const sourceVersion = typeof sourceFunction.version === 'number' ? sourceFunction.version : Number(sourceFunction.version);
+            const targetVersion = typeof existingFunction.version === 'number' ? existingFunction.version : Number(existingFunction.version);
+            const versionMatches = Number.isFinite(sourceVersion) && Number.isFinite(targetVersion) && sourceVersion === targetVersion;
+            
+            const sourceUpdated = normalizeTimestamp(sourceFunction.updated_at ?? sourceFunction.updatedAt);
+            const targetUpdated = normalizeTimestamp(existingFunction.updated_at ?? existingFunction.updatedAt);
+            const updatedMatches = sourceUpdated !== null && targetUpdated !== null && sourceUpdated === targetUpdated;
+            
+            const identical = versionMatches || updatedMatches;
+            
+            if (incrementalMode && identical) {
+                identicalFunctions.push(functionName);
+                skippedFunctions.push(functionName);
+                continue;
+            }
+            
+            functionsToMigrate.push({
+                function: sourceFunction,
+                isNew: false,
+                existing: existingFunction,
+                versionMatches,
+                updatedMatches
+            });
         } else {
             // New function - needs deployment
             functionsToMigrate.push({ function: sourceFunction, isNew: true });
         }
     }
     
-    // Check if all functions are already in target
+    if (incrementalMode && identicalFunctions.length > 0) {
+        logSuccess(`Identical functions skipped (incremental mode): ${identicalFunctions.length}`);
+        const previewCount = Math.min(identicalFunctions.length, 10);
+        const previewList = identicalFunctions.slice(0, previewCount).join(', ');
+        logInfo(`  Skipped: ${previewList}${identicalFunctions.length > previewCount ? ', …' : ''}`);
+        console.log('');
+    }
+    
+    // Check if all functions are already in target (or skipped due to identical versions)
     if (functionsToMigrate.length === 0) {
-        logSuccess(`✓ All source functions already exist in target - no migration needed`);
-        skippedFunctions.push(...sourceFunctions.map((fn) => fn?.name).filter(Boolean));
+        if (sourceFunctions.length === 0) {
+            logWarning('No edge functions found in source project.');
+        } else {
+            logSuccess(`✓ No edge function updates required for target.`);
+            if (skippedFunctions.length === 0) {
+                skippedFunctions.push(...sourceFunctions.map((fn) => fn?.name).filter(Boolean));
+            }
+        }
     } else {
         logInfo(`Functions to migrate: ${functionsToMigrate.length}`);
         logInfo(`  - New functions: ${functionsToMigrate.filter(f => f.isNew).length}`);
@@ -776,7 +840,7 @@ async function migrateEdgeFunctions() {
         
         // Process each function
         for (let i = 0; i < functionsToMigrate.length; i++) {
-            const { function: sourceFunction, isNew } = functionsToMigrate[i];
+            const { function: sourceFunction, isNew, existing, versionMatches, updatedMatches } = functionsToMigrate[i];
             const functionName = sourceFunction.name;
             const indexLabel = `${i + 1}/${functionsToMigrate.length}`;
             
@@ -792,9 +856,13 @@ async function migrateEdgeFunctions() {
                 logInfo(`  Status: NEW - will create in target`);
             } else {
                 logInfo(`  Status: EXISTS - will update in target`);
-                const existingFunction = targetFunctionMap.get(functionName);
                 logInfo(`  Source ID: ${sourceFunction.id || 'N/A'}`);
-                logInfo(`  Target ID: ${existingFunction.id || 'N/A'}`);
+                logInfo(`  Target ID: ${existing?.id || 'N/A'}`);
+                if (versionMatches) {
+                    logInfo(`  Note: Versions match; redeploying due to full-sync mode`);
+                } else if (updatedMatches) {
+                    logInfo(`  Note: Last updated timestamps match; redeploy required (full-sync mode)`);
+                }
             }
             
             // Download function from source
@@ -851,8 +919,10 @@ async function migrateEdgeFunctions() {
         attempted: attemptedFunctionNames,
         migrated: uniqueMigratedFunctions,
         failed: uniqueFailedFunctions,
-        skipped: uniqueSkippedFunctions,
-        missingInSource: dedupe(missingFilterFunctions)
+    skipped: uniqueSkippedFunctions,
+    identical: dedupe(identicalFunctions),
+    incrementalMode,
+    missingInSource: dedupe(missingFilterFunctions)
     };
 
     const failedFilePath = path.join(MIGRATION_DIR, 'edge_functions_failed.txt');

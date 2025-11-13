@@ -171,17 +171,18 @@ log_info "  Target: $TARGET_REF"
 log_info "  Note: Using Supabase Management API and CLI"
 log_info ""
 
+# Assemble Node.js command arguments
+node_args=("$EDGE_FUNCTIONS_UTIL" "$SOURCE_REF" "$TARGET_REF" "$MIGRATION_DIR_ABS")
+if [ "$INCREMENTAL_MODE" = "true" ]; then
+    node_args+=("--incremental")
+fi
+
 # Run Node.js utility and capture output
-# Pass: source_ref, target_ref, migration_dir
 # Environment variables are loaded from .env.local by the Node.js script
 MIGRATION_SUCCESS=false
 # Use PIPESTATUS to properly capture exit code when using pipes
 set +o pipefail  # Temporarily disable pipefail to check exit code manually
-if node "$EDGE_FUNCTIONS_UTIL" \
-    "$SOURCE_REF" \
-    "$TARGET_REF" \
-    "$MIGRATION_DIR_ABS" \
-    2>&1 | tee -a "${LOG_FILE:-$MIGRATION_DIR/migration.log}"; then
+if node "${node_args[@]}" 2>&1 | tee -a "${LOG_FILE:-$MIGRATION_DIR/migration.log}"; then
     NODE_EXIT_CODE=${PIPESTATUS[0]}
     if [ "$NODE_EXIT_CODE" -eq 0 ]; then
         MIGRATION_SUCCESS=true

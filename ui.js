@@ -1697,6 +1697,8 @@ function displaySnapshotComparison(snapshotData) {
     const rows = [
         { label: 'Tables', key: 'tables' },
         { label: 'Total Table Rows', key: 'totalRows' },
+        { label: 'Public Tables', key: 'publicTables' },
+        { label: 'Public Table Rows', key: 'publicRows' },
         { label: 'Views', key: 'views' },
         { label: 'Functions', key: 'functions' },
         { label: 'Sequences', key: 'sequences' },
