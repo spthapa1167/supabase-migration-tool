@@ -55,6 +55,12 @@ load_env
 validate_environments "$SOURCE_ENV" "$TARGET_ENV"
 log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
 
+PYTHON_BIN=$(command -v python3 || command -v python || true)
+if [[ -z "$PYTHON_BIN" ]]; then
+    log_error "python3 or python is required."
+    exit 1
+fi
+
 SOURCE_REF=$(get_project_ref "$SOURCE_ENV")
 TARGET_REF=$(get_project_ref "$TARGET_ENV")
 SOURCE_PASSWORD=$(get_db_password "$SOURCE_ENV")
@@ -63,6 +69,10 @@ SOURCE_POOLER_REGION=$(get_pooler_region_for_env "$SOURCE_ENV")
 TARGET_POOLER_REGION=$(get_pooler_region_for_env "$TARGET_ENV")
 SOURCE_POOLER_PORT=$(get_pooler_port_for_env "$SOURCE_ENV")
 TARGET_POOLER_PORT=$(get_pooler_port_for_env "$TARGET_ENV")
+
+TARGET_DIRECT_HOST="db.${TARGET_REF}.supabase.co"
+TARGET_DIRECT_PORT="5432"
+TARGET_DIRECT_USER="postgres.${TARGET_REF}"
 
 REQUIRED_BINARIES=(pg_dump pg_restore psql)
 for bin in "${REQUIRED_BINARIES[@]}"; do
@@ -107,6 +117,9 @@ MIGRATION_DIR=$(create_backup_dir "auth_system_tables" "$SOURCE_ENV" "$TARGET_EN
 LOG_FILE="$MIGRATION_DIR/migration.log"
 DUMP_FILE="$MIGRATION_DIR/auth_system_tables.dump"
 TRUNCATE_SQL="$MIGRATION_DIR/truncate_tables.sql"
+DELETE_SQL="$MIGRATION_DIR/delete_auth_tables.sql"
+RESTORE_SQL_RAW="$MIGRATION_DIR/auth_system_data_raw.sql"
+RESTORE_SQL="$MIGRATION_DIR/auth_system_data.sql"
 
 log_to_file "$LOG_FILE" "Syncing auth system tables from $SOURCE_ENV to $TARGET_ENV"
 
@@ -158,46 +171,64 @@ psql_execute_target_file() {
             return 0
         fi
         log_warning "Failed to execute $file via ${label}; trying next endpoint..."
-    done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    done < <(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT"; echo "${TARGET_DIRECT_HOST}|${TARGET_DIRECT_PORT}|${TARGET_DIRECT_USER}|direct_5432")
     unset PGOPTIONS
-    return 1
-}
-
-restore_tables() {
-    local restore_args=(
-        --data-only
-        --disable-triggers
-        --no-owner
-        --no-privileges
-        --dbname=postgres
-        "$DUMP_FILE"
-    )
-
-    log_info "Restoring auth system tables to $TARGET_ENV..."
-    export PGOPTIONS="-c project=$TARGET_REF"
-    if run_pg_tool_with_fallback "pg_restore" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$LOG_FILE" "${restore_args[@]}"; then
-        unset PGOPTIONS
-        return 0
-    fi
-    unset PGOPTIONS
-
-    log_warning "Pooler pg_restore failed; attempting direct connection..."
-    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require \
-        pg_restore -h "db.${TARGET_REF}.supabase.co" -p 5432 -U "postgres.${TARGET_REF}" \
-        "${restore_args[@]}" >>"$LOG_FILE" 2>&1; then
-        log_success "Direct pg_restore completed."
-        return 0
-    fi
-
-    log_error "Unable to restore auth system tables to target."
     return 1
 }
 
 generate_truncate_sql() {
     : >"$TRUNCATE_SQL"
     for table in "${TABLES[@]}"; do
-        echo "TRUNCATE TABLE ${table} RESTART IDENTITY CASCADE;" >>"$TRUNCATE_SQL"
+        echo "TRUNCATE ${table} RESTART IDENTITY CASCADE;" >>"$TRUNCATE_SQL"
     done
+}
+
+generate_delete_sql() {
+    : >"$DELETE_SQL"
+    {
+        echo "BEGIN;"
+        for table in "${TABLES[@]}"; do
+            echo "DELETE FROM ${table};"
+        done
+        echo "COMMIT;"
+    } >>"$DELETE_SQL"
+}
+
+generate_restore_sql() {
+    local restore_args=(
+        --data-only
+        --no-owner
+        --no-privileges
+    )
+    for table in "${TABLES[@]}"; do
+        restore_args+=(--table="$table")
+    done
+    restore_args+=(
+        --file="$RESTORE_SQL_RAW"
+        "$DUMP_FILE"
+    )
+
+    if ! pg_restore "${restore_args[@]}" >>"$LOG_FILE" 2>&1; then
+        log_error "Failed to extract auth system data from dump."
+        return 1
+    fi
+
+    if ! "$PYTHON_BIN" - "$RESTORE_SQL_RAW" "$RESTORE_SQL" <<'PY'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "r", encoding="utf-8") as infile, open(dst, "w", encoding="utf-8") as outfile:
+    for line in infile:
+        if "SELECT pg_catalog.setval" in line:
+            continue
+        outfile.write(line)
+PY
+    then
+        log_error "Failed to sanitize auth system SQL."
+        return 1
+    fi
+
+    rm -f "$RESTORE_SQL_RAW"
+    return 0
 }
 
 log_info "Migration workspace: $MIGRATION_DIR"
@@ -209,16 +240,28 @@ fi
 
 generate_truncate_sql
 
+generate_delete_sql
+
 if ! psql_execute_target_file "$TRUNCATE_SQL"; then
-    log_error "Failed to truncate target auth system tables."
+    log_warning "TRUNCATE failed (likely due to sequence ownership). Falling back to DELETE statements."
+    if ! psql_execute_target_file "$DELETE_SQL"; then
+        log_error "Failed to delete target auth system table data."
+        exit 1
+    fi
+else
+    log_success "Target auth system tables truncated successfully."
+fi
+rm -f "$TRUNCATE_SQL" "$DELETE_SQL"
+
+if ! generate_restore_sql; then
     exit 1
 fi
-rm -f "$TRUNCATE_SQL"
 
-if ! restore_tables; then
+if ! psql_execute_target_file "$RESTORE_SQL"; then
     log_error "Auth system table restore failed. See $LOG_FILE"
     exit 1
 fi
+rm -f "$RESTORE_SQL"
 
 log_success "Auth system tables synced successfully. Details logged at $LOG_FILE"
 exit 0

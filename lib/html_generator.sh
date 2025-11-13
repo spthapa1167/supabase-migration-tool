@@ -4,19 +4,23 @@
 
 # Generate HTML result page
 generate_result_html() {
-    local migration_dir=$1
-    local status=$2
-    local comparison_file=$3
-    local error_details=${4:-""}  # Optional 4th parameter for error details
-    
-    # Ensure migration_dir exists (create if it doesn't)
-    if [ ! -d "$migration_dir" ]; then
-        mkdir -p "$migration_dir"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Created migration directory: $migration_dir" >&2
-    fi
-    
-    local result_html="$migration_dir/result.html"
-    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    (
+        exec 3>&1
+        exec 1>&2
+        
+        local migration_dir=$1
+        local status=$2
+        local comparison_file=$3
+        local error_details=${4:-""}  # Optional 4th parameter for error details
+        
+        # Ensure migration_dir exists (create if it doesn't)
+        if [ ! -d "$migration_dir" ]; then
+            mkdir -p "$migration_dir"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Created migration directory: $migration_dir"
+        fi
+        
+        local result_html="$migration_dir/result.html"
+        local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     
     # Get all the data needed for HTML generation
     local log_file="$migration_dir/migration.log"
@@ -1799,9 +1803,10 @@ HTML_EOF
     fi
     sed -i.bak "s|EDGE_FUNCTIONS_NEXT_STEPS_PLACEHOLDER|$edge_funcs_next|g" "$result_html" 2>/dev/null || true
     
-    # Clean up backup files (created by sed -i.bak on macOS)
-    find "$migration_dir" -name "result.html.bak" -delete 2>/dev/null || true
-    
-    echo "$result_html"
+        # Clean up backup files (created by sed -i.bak on macOS)
+        find "$migration_dir" -name "result.html.bak" -delete 2>/dev/null || true
+        
+        echo "$result_html" >&3
+    )
 }
 

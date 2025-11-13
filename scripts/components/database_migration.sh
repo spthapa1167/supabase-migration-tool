@@ -715,7 +715,7 @@ fi
 # Check for actual errors (not "errors ignored on restore")
 if grep -qiE "error:" "$RESTORE_OUTPUT" 2>/dev/null && ! grep -qi "errors ignored on restore" "$RESTORE_OUTPUT" 2>/dev/null; then
     # Check if there are errors other than expected ones
-    error_lines=$(grep -iE "error:" "$RESTORE_OUTPUT" 2>/dev/null | grep -viE "(errors ignored|already exists|does not exist)" || echo "")
+    error_lines=$(grep -iE "error:" "$RESTORE_OUTPUT" 2>/dev/null | grep -viE "(errors ignored|already exists|does not exist|permission denied to set role|must be owner of)" || echo "")
     if [ "$DUPLICATE_ALLOWED" = "true" ]; then
         error_lines=$(echo "$error_lines" | grep -viE "duplicate key value violates unique constraint|Key \\(" || echo "")
         if grep -qiE "duplicate key value violates unique constraint" "$RESTORE_OUTPUT" 2>/dev/null; then

@@ -148,6 +148,36 @@ dump_public_schema() {
     return 1
 }
 
+evaluate_restore_output() {
+    local status=$1
+    local output_file=$2
+    local section=$3
+
+    if [ $status -eq 0 ]; then
+        log_success "pg_restore ($section) completed successfully."
+        return 0
+    fi
+
+    if grep -qiE "(FATAL:|could not connect|authentication failed|connection .* failed|SSL connection has been closed|Terminated)" "$output_file" 2>/dev/null; then
+        log_warning "pg_restore ($section) encountered fatal connection errors."
+        return 1
+    fi
+
+    local filtered_errors
+    filtered_errors=$(grep -iE "error:" "$output_file" 2>/dev/null | grep -viE "(errors ignored|already exists|does not exist|permission denied to set role|must be owner of)" || true)
+
+    if [ -z "$filtered_errors" ]; then
+        local ignored_count
+        ignored_count=$(grep -i "errors ignored on restore" "$output_file" 2>/dev/null | sed -n 's/.*errors ignored on restore: \([0-9]*\).*/\1/p' | head -1 || echo "some")
+        log_success "pg_restore ($section) completed with expected warnings (exit code: $status, ignored: $ignored_count)."
+        return 0
+    fi
+
+    log_warning "pg_restore ($section) reported non-ignorable errors:"
+    echo "$filtered_errors" | sed 's/^/    /' >&2
+    return 1
+}
+
 run_pg_restore_section() {
     local section=$1
     shift
@@ -158,28 +188,49 @@ run_pg_restore_section() {
         --no-owner
         --no-privileges
         --dbname=postgres
-        "$DUMP_FILE"
     )
     if [ "$#" -gt 0 ]; then
         restore_args+=("${extra_args[@]}")
     fi
+    restore_args+=("$DUMP_FILE")
 
-    log_info "Restoring $section to $TARGET_ENV via pooler..."
-    export PGOPTIONS="-c project=$TARGET_REF"
-    if run_pg_tool_with_fallback "pg_restore" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$LOG_FILE" "${restore_args[@]}"; then
+    local endpoints
+    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    local temp_log status
+
+    while IFS='|' read -r host port user label; do
+        [[ -z "$host" ]] && continue
+        log_info "Restoring $section to $TARGET_ENV via ${label}..."
+        temp_log=$(mktemp)
+        export PGOPTIONS="-c project=$TARGET_REF"
+        set +e
+        PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require \
+            pg_restore -h "$host" -p "$port" -U "$user" "${restore_args[@]}" >"$temp_log" 2>&1
+        status=$?
+        set -e
         unset PGOPTIONS
-        log_success "pg_restore ($section) completed via pooler."
-        return 0
-    fi
-    unset PGOPTIONS
+        cat "$temp_log" >>"$LOG_FILE"
+        if evaluate_restore_output $status "$temp_log" "$section"; then
+            rm -f "$temp_log"
+            return 0
+        fi
+        rm -f "$temp_log"
+        log_warning "pg_restore ($section) via ${label} did not complete cleanly; trying next endpoint..."
+    done <<< "$endpoints"
 
-    log_warning "Pooler pg_restore ($section) failed; attempting direct connection..."
-    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require \
-        pg_restore -h "$TARGET_DIRECT_HOST" -p "$TARGET_DIRECT_PORT" -U "$TARGET_DIRECT_USER" \
-        "${restore_args[@]}" >>"$LOG_FILE" 2>&1; then
-        log_success "Direct pg_restore ($section) completed."
+    log_warning "Pooler endpoints exhausted; attempting direct connection for $section..."
+    temp_log=$(mktemp)
+    set +e
+    PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require \
+        pg_restore -h "$TARGET_DIRECT_HOST" -p "$TARGET_DIRECT_PORT" -U "$TARGET_DIRECT_USER" "${restore_args[@]}" >"$temp_log" 2>&1
+    status=$?
+    set -e
+    cat "$temp_log" >>"$LOG_FILE"
+    if evaluate_restore_output $status "$temp_log" "$section"; then
+        rm -f "$temp_log"
         return 0
     fi
+    rm -f "$temp_log"
 
     log_error "Unable to restore $section to target."
     return 1
