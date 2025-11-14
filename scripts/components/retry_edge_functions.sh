@@ -300,7 +300,7 @@ log_success "Retry attempt completed. Detailed logs: $RETRY_LOG"
 if [ -s "$FAILED_FILE" ]; then
     log_warning "Remaining functions still need manual attention or additional retries."
     log_info "Use this command to retry again if desired:"
-    log_info "  ./scripts/retry_edge_functions.sh $SOURCE_ENV $TARGET_ENV \"$RETRY_DIR_ABS\""
+    log_info "  ./scripts/components/retry_edge_functions.sh $SOURCE_ENV $TARGET_ENV \"$RETRY_DIR_ABS\""
 else
     log_success "Edge functions for ${SOURCE_ENV} -> ${TARGET_ENV} are fully synchronized."
 fi

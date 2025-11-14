@@ -26,3 +26,4 @@ Thumbs.db
 *.log
 logs/
 diff_results/
+.env_example.txt

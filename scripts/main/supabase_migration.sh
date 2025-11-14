@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Source utilities
@@ -60,6 +60,7 @@ Arguments:
   <target_env>            Target environment (prod, test, dev, backup) - REQUIRED
 
 Options:
+  --full                  Shortcut for schema+data+users+files migration (equivalent to --mode full --data --users --files)
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
   --increment             Prefer incremental/delta updates for all components (default: full sync)
   --data                  Include database data/rows migration (default: false)
@@ -88,28 +89,32 @@ Default Behavior:
   Use --data flag to include database row migration
   Use --users flag to include authentication users, roles, and policies migration
   Use --files flag to include storage bucket file migration
+  Use --full for an all-in-one migration (schema + data + users + files)
 
 Examples:
   # Schema-only migration (default - no data, no files)
-  $0 dev test
+  ./scripts/main/supabase_migration.sh dev test
 
   # Schema + data migration
-  $0 dev test --data
+  ./scripts/main/supabase_migration.sh dev test --data
 
   # Schema + files migration
-  $0 dev test --files
+  ./scripts/main/supabase_migration.sh dev test --files
 
-  # Full migration (schema + data + files + users)
-  $0 dev test --data --files --users
+  # Shortcut for full migration (schema + data + files + users)
+  ./scripts/main/supabase_migration.sh dev test --full
+
+  # Full migration expanded (schema + data + files + users)
+  ./scripts/main/supabase_migration.sh dev test --data --files --users
 
   # Schema + data + users migration
-  $0 dev test --data --users
+  ./scripts/main/supabase_migration.sh dev test --data --users
 
   # Dry run (preview)
-  $0 dev test --data --files --users --dry-run
+  ./scripts/main/supabase_migration.sh dev test --data --files --users --dry-run
 
   # Interactive mode
-  $0 --interactive
+  ./scripts/main/supabase_migration.sh --interactive
 
 EOF
     exit 0
@@ -145,6 +150,13 @@ parse_args() {
                     exit 1
                 fi
                 shift 2
+                ;;
+            --full)
+                MODE="full"
+                INCLUDE_DATA=true
+                INCLUDE_USERS=true
+                INCLUDE_FILES=true
+                shift
                 ;;
             --increment|--incremental)
                 INCREMENTAL_MODE=true

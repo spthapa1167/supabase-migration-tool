@@ -79,7 +79,7 @@
 ./scripts/duplicate_schema.sh <source> <target> [--backup]
 
 # Full environment clone (destructive!)
-./scripts/supabase_clone.sh <source> <target> [--auto-confirm]
+./scripts/main/supabase_clone.sh <source> <target> [--auto-confirm]
 ```
 
 **Environments**: `prod`, `test`, `dev`
@@ -91,7 +91,7 @@
   - Clones database schema + data, auth users, storage buckets (config + files), edge functions, and secrets scaffold.
 - Automatically creates a pre-clone backup of the target environment.
 - Target contents are replaced with the source; use for prod → backup snapshots.
-- Run `chmod +x scripts/supabase_clone.sh` once after checkout if needed.
+- Run `chmod +x scripts/main/supabase_clone.sh` once after checkout if needed.
 
 ## 📋 What Gets Copied
 

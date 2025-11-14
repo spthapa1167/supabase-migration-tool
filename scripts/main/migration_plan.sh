@@ -10,7 +10,7 @@ set -eo pipefail
 set +u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Source utilities
@@ -44,8 +44,8 @@ Arguments:
   output_dir   Directory to save the HTML report (optional, defaults to ./migration_plans)
 
 Examples:
-  $0 dev test
-  $0 prod test ./custom_output
+  ./scripts/main/migration_plan.sh dev test
+  ./scripts/main/migration_plan.sh prod test ./custom_output
 
 The script will generate:
   - migration_plan_[source]_to_[target]_[timestamp].html
