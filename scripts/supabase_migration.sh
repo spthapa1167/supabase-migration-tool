@@ -60,6 +60,7 @@ Arguments:
   <target_env>            Target environment (prod, test, dev, backup) - REQUIRED
 
 Options:
+  --full                  Shortcut for schema+data+users+files migration (equivalent to --mode full --data --users --files)
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
   --increment             Prefer incremental/delta updates for all components (default: full sync)
   --data                  Include database data/rows migration (default: false)
@@ -88,6 +89,7 @@ Default Behavior:
   Use --data flag to include database row migration
   Use --users flag to include authentication users, roles, and policies migration
   Use --files flag to include storage bucket file migration
+  Use --full for an all-in-one migration (schema + data + users + files)
 
 Examples:
   # Schema-only migration (default - no data, no files)
@@ -99,7 +101,10 @@ Examples:
   # Schema + files migration
   $0 dev test --files
 
-  # Full migration (schema + data + files + users)
+  # Shortcut for full migration (schema + data + files + users)
+  $0 dev test --full
+
+  # Full migration expanded (schema + data + files + users)
   $0 dev test --data --files --users
 
   # Schema + data + users migration
@@ -145,6 +150,13 @@ parse_args() {
                     exit 1
                 fi
                 shift 2
+                ;;
+            --full)
+                MODE="full"
+                INCLUDE_DATA=true
+                INCLUDE_USERS=true
+                INCLUDE_FILES=true
+                shift
                 ;;
             --increment|--incremental)
                 INCREMENTAL_MODE=true

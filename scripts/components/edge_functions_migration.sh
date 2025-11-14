@@ -15,29 +15,59 @@ source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
 source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
-# Configuration
-SOURCE_ENV=${1:-}
-TARGET_ENV=${2:-}
-MIGRATION_DIR=${3:-""}
+# Configuration defaults
 INCREMENTAL_MODE="false"
 AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
 SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
-# Parse optional flags (beyond the first three positionals)
-for arg in "$@"; do
-    case "$arg" in
+MIGRATION_DIR=""
+
+# Argument parsing
+if [ $# -lt 2 ]; then
+    usage
+fi
+
+SOURCE_ENV=$1
+TARGET_ENV=$2
+shift 2
+
+while [ $# -gt 0 ]; do
+    case "$1" in
         --increment|--incremental)
             INCREMENTAL_MODE="true"
             ;;
         --auto-confirm|--yes|-y)
             AUTO_CONFIRM_COMPONENT="true"
             ;;
+        --migration-dir)
+            if [ -n "${2:-}" ] && [[ "${2}" != -* ]]; then
+                MIGRATION_DIR=$2
+                shift
+            else
+                log_error "--migration-dir requires a path argument"
+                exit 1
+            fi
+            ;;
+        --migration-dir=*)
+            MIGRATION_DIR="${1#*=}"
+            ;;
+        -*)
+            log_warning "Ignoring unknown option: $1"
+            ;;
+        *)
+            if [ -z "$MIGRATION_DIR" ]; then
+                MIGRATION_DIR="$1"
+            else
+                log_warning "Ignoring unexpected argument (migration directory already set): $1"
+            fi
+            ;;
     esac
+    shift || true
 done
 
 # Usage
 usage() {
     cat << EOF
-Usage: $0 <source_env> <target_env> [migration_dir]
+Usage: $0 <source_env> <target_env> [migration_dir|--migration-dir <path>] [options]
 
 Migrates edge functions from source to target using delta comparison
 
@@ -45,7 +75,11 @@ Arguments:
   source_env     Source environment (prod, test, dev, backup)
   target_env     Target environment (prod, test, dev, backup)
   migration_dir  Directory to store migration files (optional, auto-generated if not provided)
-  --increment    Prefer incremental/delta operations (default behaviour)
+  --migration-dir <path>  Same as positional migration_dir argument
+
+Options:
+  --increment    Prefer incremental/delta operations (skip identical functions)
+  --auto-confirm Automatically proceed without interactive confirmation
 
 Examples:
   $0 prod test                          # Migrate edge functions from prod to test
