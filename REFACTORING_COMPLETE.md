@@ -46,7 +46,7 @@ utils/
 
 ### Utility Scripts:
 ```
-scripts/utils/
+scripts/util/
 ├── cleanup_backups.sh             # Backup cleanup (used by components)
 ├── checkdiff.sh                   # Diff checking utility
 ├── deploy_functions.sh            # Function deployment utility
@@ -75,7 +75,7 @@ scripts/utils/
 
 ## 📋 Script Responsibilities
 
-### 1. `scripts/supabase_migration.sh`
+### 1. `scripts/main/supabase_migration.sh`
 - **Purpose**: Main orchestration script for complete migrations
 - **Features**: 
   - Validates environment and connections
@@ -84,7 +84,7 @@ scripts/utils/
   - Supports `--data`, `--users`, `--files` flags
 - **Calls**: All 4 component scripts
 
-### 2. `scripts/migration_plan.sh`
+### 2. `scripts/main/migration_plan.sh`
 - **Purpose**: Generate migration plan comparing source and target
 - **Features**:
   - Compares database schemas, buckets, functions, secrets
@@ -158,13 +158,13 @@ scripts/utils/
 ### Complete Migration:
 ```bash
 # Schema + data + users + files
-./scripts/supabase_migration.sh dev test --data --users --files
+./scripts/main/supabase_migration.sh dev test --data --users --files
 
 # Schema + data + users (no files)
-./scripts/supabase_migration.sh dev test --data --users
+./scripts/main/supabase_migration.sh dev test --data --users
 
 # Schema only (default)
-./scripts/supabase_migration.sh dev test
+./scripts/main/supabase_migration.sh dev test
 ```
 
 ### Component Scripts (Independent Use):
@@ -182,7 +182,7 @@ scripts/utils/
 ./scripts/components/secrets_migration.sh dev test
 
 # Migration plan
-./scripts/migration_plan.sh dev test
+./scripts/main/migration_plan.sh dev test
 ```
 
 ## ✨ Benefits of Refactoring

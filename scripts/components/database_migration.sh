@@ -112,7 +112,9 @@ run_psql_script_with_fallback() {
 # Default: schema-only migration (no data)
 # Use --data flag to include data migration
 
+unset INCLUDE_TABLES 2>/dev/null || true
 set -euo pipefail
+declare -a INCLUDE_TABLES=()
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
@@ -141,7 +143,6 @@ SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
 
 # Supabase-managed schemas that are handled by dedicated scripts or platform defaults
 PROTECTED_SCHEMAS=(auth vault storage realtime pgbouncer graphql_public supabase_functions supabase_functions_api pgsodium supavisor)
-INCLUDE_TABLES=()
 
 PYTHON_BIN=$(command -v python3 || command -v python || true)
 if [ -z "$PYTHON_BIN" ]; then
@@ -448,7 +449,7 @@ else
         POOLER_HOST="aws-1-us-east-2.pooler.supabase.com"
     fi
     
-    PG_DUMP_ARGS=(-d postgres -Fc --schema-only --no-owner --no-acl --verbose -f "$DUMP_FILE")
+    PG_DUMP_ARGS=(-d postgres -Fc --schema-only --no-owner --verbose -f "$DUMP_FILE")
     for schema in "${PROTECTED_SCHEMAS[@]}"; do
         PG_DUMP_ARGS+=(--exclude-schema="$schema")
     done
@@ -612,11 +613,11 @@ else
 fi
 
 # Restore dump
-RESTORE_ARGS=(--verbose "--role=supabase_admin")
+RESTORE_ARGS=(--verbose)
 RESTORE_SUCCESS=false
 RESTORE_OUTPUT=$(mktemp)
 
-RESTORE_ARGS+=(--schema-only --no-owner --no-acl)
+RESTORE_ARGS+=(--schema-only --no-owner)
 if [ "$INCLUDE_DATA" = "true" ]; then
     log_info "Step 3/3: Restoring dump to target..."
 else
@@ -658,7 +659,7 @@ if [ "$INCLUDE_DATA" != "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
     fi
 
     log_info "Creating fallback SQL backup for preserved data..."
-    SQL_BACKUP_ARGS=(-d postgres --data-only --inserts --column-inserts --no-owner --no-acl -f "$TARGET_DATA_BACKUP_SQL")
+    SQL_BACKUP_ARGS=(-d postgres --data-only --inserts --column-inserts --no-owner -f "$TARGET_DATA_BACKUP_SQL")
     if [ "$INCLUDE_USERS" = "true" ]; then
         SQL_BACKUP_ARGS+=(--exclude-schema=auth)
     fi
@@ -926,13 +927,15 @@ fi
 if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
     log_info "Step 3b/3: Applying data changes from source dump..."
     
-    DATA_RESTORE_ARGS=(--verbose --no-owner --no-acl --data-only -d postgres "--role=supabase_admin")
+    DATA_RESTORE_ARGS=(--verbose --no-owner --data-only -d postgres)
     for schema in "${PROTECTED_SCHEMAS[@]}"; do
         DATA_RESTORE_ARGS+=(--exclude-schema="$schema")
     done
-    for table in "${INCLUDE_TABLES[@]}"; do
-        DATA_RESTORE_ARGS+=(--table="$table")
-    done
+    if [ ${#INCLUDE_TABLES[@]} -gt 0 ]; then
+        for table in "${INCLUDE_TABLES[@]}"; do
+            DATA_RESTORE_ARGS+=(--table="$table")
+        done
+    fi
     
     DATA_RESTORE_SUCCESS=false
     
@@ -974,8 +977,14 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
         log_info "Using incremental SQL restore with ON CONFLICT DO NOTHING..."
         incremental_sql=$(mktemp)
         processed_sql=$(mktemp)
-        if pg_restore --data-only --no-owner --no-privileges $(for t in "${INCLUDE_TABLES[@]}"; do printf -- "--table=%s " "$t"; done) -f "$incremental_sql" "$DUMP_FILE"; then
-            if [ "${#INCLUDE_TABLES[@]}" -gt 0 ]; then
+        TABLE_FILTER_ARGS=()
+        if [ ${#INCLUDE_TABLES[@]} -gt 0 ]; then
+            for t in "${INCLUDE_TABLES[@]}"; do
+                TABLE_FILTER_ARGS+=(--table="$t")
+            done
+        fi
+        if pg_restore --data-only --no-owner --no-privileges "${TABLE_FILTER_ARGS[@]}" -f "$incremental_sql" "$DUMP_FILE"; then
+            if [ ${#INCLUDE_TABLES[@]} -gt 0 ]; then
                 TARGET_TABLE_LIST=$(for t in "${INCLUDE_TABLES[@]}"; do printf "'%s'," "$t"; done)
                 TARGET_TABLE_LIST="${TARGET_TABLE_LIST%,}"
                 prune_sql=$(mktemp)
@@ -983,7 +992,7 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
                     echo "DELETE FROM public._policy_dump_queue;"
                     echo "CREATE TEMP TABLE _inserted_tables(table_name text primary key);"
                 } >"$prune_sql"
-                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
+                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/util/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
                 cat <<'SQL' >>"$processed_sql"
 DO $$
 DECLARE
@@ -1002,7 +1011,7 @@ END $$;
 
 SQL
             else
-                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
+                "$PYTHON_BIN" "$PROJECT_ROOT/scripts/util/sql_add_on_conflict.py" "$incremental_sql" "$processed_sql"
             fi
             if run_psql_script_with_fallback "Incremental data restore" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$processed_sql"; then
                 log_success "Incremental data restore completed successfully."
@@ -1041,7 +1050,6 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" != "true" ] && [ -n "$TA
             -U "$user" \
             --data-only \
             --no-owner \
-            --no-acl \
             -d postgres \
             "$TARGET_DATA_BACKUP" \
             2>&1 | tee -a "$LOG_FILE" | tee "$restore_log"

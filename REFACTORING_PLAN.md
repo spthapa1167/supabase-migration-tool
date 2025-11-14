@@ -5,8 +5,8 @@ This document outlines the refactoring plan to clean up the codebase and maintai
 
 ## Core Parent Scripts (KEEP)
 
-1. **`scripts/supabase_migration.sh`** - Main orchestration script
-2. **`scripts/migration_plan.sh`** - Migration plan generation
+1. **`scripts/main/supabase_migration.sh`** - Main orchestration script
+2. **`scripts/main/migration_plan.sh`** - Migration plan generation
 3. **`scripts/components/database_migration.sh`** - Database migration component
 4. **`scripts/components/edge_functions_migration.sh`** - Edge functions migration component
 5. **`scripts/components/secrets_migration.sh`** - Secrets migration component
@@ -41,12 +41,12 @@ This document outlines the refactoring plan to clean up the codebase and maintai
 - `lib/error_handler.sh` - Not used
 
 ### Utility Scripts to Review:
-- `scripts/utils/checkdiff.sh` - Check if used
-- `scripts/utils/deploy_functions.sh` - Check if used
-- `scripts/utils/set_secrets.sh` - Check if used
-- `scripts/utils/setup.sh` - Check if used
-- `scripts/utils/validate.sh` - Check if used
-- `scripts/utils/cleanup_backups.sh` - KEEP (used by components)
+- `scripts/util/checkdiff.sh` - Check if used
+- `scripts/util/deploy_functions.sh` - Check if used
+- `scripts/util/set_secrets.sh` - Check if used
+- `scripts/util/setup.sh` - Check if used
+- `scripts/util/validate.sh` - Check if used
+- `scripts/util/cleanup_backups.sh` - KEEP (used by components)
 
 ## Refactoring Tasks
 

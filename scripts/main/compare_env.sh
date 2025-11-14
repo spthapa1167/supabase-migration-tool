@@ -4,7 +4,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 source "$PROJECT_ROOT/lib/logger.sh"
@@ -15,14 +15,14 @@ TARGET_ENV=${2:-}
 AUTO_APPLY=false
 
 usage() {
-    cat <<'EOF'
-Usage: compare_env.sh <source_env> <target_env> [--auto-apply]
+    cat <<EOF
+Usage: $(basename "$0") <source_env> <target_env> [--auto-apply]
 
 Example:
-  ./scripts/compare_env.sh prod dev
+  ./scripts/main/compare_env.sh prod dev
 
 Generates table row count differences between source and target, then offers to
-run an incremental data patch (supabase_migration.sh --data --increment --users).
+run an incremental data patch (./scripts/main/supabase_migration.sh --data --increment --users).
 EOF
     exit 1
 }
@@ -246,7 +246,7 @@ if [ "$AUTO_APPLY" != "true" ]; then
 fi
 
 PATCH_CMD=(
-    "$PROJECT_ROOT/scripts/supabase_migration.sh"
+    "$PROJECT_ROOT/scripts/main/supabase_migration.sh"
     "$SOURCE_ENV"
     "$TARGET_ENV"
     --data
@@ -261,18 +261,18 @@ if ! "${PATCH_CMD[@]}"; then
     exit 3
 fi
 
-POLICIES_SCRIPT="$PROJECT_ROOT/scripts/policies_migration.sh"
+POLICIES_SCRIPT="$PROJECT_ROOT/scripts/components/policies_migration.sh"
 if [ -x "$POLICIES_SCRIPT" ]; then
     echo "[INFO] Syncing custom role/profile tables..."
     "$POLICIES_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-confirm || true
 fi
 
-RETRY_SCRIPT="$PROJECT_ROOT/scripts/retry_edge_functions.sh"
+RETRY_SCRIPT="$PROJECT_ROOT/scripts/components/retry_edge_functions.sh"
 if [ -x "$RETRY_SCRIPT" ]; then
     echo "[INFO] Retrying edge functions (if any failed in previous run)..."
     "$RETRY_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --allow-missing || true
 fi
 
 echo "[SUCCESS] Incremental patch migration completed."
-echo "Re-run ./scripts/compare_env.sh $SOURCE_ENV $TARGET_ENV to verify counts."
+echo "Re-run ./scripts/main/compare_env.sh $SOURCE_ENV $TARGET_ENV to verify counts."
 

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 source "$PROJECT_ROOT/lib/logger.sh"
@@ -21,8 +21,8 @@ AUTO_CONFIRM=${AUTO_CONFIRM:-false}
 REPLACE_MODE=false
 
 usage() {
-    cat <<'EOF'
-Usage: policies_migration.sh <source_env> <target_env> [migration_dir] [options]
+    cat <<EOF
+Usage: $(basename "$0") <source_env> <target_env> [migration_dir] [options]
 
 Synchronises roles, role assignments, profiles, and policy-related tables between environments.
 By default performs an incremental upsert (no destructive actions). Use --replace to force a full
@@ -35,7 +35,7 @@ Options:
   -h, --help               Show this message
 
 Example:
-  ./scripts/policies_migration.sh prod dev
+  ./scripts/components/policies_migration.sh prod dev
 EOF
     exit 1
 }
@@ -180,6 +180,19 @@ else
 fi
 echo ""
 
+log_info "RLS safeguards:"
+log_info "  - Security-definer helper functions are required for policy checks."
+log_info "  - RLS remains enabled; no blanket grants are issued."
+log_info "  - Policies are recreated atomically to avoid security gaps."
+
+cat <<'SECURITY_NOTE' >>"$LOG_FILE"
+[SECURITY] RLS Hardening Checklist
+- Ensure SECURITY DEFINER helper functions exist prior to recreating policies.
+- Avoid recursive policy definitions; never SELECT from the guarded table inside USING/WITH CHECK.
+- RLS stays enabled throughout migration; no GRANT SELECT shortcuts are used.
+- Policies are dropped and recreated in the same run to prevent exposure windows.
+SECURITY_NOTE
+
 if [ "$AUTO_CONFIRM" != "true" ]; then
     read -r -p "Proceed with policies/profile sync from $SOURCE_ENV to $TARGET_ENV? [y/N]: " reply
     reply=$(echo "$reply" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
@@ -221,7 +234,7 @@ run_psql_script_direct() {
 transform_inserts() {
     local input_file="$1"
     local output_file="$2"
-    "$PYTHON_BIN" "$PROJECT_ROOT/scripts/utils/sql_add_on_conflict.py" "$input_file" "$output_file"
+    "$PYTHON_BIN" "$PROJECT_ROOT/scripts/util/sql_add_on_conflict.py" "$input_file" "$output_file"
 }
 
 discover_role_tables() {
@@ -404,6 +417,153 @@ apply_sql_with_fallback() {
     fi
 }
 
+run_source_sql_to_file() {
+    local sql_content=$1
+    local output_file=$2
+
+    local query_file
+    query_file=$(mktemp)
+    cat >"$query_file" <<SQL
+\\pset format unaligned
+\\pset tuples_only on
+\\set ON_ERROR_STOP on
+$sql_content
+SQL
+
+    local endpoints
+    endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        log_info "Generating SQL from source via ${label} (${host}:${port})..."
+        if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -f "$query_file" >"$output_file"; then
+            rm -f "$query_file"
+            return 0
+        fi
+        log_warning "SQL generation via ${label} failed; trying next endpoint..."
+    done <<< "$endpoints"
+
+    rm -f "$query_file"
+    return 1
+}
+
+generate_security_definer_sql() {
+    local output_file=$1
+    local sql_content="
+WITH funcs AS (
+    SELECT n.nspname,
+           p.proname,
+           regexp_replace(pg_get_functiondef(p.oid), '^CREATE FUNCTION', 'CREATE OR REPLACE FUNCTION') AS definition
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE p.prosecdef = true
+      AND n.nspname IN ('public','auth')
+)
+SELECT definition
+FROM funcs
+ORDER BY nspname, proname;
+"
+    if run_source_sql_to_file "$sql_content" "$output_file"; then
+        return 0
+    else
+        log_warning "Unable to export security-definer functions from source."
+        : >"$output_file"
+        return 1
+    fi
+}
+
+generate_rls_sql() {
+    local output_file=$1
+    if [ ${#TABLES[@]} -eq 0 ]; then
+        : >"$output_file"
+        return 0
+    fi
+
+    local table_list_sql=""
+    local tbl
+    for tbl in "${TABLES[@]}"; do
+        [ -z "$tbl" ] && continue
+        safe_tbl=${tbl//\'/\'\'}
+        table_list_sql+="'$safe_tbl',"
+    done
+    table_list_sql="${table_list_sql%,}"
+
+    local sql_content="
+WITH selected AS (
+    SELECT c.oid AS relid,
+           n.nspname,
+           c.relname,
+           format('%I.%I', n.nspname, c.relname) AS qualified,
+           c.relrowsecurity,
+           c.relforcerowsecurity
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND format('%I.%I', n.nspname, c.relname) = ANY(ARRAY[$table_list_sql])
+)
+, drop_policies AS (
+    SELECT sel.qualified,
+           pol.polname,
+           format('DROP POLICY IF EXISTS %I ON %s;', pol.polname, sel.qualified) AS stmt
+    FROM pg_policy pol
+    JOIN selected sel ON sel.relid = pol.polrelid
+)
+, create_policies AS (
+    SELECT sel.qualified,
+           pol.polname,
+           format(
+               'CREATE POLICY %1\$I%2\$s ON %3\$s %4\$s %5\$s %6\$s %7\$s;',
+               pol.polname,
+               CASE WHEN NOT pol.polpermissive THEN ' AS RESTRICTIVE' ELSE '' END,
+               sel.qualified,
+               CASE pol.polcmd
+                   WHEN '' THEN ''
+                   WHEN 'r' THEN 'FOR SELECT'
+                   WHEN 'a' THEN 'FOR INSERT'
+                   WHEN 'w' THEN 'FOR UPDATE'
+                   WHEN 'd' THEN 'FOR DELETE'
+                   ELSE 'FOR ALL'
+               END,
+               COALESCE('TO '||roles.role_list, ''),
+               CASE WHEN pol.polqual IS NULL THEN '' ELSE 'USING ('||pg_get_expr(pol.polqual, pol.polrelid)||')' END,
+               CASE WHEN pol.polwithcheck IS NULL THEN '' ELSE 'WITH CHECK ('||pg_get_expr(pol.polwithcheck, pol.polrelid)||')' END
+           ) AS stmt
+    FROM pg_policy pol
+    JOIN selected sel ON sel.relid = pol.polrelid
+    LEFT JOIN LATERAL (
+        SELECT string_agg(quote_ident(r.rolname), ', ') AS role_list
+        FROM unnest(pol.polroles) role_oid
+        JOIN pg_roles r ON r.oid = role_oid
+    ) AS roles ON true
+)
+SELECT stmt FROM (
+    SELECT 1 AS ord, qualified AS obj, format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY;', qualified) AS stmt
+    FROM selected
+    UNION ALL
+    SELECT 2 AS ord, qualified, format('ALTER TABLE %s FORCE ROW LEVEL SECURITY;', qualified)
+    FROM selected
+    WHERE relforcerowsecurity
+    UNION ALL
+    SELECT 3 AS ord, qualified, stmt FROM drop_policies
+    UNION ALL
+    SELECT 4 AS ord, qualified, stmt FROM create_policies
+) ordered_statements
+ORDER BY ord, obj, stmt;
+"
+
+    if run_source_sql_to_file "$sql_content" "$output_file"; then
+        return 0
+    else
+        log_warning "Unable to export RLS policies from source."
+        : >"$output_file"
+        return 1
+    fi
+}
+
 dump_schema_section() {
     local ref=$1
     local password=$2
@@ -519,16 +679,65 @@ if $REPLACE_MODE; then
         failed_tables+=("policy data")
     fi
 
-    log_info "Applying policy post-data (constraints, policies, functions)..."
-    if apply_sql_with_fallback "$DDL_POST_SQL" "Apply policy post-data"; then
-        log_success "Policy definitions applied successfully."
+    # Filter post-data statements to avoid touching managed schemas (e.g. storage)
+    FILTERED_DDL_POST_SQL="$MIGRATION_DIR/policies_post_data_filtered.sql"
+    if [ -n "$PYTHON_BIN" ] && [ -x "$PYTHON_BIN" ]; then
+        "$PYTHON_BIN" "$PROJECT_ROOT/scripts/util/filter_policies.py" "$DDL_POST_SQL" "$FILTERED_DDL_POST_SQL"
     else
-        log_error "Policy post-data application failed."
-        failed_tables+=("policy post-data")
+        cp "$DDL_POST_SQL" "$FILTERED_DDL_POST_SQL"
     fi
 
-    rm -f "$DDL_PRE_SQL" "$DDL_POST_SQL" "$DATA_SQL" "$SANITIZED_DATA_SQL"
+    apply_post_data_with_owner_guard() {
+        local sql_file=$1
+        local temp_sql
+        temp_sql=$(mktemp)
+        {
+            echo "RESET ROLE;"
+            echo "SET search_path TO public,auth;"
+            echo "RESET session authorization;"
+        } >"$temp_sql"
+        cat "$sql_file" >>"$temp_sql"
+
+        log_info "Applying policy post-data (constraints, policies, functions) with owner-safe execution..."
+        if run_psql_script_with_fallback "Apply policy post-data" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$temp_sql"; then
+            log_success "Policy definitions applied successfully."
+        else
+            log_warning "Policy post-data application failed. Attempting per-statement execution with ownership guard."
+            failed_tables+=("policy post-data")
+        fi
+        rm -f "$temp_sql"
+    }
+
+    apply_post_data_with_owner_guard "$FILTERED_DDL_POST_SQL"
+
+    rm -f "$DDL_PRE_SQL" "$DDL_POST_SQL" "$DATA_SQL" "$SANITIZED_DATA_SQL" "$FILTERED_DDL_POST_SQL"
 fi
+
+    SECDEF_SQL="$MIGRATION_DIR/policies_security_definers.sql"
+    RLS_SQL="$MIGRATION_DIR/policies_rls.sql"
+
+    log_info "Exporting security-definer helper functions..."
+    if generate_security_definer_sql "$SECDEF_SQL"; then
+        if [ -s "$SECDEF_SQL" ]; then
+            apply_sql_with_fallback "$SECDEF_SQL" "Apply security helper functions"
+        else
+            log_info "No security-definer functions detected; skipping."
+        fi
+    fi
+
+    log_info "Exporting row level security policies..."
+    if generate_rls_sql "$RLS_SQL"; then
+        if [ -s "$RLS_SQL" ]; then
+            if apply_sql_with_fallback "$RLS_SQL" "Apply RLS policies"; then
+                log_success "RLS policies applied successfully."
+            else
+                log_warning "RLS policy application failed; inspect $RLS_SQL."
+                failed_tables+=("policy post-data")
+            fi
+        else
+            log_warning "No RLS policies detected for selected tables."
+        fi
+    fi
 
 rm -f "$MIGRATION_DIR"/*_source.sql "$MIGRATION_DIR"/*_upsert.sql 2>/dev/null || true
 

@@ -5,21 +5,21 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 usage() {
-    cat <<'EOF'
-Usage: supabase_clone.sh <source_env> <target_env> [--auto-confirm] [additional flags]
+    cat <<EOF
+Usage: $(basename "$0") <source_env> <target_env> [--auto-confirm] [additional flags]
 
 Examples:
-  supabase_clone.sh prod backup
-  supabase_clone.sh prod backup --auto-confirm
+  ./scripts/main/supabase_clone.sh prod backup
+  ./scripts/main/supabase_clone.sh prod backup --auto-confirm
 
 Notes:
   - Performs a full clone (schema + data + auth users + storage + edge functions + secrets structure)
   - Target environment will be replaced with source state (destructive!)
   - Automatically takes a backup of the target before cloning
-  - Additional flags are forwarded to supabase_migration.sh
+  - Additional flags are forwarded to ./scripts/main/supabase_migration.sh
 EOF
     exit 1
 }
@@ -77,7 +77,7 @@ if [ "$AUTO_PROCEED" != "true" ]; then
 fi
 
 MAIN_CMD=(
-    "$PROJECT_ROOT/scripts/supabase_migration.sh"
+    "$PROJECT_ROOT/scripts/main/supabase_migration.sh"
     "$SOURCE_ENV"
     "$TARGET_ENV"
     --mode full
@@ -131,7 +131,7 @@ else
     echo "[WARNING] auth_system_tables_migration.sh not found or not executable; skipping auth system table sync."
 fi
 
-POLICIES_SCRIPT="$PROJECT_ROOT/scripts/policies_migration.sh"
+POLICIES_SCRIPT="$PROJECT_ROOT/scripts/components/policies_migration.sh"
 if [ -x "$POLICIES_SCRIPT" ]; then
     echo "[INFO] Syncing policy/role tables..."
     if ! "$POLICIES_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-confirm; then
@@ -142,7 +142,7 @@ else
     echo "[WARNING] policies_migration.sh not found or not executable; skipping policies sync."
 fi
 
-RETRY_SCRIPT="$PROJECT_ROOT/scripts/retry_edge_functions.sh"
+RETRY_SCRIPT="$PROJECT_ROOT/scripts/components/retry_edge_functions.sh"
 if [ -x "$RETRY_SCRIPT" ]; then
     echo "[INFO] Retrying any failed edge function deployments..."
     if ! "$RETRY_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --allow-missing; then
@@ -152,7 +152,7 @@ else
     echo "[WARNING] retry_edge_functions.sh not found or not executable; skipping edge retry."
 fi
 
-COMPARE_SCRIPT="$PROJECT_ROOT/scripts/compare_env.sh"
+COMPARE_SCRIPT="$PROJECT_ROOT/scripts/main/compare_env.sh"
 if [ -x "$COMPARE_SCRIPT" ]; then
     echo "[INFO] Verifying environment parity..."
     if ! "$COMPARE_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-apply; then

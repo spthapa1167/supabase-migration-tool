@@ -7,7 +7,7 @@ set -eo pipefail
 set +u  # Temporarily disable for environment loading
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Source utilities
@@ -39,8 +39,8 @@ Arguments:
   output_dir   Directory to save the snapshot JSON file (optional, defaults to ./snapshots)
 
 Examples:
-  $0
-  $0 ./custom_output
+  ./scripts/main/all_envs_snapshot.sh
+  ./scripts/main/all_envs_snapshot.sh ./custom_output
 
 The script will generate:
   - A JSON file with comprehensive object counts and metadata for all three environments

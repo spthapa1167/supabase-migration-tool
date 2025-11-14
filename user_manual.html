@@ -375,7 +375,7 @@
                 <span class="badge main">MAIN SCRIPT</span>
                 <span class="badge success">ORCHESTRATES ALL</span>
                 
-                <p class="script-path">scripts/supabase_migration.sh</p>
+                <p class="script-path">scripts/main/supabase_migration.sh</p>
 
                 <h3>Purpose</h3>
                 <p>The main orchestration script that coordinates all migration components. It validates environments, runs comparisons, and executes all 4 component migrations in sequence.</p>
@@ -396,7 +396,7 @@
                 <h3>Usage</h3>
                 <div class="usage-example">
                     <h4>Basic Syntax</h4>
-                    <pre><code>./scripts/supabase_migration.sh &lt;source_env&gt; &lt;target_env&gt; [OPTIONS]</code></pre>
+                    <pre><code>./scripts/main/supabase_migration.sh &lt;source_env&gt; &lt;target_env&gt; [OPTIONS]</code></pre>
                 </div>
 
                 <h4>Flags</h4>
@@ -440,22 +440,22 @@
 
                 <h4>Examples</h4>
                 <pre><code># Schema-only migration (default)
-./scripts/supabase_migration.sh dev test
+./scripts/main/supabase_migration.sh dev test
 
 # Schema + data migration
-./scripts/supabase_migration.sh dev test --data
+./scripts/main/supabase_migration.sh dev test --data
 
 # Complete migration (schema + data + users + files)
-./scripts/supabase_migration.sh dev test --data --users --files
+./scripts/main/supabase_migration.sh dev test --data --users --files
 
 # With backup
-./scripts/supabase_migration.sh dev test --data --users --files --backup
+./scripts/main/supabase_migration.sh dev test --data --users --files --backup
 
 # Dry run (preview only)
-./scripts/supabase_migration.sh dev test --data --files --dry-run
+./scripts/main/supabase_migration.sh dev test --data --files --dry-run
 
 # Interactive mode
-./scripts/supabase_migration.sh --interactive</code></pre>
+./scripts/main/supabase_migration.sh --interactive</code></pre>
 
                 <h3>Dependencies</h3>
                 <div class="dependencies">
@@ -487,7 +487,7 @@
                 <span class="badge plan">PLAN GENERATOR</span>
                 <span class="badge info">READ-ONLY</span>
                 
-                <p class="script-path">scripts/migration_plan.sh</p>
+                <p class="script-path">scripts/main/migration_plan.sh</p>
 
                 <h3>Purpose</h3>
                 <p>Generates a comprehensive HTML report comparing source and target environments. This is a <strong>read-only</strong> script that doesn't perform any migrations - it only analyzes and reports differences.</p>
@@ -508,7 +508,7 @@
                 <h3>Usage</h3>
                 <div class="usage-example">
                     <h4>Basic Syntax</h4>
-                    <pre><code>./scripts/migration_plan.sh &lt;source_env&gt; &lt;target_env&gt; [output_dir]</code></pre>
+                    <pre><code>./scripts/main/migration_plan.sh &lt;source_env&gt; &lt;target_env&gt; [output_dir]</code></pre>
                 </div>
 
                 <h4>Arguments</h4>
@@ -537,13 +537,13 @@
 
                 <h4>Examples</h4>
                 <pre><code># Generate migration plan
-./scripts/migration_plan.sh dev test
+./scripts/main/migration_plan.sh dev test
 
 # Custom output directory
-./scripts/migration_plan.sh dev test ./reports
+./scripts/main/migration_plan.sh dev test ./reports
 
 # Compare production to test
-./scripts/migration_plan.sh prod test</code></pre>
+./scripts/main/migration_plan.sh prod test</code></pre>
 
                 <h3>Output</h3>
                 <ul>
@@ -1082,12 +1082,12 @@
 
             <h3>Recommended Migration Flow</h3>
             <pre><code># 1. Generate migration plan
-./scripts/migration_plan.sh dev test
+./scripts/main/migration_plan.sh dev test
 
 # 2. Review the HTML report
 
 # 3. Run complete migration with backup
-./scripts/supabase_migration.sh dev test --data --users --files --backup
+./scripts/main/supabase_migration.sh dev test --data --users --files --backup
 
 # 4. Review migration results
 # Check: backups/&lt;timestamp&gt;/result.html
@@ -1099,15 +1099,15 @@
 
             <h3>Common Scenarios</h3>
             <h4>Scenario 1: Schema-Only Migration</h4>
-            <pre><code>./scripts/supabase_migration.sh dev test</code></pre>
+            <pre><code>./scripts/main/supabase_migration.sh dev test</code></pre>
             <p>Use this when you only want to sync database structure without data.</p>
 
             <h4>Scenario 2: Complete Migration (Development)</h4>
-            <pre><code>./scripts/supabase_migration.sh dev test --data --users --files</code></pre>
+            <pre><code>./scripts/main/supabase_migration.sh dev test --data --users --files</code></pre>
             <p>Use this for complete migration between dev and test environments.</p>
 
             <h4>Scenario 3: Production Migration</h4>
-            <pre><code>./scripts/supabase_migration.sh prod test --data --users --files --backup</code></pre>
+            <pre><code>./scripts/main/supabase_migration.sh prod test --data --users --files --backup</code></pre>
             <p>Always use <code>--backup</code> when migrating from production.</p>
 
             <h4>Scenario 4: Targeted Migration (Storage Only)</h4>

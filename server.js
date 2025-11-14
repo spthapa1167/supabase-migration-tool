@@ -317,8 +317,8 @@ app.get('/api/info', (req, res) => {
             }
         },
         scripts: {
-            main: 'scripts/supabase_migration.sh',
-            plan: 'scripts/migration_plan.sh',
+            main: 'scripts/main/supabase_migration.sh',
+            plan: 'scripts/main/migration_plan.sh',
             database: 'scripts/components/database_migration.sh',
             storage: 'scripts/components/storage_buckets_migration.sh',
             edgeFunctions: 'scripts/components/edge_functions_migration.sh',
@@ -499,7 +499,7 @@ app.post('/api/migration-plan', async (req, res) => {
         };
 
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/migration_plan.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/migration_plan.sh');
             await fs.access(fullPath, fs.constants.F_OK);
             
             const allArgs = args.filter(arg => arg !== null && arg !== undefined);
@@ -568,7 +568,7 @@ app.post('/api/migration-plan', async (req, res) => {
         }
 
         try {
-            const result = await executeScript('scripts/migration_plan.sh', args);
+            const result = await executeScript('scripts/main/migration_plan.sh', args);
             res.json(result);
         } catch (error) {
             res.status(500).json(error);
@@ -612,7 +612,7 @@ app.post('/api/migration', async (req, res) => {
         const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/supabase_migration.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/supabase_migration.sh');
             await fs.access(fullPath, fs.constants.F_OK);
             
             const allArgs = args.filter(arg => arg !== null && arg !== undefined);
@@ -678,7 +678,7 @@ app.post('/api/migration', async (req, res) => {
     } else {
         // Non-streaming mode
         try {
-            const result = await executeScript('scripts/supabase_migration.sh', args);
+            const result = await executeScript('scripts/main/supabase_migration.sh', args);
             res.json(result);
         } catch (error) {
             res.status(500).json(error);
@@ -705,7 +705,7 @@ app.post('/api/clone', async (req, res) => {
         const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
 
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/supabase_clone.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/supabase_clone.sh');
             await fs.access(fullPath, fs.constants.F_OK);
 
             const allArgs = args.filter(arg => arg !== null && arg !== undefined);
@@ -769,7 +769,7 @@ app.post('/api/clone', async (req, res) => {
         }
     } else {
         try {
-            const result = await executeScript('scripts/supabase_clone.sh', args);
+            const result = await executeScript('scripts/main/supabase_clone.sh', args);
             res.json(result);
         } catch (error) {
             res.status(500).json(error);
@@ -1260,7 +1260,7 @@ app.post('/api/all-envs-snapshot', async (req, res) => {
         const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/all_envs_snapshot.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/all_envs_snapshot.sh');
             await fs.access(fullPath, fs.constants.F_OK);
             
             const child = spawn('bash', [fullPath, 'snapshots'], {
@@ -1343,7 +1343,7 @@ app.post('/api/all-envs-snapshot', async (req, res) => {
     } else {
         // Non-streaming response - execute and return snapshot data
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/all_envs_snapshot.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/all_envs_snapshot.sh');
             await fs.access(fullPath, fs.constants.F_OK);
             
             const { exec } = require('child_process');

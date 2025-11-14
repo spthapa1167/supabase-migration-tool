@@ -18,8 +18,8 @@
 ## Files Kept (Core System)
 
 ### Main Scripts (6):
-1. `scripts/supabase_migration.sh` - Main orchestration script
-2. `scripts/migration_plan.sh` - Migration plan generation
+1. `scripts/main/supabase_migration.sh` - Main orchestration script
+2. `scripts/main/migration_plan.sh` - Migration plan generation
 3. `scripts/components/database_migration.sh` - Database migration component
 4. `scripts/components/edge_functions_migration.sh` - Edge functions migration component
 5. `scripts/components/secrets_migration.sh` - Secrets migration component
@@ -37,7 +37,7 @@
 - `utils/edge-functions-migration.js` - Edge functions migration (used by edge_functions_migration.sh)
 
 ### Utility Scripts:
-- `scripts/utils/cleanup_backups.sh` - Backup cleanup (used by components)
+- `scripts/util/cleanup_backups.sh` - Backup cleanup (used by components)
 
 ## Refactoring Changes
 

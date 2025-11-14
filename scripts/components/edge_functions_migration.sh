@@ -172,6 +172,18 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
+if command -v docker >/dev/null 2>&1; then
+    DOCKER_AVAILABLE=true
+else
+    if [ "${SKIP_DOCKER_CHECK:-false}" = "true" ]; then
+        log_warning "Docker CLI not found, continuing with Management API only."
+        DOCKER_AVAILABLE=false
+    else
+        log_error "Supabase CLI requires Docker for edge function download/deploy. Install Docker or set SKIP_DOCKER_CHECK=true to skip."
+        exit 1
+    fi
+fi
+
 # Check for SUPABASE_ACCESS_TOKEN
 if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
     log_error "SUPABASE_ACCESS_TOKEN not set - cannot use Node.js utility"
@@ -243,7 +255,7 @@ if [ -f "$FAILED_FUNCTIONS_FILE" ]; then
     if [ -s "$FAILED_FUNCTIONS_FILE" ]; then
         log_warning "Some edge functions failed to deploy. See: $FAILED_FUNCTIONS_FILE"
         log_info "Retry only the failed functions with:"
-        log_info "  ./scripts/retry_edge_functions.sh $SOURCE_ENV $TARGET_ENV \"$MIGRATION_DIR_ABS\""
+        log_info "  ./scripts/components/retry_edge_functions.sh $SOURCE_ENV $TARGET_ENV \"$MIGRATION_DIR_ABS\""
     else
         log_info "No edge function failures recorded (empty failure list)."
     fi

@@ -6,7 +6,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # Source utilities
@@ -93,28 +93,28 @@ Default Behavior:
 
 Examples:
   # Schema-only migration (default - no data, no files)
-  $0 dev test
+  ./scripts/main/supabase_migration.sh dev test
 
   # Schema + data migration
-  $0 dev test --data
+  ./scripts/main/supabase_migration.sh dev test --data
 
   # Schema + files migration
-  $0 dev test --files
+  ./scripts/main/supabase_migration.sh dev test --files
 
   # Shortcut for full migration (schema + data + files + users)
-  $0 dev test --full
+  ./scripts/main/supabase_migration.sh dev test --full
 
   # Full migration expanded (schema + data + files + users)
-  $0 dev test --data --files --users
+  ./scripts/main/supabase_migration.sh dev test --data --files --users
 
   # Schema + data + users migration
-  $0 dev test --data --users
+  ./scripts/main/supabase_migration.sh dev test --data --users
 
   # Dry run (preview)
-  $0 dev test --data --files --users --dry-run
+  ./scripts/main/supabase_migration.sh dev test --data --files --users --dry-run
 
   # Interactive mode
-  $0 --interactive
+  ./scripts/main/supabase_migration.sh --interactive
 
 EOF
     exit 0

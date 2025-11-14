@@ -4,19 +4,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
 
 usage() {
-    cat <<'EOF'
-Usage: rollback_last_migration.sh <target_env> [--auto-confirm] [--dry-run] [--backup-dir <path>]
+    cat <<EOF
+Usage: $(basename "$0") <target_env> [--auto-confirm] [--dry-run] [--backup-dir <path>]
 
 Examples:
-  rollback_last_migration.sh test
-  rollback_last_migration.sh prod --auto-confirm
+  ./scripts/main/rollback_last_migration.sh test
+  ./scripts/main/rollback_last_migration.sh prod --auto-confirm
 
 Notes:
   - Restores the target environment to its pre-migration state using the most recent backup directory.
