@@ -2,7 +2,7 @@
 /**
  * Supabase Edge Functions Migration Utility
  * Migrates edge functions from source to target project
- * Uses Supabase Management API and CLI for operations
+ * Uses Supabase CLI for downloading and deploying functions
  * 
  * Usage: node utils/edge-functions-migration.js <source_ref> <target_ref> <migration_dir>
  */
@@ -12,7 +12,6 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { execSync } = require('child_process');
-const { createManagementClient } = require('./lib/edgeFunctionsClient');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 // ANSI color codes for console output
@@ -139,16 +138,6 @@ function loadEnvFile() {
 
 // Load environment variables
 loadEnvFile();
-
-let managementClient = null;
-try {
-    if (process.env.SUPABASE_ACCESS_TOKEN) {
-        managementClient = createManagementClient(process.env.SUPABASE_ACCESS_TOKEN);
-    }
-} catch (clientError) {
-    logWarning(`Unable to initialize Management API client: ${clientError.message}`);
-    managementClient = null;
-}
 
 // Configuration from arguments
 const SOURCE_REF = process.argv[2];
@@ -474,43 +463,6 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
     try {
         if (!quiet) {
             logInfo(`    Downloading function code: ${functionName}...`);
-        }
-
-        if (managementClient) {
-            const maxAttempts = 3;
-            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-                const apiTempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-api-${functionName}-${attempt}-`));
-                try {
-                    if (!quiet) {
-                        logInfo(`    Attempting Management API bundle download (attempt ${attempt}/${maxAttempts})...`);
-                    }
-                    await managementClient.downloadFunctionCode(projectRef, functionName, apiTempDir);
-                    const apiFunctionDir = findFunctionDirectory(apiTempDir, functionName);
-                    if (apiFunctionDir) {
-                        fs.rmSync(finalFunctionPath, { recursive: true, force: true });
-                        fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
-                        fs.cpSync(apiFunctionDir, finalFunctionPath, { recursive: true });
-                        normalizeFunctionLayout(finalFunctionPath, downloadDir);
-                        if (!quiet) {
-                            logSuccess(`    ✓ Downloaded function via Management API: ${functionName}`);
-                        }
-                        fs.rmSync(apiTempDir, { recursive: true, force: true });
-                        return true;
-                    }
-                    if (!quiet) {
-                        logWarning(`    Management API download succeeded but function files were not located; retrying...`);
-                    }
-                } catch (apiError) {
-                    if (!quiet) {
-                        logWarning(`    Management API download attempt ${attempt}/${maxAttempts} failed (${apiError.message})`);
-                    }
-                } finally {
-                    fs.rmSync(apiTempDir, { recursive: true, force: true });
-                }
-            }
-            if (!quiet) {
-                logWarning(`    Management API download failed after retries; falling back to CLI options`);
-            }
         }
 
         if (!checkDocker()) {

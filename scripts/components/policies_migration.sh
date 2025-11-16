@@ -24,12 +24,20 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") <source_env> <target_env> [migration_dir] [options]
 
-Synchronises roles, role assignments, profiles, and policy-related tables between environments.
+Comprehensive migration of policies, roles, grants, user profiles, and database functions.
+Synchronises:
+  - RLS policies for all tables (auto-discovers all RLS-enabled tables)
+  - Roles and user role assignments (auth.roles, auth.user_roles, public.user_roles)
+  - User profiles (public.profiles)
+  - Table grants/permissions for all tables
+  - All database functions (public and auth schemas)
+  - Security-definer helper functions
+
 By default performs an incremental upsert (no destructive actions). Use --replace to force a full
 replacement so the target matches the source exactly.
 
 Options:
-  --tables=table1,table2   Extend table list (auth.roles, auth.user_roles, public.profiles, public.user_roles)
+  --tables=table1,table2   Extend table list (default: auth.roles, auth.user_roles, public.profiles, public.user_roles)
   --replace                Destructive sync (truncate + reload + policy redeploy)
   --auto-confirm           Skip confirmation prompts
   -h, --help               Show this message
@@ -175,7 +183,8 @@ auto_discover_rls_tables() {
         return 0
     fi
 
-    log_info "Auto-discovering RLS-enabled tables in source (public schema)..."
+    log_info "Auto-discovering ALL RLS-enabled tables in source (public schema)..."
+    log_info "  (Including tables with RLS enabled, even if they don't have policies yet)"
 
     local sql_content="
 WITH rls_tables AS (
@@ -185,9 +194,9 @@ WITH rls_tables AS (
         format('%I.%I', n.nspname, c.relname) AS qualified
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
-    JOIN pg_policy p ON p.polrelid = c.oid
     WHERE c.relkind = 'r'
       AND n.nspname = 'public'
+      AND c.relrowsecurity = true  -- Discover ALL tables with RLS enabled, not just those with policies
 )
 SELECT qualified
 FROM rls_tables
@@ -225,7 +234,7 @@ ORDER BY qualified;
     rm -f "$discovered_file"
 }
 
-log_info "🛡️  Policies & Profiles Migration"
+log_info "🛡️  Comprehensive Policies, Roles, Grants & Functions Migration"
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR"
@@ -233,12 +242,21 @@ log_info "Migration directory: $MIGRATION_DIR"
 # Auto-discover additional RLS-enabled tables before logging the final table list
 auto_discover_rls_tables
 
-log_info "Tables (including RLS-enabled public tables): ${TABLES[*]}"
+log_info "Tables (including ALL RLS-enabled public tables): ${TABLES[*]}"
 if [ "$REPLACE_MODE" = "true" ]; then
     log_warning "Replace mode enabled - target data will be made identical to source."
 else
     log_info "Running in incremental mode - existing rows preserved, new rows inserted."
 fi
+echo ""
+
+log_info "Migration will cover:"
+log_info "  ✓ RLS policies for all tables (including auto-discovered RLS-enabled tables)"
+log_info "  ✓ Roles and user role assignments (auth.roles, auth.user_roles, public.user_roles)"
+log_info "  ✓ User profiles (public.profiles)"
+log_info "  ✓ Table grants/permissions for all tables"
+log_info "  ✓ All database functions (public and auth schemas)"
+log_info "  ✓ Security-definer helper functions"
 echo ""
 
 log_info "RLS safeguards:"
@@ -537,6 +555,79 @@ ORDER BY nspname, proname;
     fi
 }
 
+generate_all_database_functions_sql() {
+    local output_file=$1
+    local sql_content="
+WITH funcs AS (
+    SELECT n.nspname,
+           p.proname,
+           pg_get_function_identity_arguments(p.oid) AS args,
+           regexp_replace(pg_get_functiondef(p.oid), '^CREATE FUNCTION', 'CREATE OR REPLACE FUNCTION') AS definition
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname IN ('public','auth')
+      AND p.prokind IN ('f', 'p', 'w')  -- functions, procedures, window functions
+      AND NOT (n.nspname = 'pg_catalog' OR n.nspname = 'information_schema')
+)
+SELECT definition
+FROM funcs
+ORDER BY nspname, proname, args;
+"
+    if run_source_sql_to_file "$sql_content" "$output_file"; then
+        return 0
+    else
+        log_warning "Unable to export all database functions from source."
+        : >"$output_file"
+        return 1
+    fi
+}
+
+generate_grants_sql() {
+    local output_file=$1
+    # Export grants for ALL tables in public and auth schemas, not just those in TABLES array
+    # This ensures comprehensive coverage of all permissions
+    local sql_content="
+WITH all_tables AS (
+    SELECT c.oid AS relid,
+           n.nspname AS schema_name,
+           c.relname AS table_name,
+           format('%I.%I', n.nspname, c.relname) AS qualified
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND n.nspname IN ('public', 'auth')
+)
+, table_grants AS (
+    SELECT 
+        at.qualified,
+        rtg.grantee,
+        rtg.privilege_type,
+        rtg.is_grantable,
+        format(
+            'GRANT %s ON %s TO %s%s;',
+            rtg.privilege_type,
+            at.qualified,
+            quote_ident(rtg.grantee),
+            CASE WHEN rtg.is_grantable = 'YES' THEN ' WITH GRANT OPTION' ELSE '' END
+        ) AS grant_stmt
+    FROM information_schema.role_table_grants rtg
+    JOIN all_tables at ON at.schema_name = rtg.table_schema AND at.table_name = rtg.table_name
+    WHERE rtg.grantee NOT IN ('postgres', 'supabase_admin', 'supabase_auth_admin', 'supabase_storage_admin')
+      AND rtg.grantee NOT LIKE 'pg_%'
+)
+SELECT grant_stmt
+FROM table_grants
+ORDER BY qualified, grantee, privilege_type;
+"
+    if run_source_sql_to_file "$sql_content" "$output_file"; then
+        return 0
+    else
+        log_warning "Unable to export grants from source."
+        : >"$output_file"
+        return 1
+    fi
+}
+
 generate_rls_sql() {
     local output_file=$1
     if [ ${#TABLES[@]} -eq 0 ]; then
@@ -776,6 +867,8 @@ fi
 
     SECDEF_SQL="$MIGRATION_DIR/policies_security_definers.sql"
     RLS_SQL="$MIGRATION_DIR/policies_rls.sql"
+    GRANTS_SQL="$MIGRATION_DIR/policies_grants.sql"
+    FUNCTIONS_SQL="$MIGRATION_DIR/policies_all_functions.sql"
 
     log_info "Exporting security-definer helper functions..."
     if generate_security_definer_sql "$SECDEF_SQL"; then
@@ -786,6 +879,20 @@ fi
         fi
     fi
 
+    log_info "Exporting all database functions (public and auth schemas)..."
+    if generate_all_database_functions_sql "$FUNCTIONS_SQL"; then
+        if [ -s "$FUNCTIONS_SQL" ]; then
+            if apply_sql_with_fallback "$FUNCTIONS_SQL" "Apply all database functions"; then
+                log_success "All database functions applied successfully."
+            else
+                log_warning "Database functions application had issues; inspect $FUNCTIONS_SQL."
+                failed_tables+=("database functions")
+            fi
+        else
+            log_info "No database functions detected in public/auth schemas."
+        fi
+    fi
+
     log_info "Exporting row level security policies..."
     if generate_rls_sql "$RLS_SQL"; then
         if [ -s "$RLS_SQL" ]; then
@@ -793,10 +900,24 @@ fi
                 log_success "RLS policies applied successfully."
             else
                 log_warning "RLS policy application failed; inspect $RLS_SQL."
-                failed_tables+=("policy post-data")
+                failed_tables+=("RLS policies")
             fi
         else
             log_warning "No RLS policies detected for selected tables."
+        fi
+    fi
+
+    log_info "Exporting table grants (permissions)..."
+    if generate_grants_sql "$GRANTS_SQL"; then
+        if [ -s "$GRANTS_SQL" ]; then
+            if apply_sql_with_fallback "$GRANTS_SQL" "Apply table grants"; then
+                log_success "Table grants applied successfully."
+            else
+                log_warning "Table grants application had issues; inspect $GRANTS_SQL."
+                failed_tables+=("table grants")
+            fi
+        else
+            log_info "No table grants detected for selected tables."
         fi
     fi
 
