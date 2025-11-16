@@ -168,11 +168,72 @@ cleanup_old_backups "policies" "$SOURCE_ENV" "$TARGET_ENV" "$MIGRATION_DIR"
 LOG_FILE="${LOG_FILE:-$MIGRATION_DIR/migration.log}"
 log_to_file "$LOG_FILE" "Starting policies/profiles migration from $SOURCE_ENV to $TARGET_ENV"
 
+# If caller did not override TABLES, auto-extend with all RLS-enabled public tables
+auto_discover_rls_tables() {
+    # Only run if TABLES is still the default set
+    if [ "${TABLES[*]}" != "${DEFAULT_TABLES[*]}" ]; then
+        return 0
+    fi
+
+    log_info "Auto-discovering RLS-enabled tables in source (public schema)..."
+
+    local sql_content="
+WITH rls_tables AS (
+    SELECT DISTINCT
+        n.nspname AS schema_name,
+        c.relname AS table_name,
+        format('%I.%I', n.nspname, c.relname) AS qualified
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_policy p ON p.polrelid = c.oid
+    WHERE c.relkind = 'r'
+      AND n.nspname = 'public'
+)
+SELECT qualified
+FROM rls_tables
+ORDER BY qualified;
+"
+
+    local discovered_file
+    discovered_file=$(mktemp)
+    if run_source_sql_to_file "$sql_content" "$discovered_file"; then
+        if [ -s "$discovered_file" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                local trimmed
+                trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [ -z "$trimmed" ] && continue
+                # Avoid duplicates
+                local exists=false
+                for existing in "${TABLES[@]}"; do
+                    if [ "$existing" = "$trimmed" ]; then
+                        exists=true
+                        break
+                    fi
+                done
+                if [ "$exists" = "false" ]; then
+                    TABLES+=("$trimmed")
+                fi
+            done < "$discovered_file"
+            log_info "RLS auto-discovery added tables: ${TABLES[*]}"
+        else
+            log_warning "No RLS-enabled public tables discovered in source."
+        fi
+    else
+        log_warning "Failed to auto-discover RLS-enabled tables; continuing with default TABLES."
+    fi
+
+    rm -f "$discovered_file"
+}
+
 log_info "🛡️  Policies & Profiles Migration"
 log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR"
-log_info "Tables: ${TABLES[*]}"
+
+# Auto-discover additional RLS-enabled tables before logging the final table list
+auto_discover_rls_tables
+
+log_info "Tables (including RLS-enabled public tables): ${TABLES[*]}"
 if [ "$REPLACE_MODE" = "true" ]; then
     log_warning "Replace mode enabled - target data will be made identical to source."
 else
