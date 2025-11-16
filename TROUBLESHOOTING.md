@@ -95,3 +95,26 @@ If scripts can't find `.env.local`:
    # etc.
    ```
 
+## DNS fails for `db.<project>.supabase.*`
+
+If you see repeated errors such as:
+
+```
+psql: error: could not translate host name "db.xxxxx.supabase.co" to address: nodename nor servname provided, or not known
+```
+
+your network can't resolve the default Supabase database domains for that project (this is common for older projects hosted on non‑`.supabase.co` zones). You can pin a custom host per environment:
+
+1. In your Supabase dashboard open **Settings → Database → Connection string** and copy the exact hostname shown for the project (for example `db.my-project.supabase.net`).
+2. In `.env.local` add an override for that environment, e.g.
+
+   ```ini
+   SUPABASE_DEV_DB_HOST_OVERRIDE=db.my-project.supabase.net
+   # optionally set the correct pooler region
+   SUPABASE_DEV_POOLER_REGION=ap-southeast-1
+   ```
+
+3. Restart the migration UI (`./start.sh`). All scripts now try the override first before falling back to the default `.supabase.co/.net/.in` hosts.
+
+You can set overrides for any environment by replacing `DEV` with `TEST`, `PROD`, or `BACKUP`.
+

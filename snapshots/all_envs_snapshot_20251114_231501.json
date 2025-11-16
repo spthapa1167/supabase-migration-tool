@@ -1,0 +1,2197 @@
+{
+  "timestamp": "2025-11-14 23:15:01",
+  "generatedAt": 1763183728,
+  "environments": {
+    "dev": {
+      "env": "dev",
+      "name": "Development",
+      "projectRef": "dikxskzyxolpltqlqeqg",
+      "projectName": "KNC_Platform_Dev",
+      "timestamp": "2025-11-15T05:15:09Z",
+      "counts": {
+        "tables": 103,
+        "views": 2,
+        "functions": 92,
+        "sequences": 1,
+        "indexes": 309,
+        "policies": 276,
+        "triggers": 73,
+        "types": 105,
+        "enums": 11,
+        "publicTables": 77,
+        "publicRows": 1269,
+        "authUsers": 21,
+        "edgeFunctions": 71,
+        "buckets": 2,
+        "secrets": 15,
+        "totalRows": 1452,
+        "storageObjects": 11
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 21
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 2
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 7
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 2
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 21
+        },
+        {
+          "schema": "public",
+          "table": "_xyntra_connection_test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "adhoc_invoices",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "attendance",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "b2b_consultation_requests",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "badge_types",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "batch_activities",
+          "rows": 132
+        },
+        {
+          "schema": "public",
+          "table": "batch_students",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "batches",
+          "rows": 33
+        },
+        {
+          "schema": "public",
+          "table": "camp_off_days",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_page_content",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_seasons",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "centers",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_access_rules",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_knowledge",
+          "rows": 14
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_settings",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "class_enrollments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "classes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "cms_activities",
+          "rows": 150
+        },
+        {
+          "schema": "public",
+          "table": "communication_messages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "content_pages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "csr_activities",
+          "rows": 194
+        },
+        {
+          "schema": "public",
+          "table": "customer_interactions",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "discount_credits",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "email_template_settings",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "employees",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "enrollment_drafts",
+          "rows": 11
+        },
+        {
+          "schema": "public",
+          "table": "enrollments",
+          "rows": 16
+        },
+        {
+          "schema": "public",
+          "table": "failed_enrollments",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "family_discount_settings",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "features",
+          "rows": 37
+        },
+        {
+          "schema": "public",
+          "table": "hero_sections",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "homework_help_content",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "leads",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "learning_levels",
+          "rows": 28
+        },
+        {
+          "schema": "public",
+          "table": "news_events",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "notification_preferences",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "offline_messages",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "operational_tasks",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "parent_emails",
+          "rows": 24
+        },
+        {
+          "schema": "public",
+          "table": "parents",
+          "rows": 24
+        },
+        {
+          "schema": "public",
+          "table": "password_reset_tokens",
+          "rows": 93
+        },
+        {
+          "schema": "public",
+          "table": "payments",
+          "rows": 16
+        },
+        {
+          "schema": "public",
+          "table": "pricing_tiers",
+          "rows": 21
+        },
+        {
+          "schema": "public",
+          "table": "privacy_policy_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "profiles",
+          "rows": 17
+        },
+        {
+          "schema": "public",
+          "table": "program_camp_off_days",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "program_discount_settings",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "program_exceptions",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "programs",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "promo_code_usage",
+          "rows": 9
+        },
+        {
+          "schema": "public",
+          "table": "promotion_codes",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "refunds",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "role_definitions",
+          "rows": 15
+        },
+        {
+          "schema": "public",
+          "table": "schedule_slots",
+          "rows": 209
+        },
+        {
+          "schema": "public",
+          "table": "setting_categories",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "site_settings",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "staff_timeclock",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_badges",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_checkins",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_levels",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "student_milestones",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_observations",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_points",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress_notes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_ratings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_teacher_assignments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "students",
+          "rows": 25
+        },
+        {
+          "schema": "public",
+          "table": "support_tickets",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "system_settings",
+          "rows": 16
+        },
+        {
+          "schema": "public",
+          "table": "teacher_communications",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "teacher_resources",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "teacher_schedule_requests",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "terms_conditions_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "trial_requests",
+          "rows": 12
+        },
+        {
+          "schema": "public",
+          "table": "user_learning_centers",
+          "rows": 15
+        },
+        {
+          "schema": "public",
+          "table": "user_roles",
+          "rows": 65
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 11
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "cms-uploads",
+          "objects": 11
+        }
+      ]
+    },
+    "test": {
+      "env": "test",
+      "name": "Test/Staging",
+      "projectRef": "crofzxkxwitcaooinurs",
+      "projectName": "KNC_Platform_Test",
+      "timestamp": "2025-11-15T05:15:14Z",
+      "counts": {
+        "tables": 103,
+        "views": 2,
+        "functions": 92,
+        "sequences": 1,
+        "indexes": 309,
+        "policies": 267,
+        "triggers": 73,
+        "types": 105,
+        "enums": 11,
+        "publicTables": 77,
+        "publicRows": 1027,
+        "authUsers": 70,
+        "edgeFunctions": 71,
+        "buckets": 2,
+        "secrets": 12,
+        "totalRows": 1297,
+        "storageObjects": 11
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 70
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 70
+        },
+        {
+          "schema": "public",
+          "table": "_xyntra_connection_test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "adhoc_invoices",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "attendance",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "b2b_consultation_requests",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "badge_types",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "batch_activities",
+          "rows": 131
+        },
+        {
+          "schema": "public",
+          "table": "batch_students",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "batches",
+          "rows": 33
+        },
+        {
+          "schema": "public",
+          "table": "camp_off_days",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_page_content",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_seasons",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "centers",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_access_rules",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_knowledge",
+          "rows": 14
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_settings",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "class_enrollments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "classes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "cms_activities",
+          "rows": 150
+        },
+        {
+          "schema": "public",
+          "table": "communication_messages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "content_pages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "csr_activities",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "customer_interactions",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "discount_credits",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "email_template_settings",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "employees",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "enrollment_drafts",
+          "rows": 11
+        },
+        {
+          "schema": "public",
+          "table": "enrollments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "failed_enrollments",
+          "rows": 12
+        },
+        {
+          "schema": "public",
+          "table": "family_discount_settings",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "features",
+          "rows": 37
+        },
+        {
+          "schema": "public",
+          "table": "hero_sections",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "homework_help_content",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "leads",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "learning_levels",
+          "rows": 28
+        },
+        {
+          "schema": "public",
+          "table": "news_events",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "notification_preferences",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "offline_messages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "operational_tasks",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "parent_emails",
+          "rows": 34
+        },
+        {
+          "schema": "public",
+          "table": "parents",
+          "rows": 34
+        },
+        {
+          "schema": "public",
+          "table": "password_reset_tokens",
+          "rows": 90
+        },
+        {
+          "schema": "public",
+          "table": "payments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "pricing_tiers",
+          "rows": 21
+        },
+        {
+          "schema": "public",
+          "table": "privacy_policy_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "profiles",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "program_camp_off_days",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "program_discount_settings",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "program_exceptions",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "programs",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "promo_code_usage",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "promotion_codes",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "refunds",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "role_definitions",
+          "rows": 15
+        },
+        {
+          "schema": "public",
+          "table": "schedule_slots",
+          "rows": 209
+        },
+        {
+          "schema": "public",
+          "table": "setting_categories",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "site_settings",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "staff_timeclock",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_badges",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_checkins",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_levels",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "student_milestones",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_observations",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_points",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress_notes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_ratings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_teacher_assignments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "students",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "support_tickets",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "system_settings",
+          "rows": 16
+        },
+        {
+          "schema": "public",
+          "table": "teacher_communications",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "teacher_resources",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "teacher_schedule_requests",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "terms_conditions_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "trial_requests",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "user_learning_centers",
+          "rows": 37
+        },
+        {
+          "schema": "public",
+          "table": "user_roles",
+          "rows": 68
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 11
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "cms-uploads",
+          "objects": 11
+        }
+      ]
+    },
+    "prod": {
+      "env": "prod",
+      "name": "Production",
+      "projectRef": "mdjogmjtyuotugwroqjp",
+      "projectName": "KNC_Platform_Prod",
+      "timestamp": "2025-11-15T05:15:21Z",
+      "counts": {
+        "tables": 102,
+        "views": 2,
+        "functions": 91,
+        "sequences": 1,
+        "indexes": 308,
+        "policies": 267,
+        "triggers": 74,
+        "types": 104,
+        "enums": 11,
+        "publicTables": 76,
+        "publicRows": 1677,
+        "authUsers": 70,
+        "edgeFunctions": 70,
+        "buckets": 2,
+        "secrets": 12,
+        "totalRows": 3691,
+        "storageObjects": 9
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 1685
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 70
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 5
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 35
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 16
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 5
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 70
+        },
+        {
+          "schema": "public",
+          "table": "_xyntra_connection_test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "adhoc_invoices",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "attendance",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "b2b_consultation_requests",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "badge_types",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "batch_activities",
+          "rows": 131
+        },
+        {
+          "schema": "public",
+          "table": "batch_students",
+          "rows": 50
+        },
+        {
+          "schema": "public",
+          "table": "batches",
+          "rows": 33
+        },
+        {
+          "schema": "public",
+          "table": "camp_off_days",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_page_content",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_seasons",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "centers",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_access_rules",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_knowledge",
+          "rows": 14
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_settings",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "class_enrollments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "classes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "cms_activities",
+          "rows": 150
+        },
+        {
+          "schema": "public",
+          "table": "communication_messages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "content_pages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "csr_activities",
+          "rows": 360
+        },
+        {
+          "schema": "public",
+          "table": "customer_interactions",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "discount_credits",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "employees",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "enrollment_drafts",
+          "rows": 11
+        },
+        {
+          "schema": "public",
+          "table": "enrollments",
+          "rows": 54
+        },
+        {
+          "schema": "public",
+          "table": "failed_enrollments",
+          "rows": 12
+        },
+        {
+          "schema": "public",
+          "table": "family_discount_settings",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "features",
+          "rows": 37
+        },
+        {
+          "schema": "public",
+          "table": "hero_sections",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "homework_help_content",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "leads",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "learning_levels",
+          "rows": 28
+        },
+        {
+          "schema": "public",
+          "table": "news_events",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "notification_preferences",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "offline_messages",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "operational_tasks",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "parent_emails",
+          "rows": 34
+        },
+        {
+          "schema": "public",
+          "table": "parents",
+          "rows": 34
+        },
+        {
+          "schema": "public",
+          "table": "password_reset_tokens",
+          "rows": 90
+        },
+        {
+          "schema": "public",
+          "table": "payments",
+          "rows": 29
+        },
+        {
+          "schema": "public",
+          "table": "pricing_tiers",
+          "rows": 21
+        },
+        {
+          "schema": "public",
+          "table": "privacy_policy_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "profiles",
+          "rows": 70
+        },
+        {
+          "schema": "public",
+          "table": "program_camp_off_days",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "program_discount_settings",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "program_exceptions",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "programs",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "promo_code_usage",
+          "rows": 9
+        },
+        {
+          "schema": "public",
+          "table": "promotion_codes",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "refunds",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "role_definitions",
+          "rows": 15
+        },
+        {
+          "schema": "public",
+          "table": "schedule_slots",
+          "rows": 209
+        },
+        {
+          "schema": "public",
+          "table": "setting_categories",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "site_settings",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "staff_timeclock",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_badges",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_checkins",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_levels",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "student_milestones",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_observations",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_points",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress_notes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_ratings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_teacher_assignments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "students",
+          "rows": 63
+        },
+        {
+          "schema": "public",
+          "table": "support_tickets",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "system_settings",
+          "rows": 16
+        },
+        {
+          "schema": "public",
+          "table": "teacher_communications",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "teacher_resources",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "teacher_schedule_requests",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "terms_conditions_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "trial_requests",
+          "rows": 9
+        },
+        {
+          "schema": "public",
+          "table": "user_learning_centers",
+          "rows": 37
+        },
+        {
+          "schema": "public",
+          "table": "user_roles",
+          "rows": 67
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 9
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "cms-uploads",
+          "objects": 9
+        }
+      ]
+    },
+    "backup": {
+      "env": "backup",
+      "name": "Backup",
+      "projectRef": "vckgjpyhgnwwnldovuhh",
+      "projectName": "KNC_Platform_Prod_Backup",
+      "timestamp": "2025-11-15T05:15:28Z",
+      "counts": {
+        "tables": 103,
+        "views": 2,
+        "functions": 92,
+        "sequences": 1,
+        "indexes": 309,
+        "policies": 272,
+        "triggers": 73,
+        "types": 105,
+        "enums": 11,
+        "publicTables": 77,
+        "publicRows": 1677,
+        "authUsers": 70,
+        "edgeFunctions": 71,
+        "buckets": 2,
+        "secrets": 13,
+        "totalRows": 1945,
+        "storageObjects": 9
+      },
+      "tableRows": [
+        {
+          "schema": "auth",
+          "table": "audit_log_entries",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "flow_state",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "identities",
+          "rows": 70
+        },
+        {
+          "schema": "auth",
+          "table": "instances",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_amr_claims",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_challenges",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "mfa_factors",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_authorizations",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_clients",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "oauth_consents",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "one_time_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "refresh_tokens",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "saml_relay_states",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "schema_migrations",
+          "rows": 69
+        },
+        {
+          "schema": "auth",
+          "table": "sessions",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_domains",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "sso_providers",
+          "rows": 0
+        },
+        {
+          "schema": "auth",
+          "table": "users",
+          "rows": 70
+        },
+        {
+          "schema": "public",
+          "table": "_xyntra_connection_test",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "adhoc_invoices",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "attendance",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "b2b_consultation_requests",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "badge_types",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "batch_activities",
+          "rows": 131
+        },
+        {
+          "schema": "public",
+          "table": "batch_students",
+          "rows": 50
+        },
+        {
+          "schema": "public",
+          "table": "batches",
+          "rows": 33
+        },
+        {
+          "schema": "public",
+          "table": "camp_off_days",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_page_content",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "camp_seasons",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "centers",
+          "rows": 3
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_access_rules",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_knowledge",
+          "rows": 14
+        },
+        {
+          "schema": "public",
+          "table": "chatbot_settings",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "class_enrollments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "classes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "cms_activities",
+          "rows": 150
+        },
+        {
+          "schema": "public",
+          "table": "communication_messages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "content_pages",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "csr_activities",
+          "rows": 360
+        },
+        {
+          "schema": "public",
+          "table": "customer_interactions",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "discount_credits",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "email_template_settings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "employees",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "enrollment_drafts",
+          "rows": 11
+        },
+        {
+          "schema": "public",
+          "table": "enrollments",
+          "rows": 54
+        },
+        {
+          "schema": "public",
+          "table": "failed_enrollments",
+          "rows": 12
+        },
+        {
+          "schema": "public",
+          "table": "family_discount_settings",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "features",
+          "rows": 37
+        },
+        {
+          "schema": "public",
+          "table": "hero_sections",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "homework_help_content",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "leads",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "learning_levels",
+          "rows": 28
+        },
+        {
+          "schema": "public",
+          "table": "news_events",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "notification_preferences",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "offline_messages",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "operational_tasks",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "parent_emails",
+          "rows": 34
+        },
+        {
+          "schema": "public",
+          "table": "parents",
+          "rows": 34
+        },
+        {
+          "schema": "public",
+          "table": "password_reset_tokens",
+          "rows": 90
+        },
+        {
+          "schema": "public",
+          "table": "payments",
+          "rows": 29
+        },
+        {
+          "schema": "public",
+          "table": "pricing_tiers",
+          "rows": 21
+        },
+        {
+          "schema": "public",
+          "table": "privacy_policy_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "profiles",
+          "rows": 70
+        },
+        {
+          "schema": "public",
+          "table": "program_camp_off_days",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "program_discount_settings",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "program_exceptions",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "programs",
+          "rows": 10
+        },
+        {
+          "schema": "public",
+          "table": "promo_code_usage",
+          "rows": 9
+        },
+        {
+          "schema": "public",
+          "table": "promotion_codes",
+          "rows": 2
+        },
+        {
+          "schema": "public",
+          "table": "refunds",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "role_definitions",
+          "rows": 15
+        },
+        {
+          "schema": "public",
+          "table": "schedule_slots",
+          "rows": 209
+        },
+        {
+          "schema": "public",
+          "table": "setting_categories",
+          "rows": 7
+        },
+        {
+          "schema": "public",
+          "table": "site_settings",
+          "rows": 8
+        },
+        {
+          "schema": "public",
+          "table": "staff_timeclock",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_badges",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_checkins",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_levels",
+          "rows": 4
+        },
+        {
+          "schema": "public",
+          "table": "student_milestones",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_observations",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_points",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_progress_notes",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_ratings",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "student_teacher_assignments",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "students",
+          "rows": 63
+        },
+        {
+          "schema": "public",
+          "table": "support_tickets",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "system_settings",
+          "rows": 16
+        },
+        {
+          "schema": "public",
+          "table": "teacher_communications",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "teacher_resources",
+          "rows": 1
+        },
+        {
+          "schema": "public",
+          "table": "teacher_schedule_requests",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "terms_conditions_sections",
+          "rows": 0
+        },
+        {
+          "schema": "public",
+          "table": "trial_requests",
+          "rows": 9
+        },
+        {
+          "schema": "public",
+          "table": "user_learning_centers",
+          "rows": 37
+        },
+        {
+          "schema": "public",
+          "table": "user_roles",
+          "rows": 67
+        },
+        {
+          "schema": "storage",
+          "table": "buckets",
+          "rows": 2
+        },
+        {
+          "schema": "storage",
+          "table": "buckets_analytics",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "migrations",
+          "rows": 44
+        },
+        {
+          "schema": "storage",
+          "table": "objects",
+          "rows": 9
+        },
+        {
+          "schema": "storage",
+          "table": "prefixes",
+          "rows": 4
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads",
+          "rows": 0
+        },
+        {
+          "schema": "storage",
+          "table": "s3_multipart_uploads_parts",
+          "rows": 0
+        }
+      ],
+      "storageBucketObjects": [
+        {
+          "bucket": "cms-uploads",
+          "objects": 9
+        }
+      ]
+    }
+  }
+}

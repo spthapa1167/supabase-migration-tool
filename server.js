@@ -274,6 +274,42 @@ async function buildEdgeComparisonPayload(cleanOutput) {
     };
 }
 
+function buildPublicTableDiffPayload(cleanOutput = '') {
+    const clean = (cleanOutput || '').trim();
+    const match = clean.match(/PUBLIC_TABLE_DIFF_JSON=({[\s\S]+})/);
+    if (!match) {
+        throw new Error('Unable to parse public table comparison output');
+    }
+    return JSON.parse(match[1].trim());
+}
+
+function buildPublicTableSyncPayload(cleanOutput = '') {
+    const clean = (cleanOutput || '').trim();
+    const match = clean.match(/PUBLIC_TABLE_SYNC_JSON=({[\s\S]+})/);
+    if (!match) {
+        throw new Error('Unable to parse public table sync output');
+    }
+    return JSON.parse(match[1].trim());
+}
+
+function buildPoliciesDiffPayload(cleanOutput = '') {
+    const clean = (cleanOutput || '').trim();
+    const match = clean.match(/POLICIES_DIFF_JSON=({[\s\S]+})/);
+    if (!match) {
+        throw new Error('Unable to parse policies comparison output');
+    }
+    return JSON.parse(match[1].trim());
+}
+
+function buildPoliciesSyncPayload(cleanOutput = '') {
+    const clean = (cleanOutput || '').trim();
+    const match = clean.match(/POLICIES_SYNC_JSON=({[\s\S]+})/);
+    if (!match) {
+        throw new Error('Unable to parse policies sync output');
+    }
+    return JSON.parse(match[1].trim());
+}
+
 // API Routes
 
 // Get server info
@@ -777,6 +813,100 @@ app.post('/api/clone', async (req, res) => {
     }
 });
 
+// Execute table data migration with streaming
+app.post('/api/migration/table-data', async (req, res) => {
+    const { sourceEnv, targetEnv, tables = [], mode = 'append', batchSize = 1000, includeUsers = false, stream } = req.body;
+
+    if (!sourceEnv || !targetEnv) {
+        return res.status(400).json({ error: 'sourceEnv and targetEnv are required' });
+    }
+
+    const args = [sourceEnv, targetEnv];
+    if (includeUsers === true) args.push('--users');
+    if (mode === 'replace') args.push('--replace');
+    if (batchSize && Number.isFinite(batchSize)) args.push(`--batch=${batchSize}`);
+    if (Array.isArray(tables) && tables.length > 0) args.push(`--tables=${tables.join(',')}`);
+
+    if (stream === true) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+        try {
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/components/migrate_all_table_data.sh');
+            await fs.access(fullPath, fs.constants.F_OK);
+
+            const allArgs = args.filter(arg => arg !== null && arg !== undefined);
+            const child = spawn('bash', [fullPath, ...allArgs], {
+                cwd: PROJECT_ROOT,
+                env: process.env
+            });
+
+            const output = {
+                processId,
+                stdout: '',
+                stderr: '',
+                exitCode: null,
+                status: 'running'
+            };
+
+            child.stdout.on('data', (data) => {
+                const text = data.toString();
+                output.stdout += text;
+                res.write(`data: ${JSON.stringify({ type: 'stdout', data: text })}\n\n`);
+            });
+
+            child.stderr.on('data', (data) => {
+                const text = data.toString();
+                output.stderr += text;
+                res.write(`data: ${JSON.stringify({ type: 'stderr', data: text })}\n\n`);
+            });
+
+            child.on('close', (code) => {
+                output.exitCode = code;
+                output.status = code === 0 ? 'completed' : 'failed';
+                res.write(`data: ${JSON.stringify({ type: 'complete', status: output.status, exitCode: code })}\n\n`);
+                res.end();
+            });
+
+            child.on('error', (error) => {
+                res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+                res.end();
+            });
+
+            activeProcesses.set(processId, {
+                child,
+                output,
+                type: 'table-data',
+                sourceEnv,
+                targetEnv,
+                options: { tables, mode, batchSize, includeUsers },
+                startTime: new Date().toISOString(),
+                endpoint: '/api/migration/table-data'
+            });
+
+            req.on('close', () => {
+                if (child && !child.killed) {
+                    child.kill();
+                }
+                activeProcesses.delete(processId);
+            });
+        } catch (error) {
+            res.write(`data: ${JSON.stringify({ type: 'error', error: error.message })}\n\n`);
+            res.end();
+        }
+    } else {
+        try {
+            const result = await executeScript('scripts/components/migrate_all_table_data.sh', args);
+            res.json(result);
+        } catch (error) {
+            res.status(500).json(error);
+        }
+    }
+});
+
 // Execute database migration with streaming
 app.post('/api/migration/database', async (req, res) => {
     const { sourceEnv, targetEnv, migrationDir, options = {}, stream } = req.body;
@@ -1159,6 +1289,127 @@ app.post('/api/migration/secrets', async (req, res) => {
         } catch (error) {
             res.status(500).json(error);
         }
+    }
+});
+
+app.get('/api/schema/public-table-diff', async (req, res) => {
+    const sourceEnv = req.query.sourceEnv;
+    const targetEnv = req.query.targetEnv;
+
+    if (!sourceEnv || !targetEnv) {
+        return res.status(400).json({ error: 'sourceEnv and targetEnv are required' });
+    }
+    if (sourceEnv === targetEnv) {
+        return res.status(400).json({ error: 'Source and target environments must be different' });
+    }
+
+    try {
+        const result = await executeScript('scripts/components/public_table_comparison.sh', [sourceEnv, targetEnv]);
+        if (result.exitCode !== 0) {
+            const message = result.stderr?.trim() || 'Public table comparison failed';
+            return res.status(500).json({ error: message });
+        }
+        const payload = buildPublicTableDiffPayload(stripAnsi(result.stdout || ''));
+        res.json(payload);
+    } catch (error) {
+        res.status(500).json({ error: error.error || error.message || 'Unable to generate table comparison' });
+    }
+});
+
+app.post('/api/schema/public-table-sync', async (req, res) => {
+    const { sourceEnv, targetEnv, tableName, schemaName = 'public' } = req.body || {};
+
+    if (!sourceEnv || !targetEnv || !tableName) {
+        return res.status(400).json({ error: 'sourceEnv, targetEnv, and tableName are required' });
+    }
+
+    if (sourceEnv === targetEnv) {
+        return res.status(400).json({ error: 'Source and target environments must be different' });
+    }
+
+    try {
+        const args = [sourceEnv, targetEnv, tableName];
+        if (schemaName && schemaName !== 'public') {
+            args.push(`--schema=${schemaName}`);
+        }
+        const result = await executeScript('scripts/components/sync_table_schema.sh', args);
+        if (result.exitCode !== 0) {
+            const message = result.stderr?.trim() || 'Public table sync failed';
+            return res.status(500).json({ error: message });
+        }
+        const payload = buildPublicTableSyncPayload(stripAnsi(result.stdout || ''));
+        res.json(payload);
+    } catch (error) {
+        res.status(500).json({ error: error.error || error.message || 'Unable to sync table schema' });
+    }
+});
+
+app.get('/api/schema/policies-diff', async (req, res) => {
+    const sourceEnv = req.query.sourceEnv;
+    const targetEnv = req.query.targetEnv;
+
+    if (!sourceEnv || !targetEnv) {
+        return res.status(400).json({ error: 'sourceEnv and targetEnv are required' });
+    }
+    if (sourceEnv === targetEnv) {
+        return res.status(400).json({ error: 'Source and target environments must be different' });
+    }
+
+    try {
+        const result = await executeScript('scripts/components/policies_comparison.sh', [sourceEnv, targetEnv]);
+        if (result.exitCode !== 0) {
+            const message = result.stderr?.trim() || 'Policies comparison failed';
+            return res.status(500).json({ error: message });
+        }
+        const payload = buildPoliciesDiffPayload(stripAnsi(result.stdout || ''));
+        res.json(payload);
+    } catch (error) {
+        res.status(500).json({ error: error.error || error.message || 'Unable to generate policies comparison' });
+    }
+});
+
+app.post('/api/schema/policies-sync', async (req, res) => {
+    const {
+        sourceEnv,
+        targetEnv,
+        type,
+        action,
+        schemaName,
+        tableName,
+        policyName,
+        grantee,
+        privilege,
+        roleName,
+        userId
+    } = req.body || {};
+
+    if (!sourceEnv || !targetEnv || !type) {
+        return res.status(400).json({ error: 'sourceEnv, targetEnv, and type are required' });
+    }
+    if (sourceEnv === targetEnv) {
+        return res.status(400).json({ error: 'Source and target environments must be different' });
+    }
+
+    const args = [sourceEnv, targetEnv, `--type=${type}`];
+    if (action) args.push(`--action=${action}`);
+    if (schemaName) args.push(`--schema=${schemaName}`);
+    if (tableName) args.push(`--table=${tableName}`);
+    if (policyName) args.push(`--policy=${policyName}`);
+    if (grantee) args.push(`--grantee=${grantee}`);
+    if (privilege) args.push(`--privilege=${privilege}`);
+    if (roleName) args.push(`--role=${roleName}`);
+    if (userId) args.push(`--user-id=${userId}`);
+
+    try {
+        const result = await executeScript('scripts/components/policies_sync_item.sh', args);
+        if (result.exitCode !== 0) {
+            const message = result.stderr?.trim() || 'Policies sync failed';
+            return res.status(500).json({ error: message });
+        }
+        const payload = buildPoliciesSyncPayload(stripAnsi(result.stdout || ''));
+        res.json(payload);
+    } catch (error) {
+        res.status(500).json({ error: error.error || error.message || 'Unable to sync policies' });
     }
 });
 

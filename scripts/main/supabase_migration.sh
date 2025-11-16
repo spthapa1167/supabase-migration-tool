@@ -28,11 +28,11 @@ INCLUDE_COMPONENTS=""
 EXCLUDE_COMPONENTS=""
 MULTIPLE_TARGETS=false
 BACKUP_TARGET=false
-INCLUDE_DATA=false  # Default: false - don't migrate database data by default
-INCLUDE_FILES=false  # Default: false - don't migrate bucket files by default
-INCLUDE_USERS=false  # Default: false - don't migrate auth users by default
+INCLUDE_DATA=false   # Default: false  - don't migrate database row data by default
+INCLUDE_FILES=false  # Default: false  - don't migrate bucket files by default
+INCLUDE_USERS=false  # Default: false  - don't migrate auth.users / identities unless --users is specified
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
-INCREMENTAL_MODE=false  # Default: false - full synchronization unless --increment is provided
+INCREMENTAL_MODE=false     # Default: false - full sync for data unless --increment is provided
 
 # Colors
 RED='\033[0;31m'
@@ -62,11 +62,11 @@ Arguments:
 Options:
   --full                  Shortcut for schema+data+users+files migration (equivalent to --mode full --data --users --files)
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
-  --increment             Prefer incremental/delta updates for all components (default: full sync)
-  --data                  Include database data/rows migration (default: false)
-  --replace-data          Allow destructive replace of target data (requires --data). Without this flag, data sync runs in delta/append mode.
-  --users                 Include authentication users, roles, and policies migration (default: false)
-  --files                 Include storage bucket files migration (default: false)
+  --increment             Prefer incremental/delta updates where supported (e.g. data) instead of full replace
+  --data                  Include database row data migration (default: disabled)
+  --replace-data          With --data, REPLACE all target table data with source data (destructive). Without this flag, data sync runs in delta/append mode.
+  --users                 Include authentication users/identities migration (default: disabled; auth users are NOT copied unless this is set)
+  --files                 Include storage bucket files migration (default: disabled)
   --env-file <file>       Environment file (default: .env.local)
   --dry-run               Preview migration without executing
   --backup                Create backup before migration
@@ -80,16 +80,20 @@ Options:
   -h, --help              Show this help message
 
 Default Behavior:
-  By default, migrates SCHEMA ONLY (no database data, no bucket files, no auth users):
-  - Database: Schema only (tables, indexes, policies, etc.)
+  By default, the main migration runs a COMPLETE SCHEMA + POLICY sync, but does NOT copy table data, files, or auth users:
+  - Database: Schema only (tables, indexes, constraints, functions, RLS policies, etc.)
+  - Auth: auth schema (structure) only; auth users/identities are NOT copied unless --users is provided
+  - Policies & Roles: roles, user_roles, and RLS policies are synchronized to match source
   - Storage: Bucket configurations only (no files)
   - Edge Functions: Migrated
-  - Secrets: Structure created (values need manual update)
+  - Secrets: Keys synchronized incrementally (no existing values overwritten; new keys added only)
 
-  Use --data flag to include database row migration
-  Use --users flag to include authentication users, roles, and policies migration
-  Use --files flag to include storage bucket file migration
-  Use --full for an all-in-one migration (schema + data + users + files)
+  Use --data to include database row migration.
+  Use --data --increment for incremental/delta data sync (append / upsert semantics where possible).
+  Use --data --replace-data for a full data REPLACE (target table data is truncated/replaced by source).
+  Use --files to include storage bucket file migration.
+  Use --users to copy auth users/identities so login state matches source.
+  Use --full for an all-in-one migration (schema + data + users + files).
 
 Examples:
   # Schema-only migration (default - no data, no files)
@@ -1444,6 +1448,39 @@ perform_migration() {
             FAILED_COMPONENTS+=("secrets")
             exit_code=1
         fi
+    fi
+
+    # Step 5: Migrate policies / roles / RLS (profiles, user_roles, etc.)
+    # This ensures that tables like public.profiles have the same RLS policies
+    # and role mappings in the target as in the source.
+    local policies_script="$PROJECT_ROOT/scripts/components/policies_migration.sh"
+    if [ -x "$policies_script" ]; then
+        log_info "Synchronising policies, roles, and policy-related tables..."
+        local policies_args=("$source" "$target" "$migration_dir")
+        # If we're doing a full replace of data, default to a destructive policies sync
+        if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+            policies_args+=("--replace")
+        fi
+        if [ "$AUTO_CONFIRM" = "true" ]; then
+            policies_args+=("--auto-confirm")
+        fi
+
+        if ! prompt_proceed "Policies & RLS Migration" "Proceed with policies/roles/RLS migration from $source to $target?"; then
+            log_warning "Policies/roles migration skipped by user."
+            SKIPPED_COMPONENTS+=("policies/roles/RLS")
+        else
+            if "$policies_script" "${policies_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                log_success "Policies/roles/RLS migration completed successfully"
+                SUCCEEDED_COMPONENTS+=("policies/roles/RLS")
+            else
+                log_warning "Policies/roles/RLS migration had errors, continuing..."
+                FAILED_COMPONENTS+=("policies/roles/RLS")
+                exit_code=1
+            fi
+        fi
+    else
+        log_warning "Policies migration script not found at $policies_script; skipping policies/roles/RLS sync."
+        SKIPPED_COMPONENTS+=("policies/roles/RLS")
     fi
     
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

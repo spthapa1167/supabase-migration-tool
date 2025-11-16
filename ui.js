@@ -95,7 +95,7 @@ function switchTab(tabName, clickedElement) {
         loadEnvironmentsList();
     }
 
-    if (tabName === 'edge-comparison') {
+if (tabName === 'edge-comparison') {
         onEdgeComparisonTabOpen();
     }
 
@@ -196,6 +196,879 @@ function showLoading(elementId) {
 function hideLoading(elementId) {
     const loader = document.getElementById(elementId);
     if (loader) loader.classList.add('hidden');
+}
+
+async function runPublicTableComparison() {
+    const sourceSelect = document.getElementById('publicTableSource');
+    const targetSelect = document.getElementById('publicTableTarget');
+    const sourceEnv = sourceSelect?.value;
+    const targetEnv = targetSelect?.value;
+
+    if (!sourceEnv || !targetEnv) {
+        showPublicTableComparisonError('Please select both source and target environments.');
+        return;
+    }
+
+    if (sourceEnv === targetEnv) {
+        showPublicTableComparisonError('Source and target environments must be different.');
+        return;
+    }
+
+    showPublicTableComparisonError('');
+    setPublicTableComparisonLoading(true);
+    const resultContainer = document.getElementById('publicTableComparisonResult');
+    if (resultContainer) {
+        resultContainer.classList.add('hidden');
+        resultContainer.innerHTML = '';
+    }
+
+    try {
+        const response = await fetch(`/api/schema/public-table-diff?sourceEnv=${encodeURIComponent(sourceEnv)}&targetEnv=${encodeURIComponent(targetEnv)}`, {
+            headers: getAuthHeaders()
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ error: 'Unable to fetch comparison results' }));
+            throw new Error(error.error || 'Unable to fetch comparison results');
+        }
+        const data = await response.json();
+        renderPublicTableComparison(data, sourceEnv, targetEnv);
+    } catch (error) {
+        showPublicTableComparisonError(error.message || 'Failed to compare public tables');
+    } finally {
+        setPublicTableComparisonLoading(false);
+    }
+}
+
+function setPublicTableComparisonLoading(isLoading) {
+    const spinner = document.getElementById('publicTableComparisonLoading');
+    const submitBtn = document.querySelector('#publicTableComparisonForm button[type="submit"]');
+    if (spinner) {
+        spinner.classList.toggle('hidden', !isLoading);
+    }
+    if (submitBtn) {
+        submitBtn.disabled = isLoading;
+        submitBtn.classList.toggle('opacity-70', isLoading);
+    }
+}
+
+function renderColumnItems(columns, emptyText) {
+    if (!Array.isArray(columns) || columns.length === 0) {
+        return `<p class="text-xs text-neutral-500">${escapeHtml(emptyText)}</p>`;
+    }
+    return `
+        <ul class="space-y-1 text-xs">
+            ${columns.map(col => `
+                <li class="flex items-center space-x-2">
+                    <span class="w-2 h-2 bg-primary-400 rounded-full"></span>
+                    <span class="font-semibold text-neutral-800">${escapeHtml(col.name || '')}</span>
+                    <span class="text-neutral-500">
+                        (${escapeHtml(col.formatted_type || col.data_type || 'unknown')})
+                    </span>
+                </li>
+            `).join('')}
+        </ul>
+    `;
+}
+
+function renderChangedColumns(changed) {
+    if (!Array.isArray(changed) || changed.length === 0) {
+        return '<p class="text-xs text-neutral-500">No type/nullability/default changes.</p>';
+    }
+    return `
+        <ul class="space-y-2 text-xs">
+            ${changed.map(change => {
+                const diffs = Object.entries(change.differences || {}).map(([key, value]) => `
+                    <div class="flex justify-between text-[11px] text-neutral-600">
+                        <span class="uppercase tracking-wide text-neutral-500">${escapeHtml(key)}</span>
+                        <span class="text-neutral-800 font-semibold">${escapeHtml(value.source || '∅')}</span>
+                        <span class="text-neutral-400">→</span>
+                        <span class="text-primary-700 font-semibold">${escapeHtml(value.target || '∅')}</span>
+                    </div>
+                `).join('');
+                return `
+                    <li class="border border-neutral-100 rounded-lg p-2 bg-neutral-50">
+                        <div class="text-neutral-800 font-semibold mb-1">${escapeHtml(change.column || '')}</div>
+                        ${diffs}
+                    </li>
+                `;
+            }).join('')}
+        </ul>
+    `;
+}
+
+function createPublicTableSyncButton(detail, sourceEnv, targetEnv) {
+    if (!detail || detail.syncable !== true) {
+        return '';
+    }
+    const schema = detail.schema || 'public';
+    const key = `${schema}.${detail.name}`;
+    const label = detail.syncType === 'create' ? 'Create in target' : 'Sync schema';
+    return `
+        <button 
+            type="button"
+            class="px-3 py-1.5 text-xs font-semibold rounded-lg bg-primary-600 text-white hover:bg-primary-700 transition-all duration-200 flex items-center space-x-2 shadow"
+            data-sync-table="${escapeHtml(detail.name)}"
+            data-sync-schema="${escapeHtml(schema)}"
+            data-source="${escapeHtml(sourceEnv)}"
+            data-target="${escapeHtml(targetEnv)}"
+            data-sync-status-key="${escapeHtml(key)}"
+            data-label="${escapeHtml(label)}"
+        >
+            <span class="sync-label">${escapeHtml(label)}</span>
+            <span class="loading-spinner hidden"></span>
+        </button>
+    `;
+}
+
+function renderSourceOnlySection(details, sourceEnv, targetEnv) {
+    if (!Array.isArray(details) || details.length === 0) return '';
+    return `
+        <section class="space-y-3">
+            <div>
+                <h4 class="text-sm font-semibold text-primary-900">Tables only in ${escapeHtml(sourceEnv)} (${details.length})</h4>
+                <p class="text-xs text-neutral-500">These tables exist in source but not target. Syncing will create them in target.</p>
+            </div>
+            <div class="space-y-3">
+                ${details.map(detail => {
+                    const schema = detail.schema || 'public';
+                    const key = `${schema}.${detail.name}`;
+                    return `
+                        <div class="border border-primary-100 rounded-xl p-4 bg-primary-50/40">
+                            <div class="flex items-start justify-between gap-3">
+                                <div>
+                                    <div class="text-sm font-semibold text-primary-900">${escapeHtml(detail.name)}</div>
+                                    <p class="text-xs text-neutral-600">${escapeHtml(detail.reason || '')}</p>
+                                </div>
+                                ${createPublicTableSyncButton(detail, sourceEnv, targetEnv)}
+                            </div>
+                            <div class="text-[11px] text-neutral-500 mt-2" data-sync-status="${escapeHtml(key)}"></div>
+                            <div class="mt-3">
+                                <h5 class="text-xs font-semibold text-primary-900 mb-1">Columns</h5>
+                                ${renderColumnItems(detail.columns, 'No columns found')}
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </section>
+    `;
+}
+
+function renderChangedTablesSection(changedTables, sourceEnv, targetEnv) {
+    if (!Array.isArray(changedTables) || changedTables.length === 0) return '';
+    return `
+        <section class="space-y-3">
+            <div>
+                <h4 class="text-sm font-semibold text-primary-900">Changed Tables (${changedTables.length})</h4>
+                <p class="text-xs text-neutral-500">Column differences detected between environments. Syncing will align target schema.</p>
+            </div>
+            <div class="space-y-3">
+                ${changedTables.map(table => {
+                    const schema = table.schema || 'public';
+                    const key = `${schema}.${table.name}`;
+                    const diff = table.diff || {};
+                    return `
+                        <div class="border border-neutral-200 rounded-xl bg-white/80">
+                            <div class="px-4 py-3 flex items-start justify-between gap-3 border-b border-neutral-100">
+                                <div>
+                                    <div class="text-sm font-semibold text-primary-900">${escapeHtml(table.name)}</div>
+                                    <p class="text-xs text-neutral-500">${escapeHtml(table.reason || '')}</p>
+                                </div>
+                                ${createPublicTableSyncButton(table, sourceEnv, targetEnv)}
+                            </div>
+                            <div class="px-4 text-[11px] text-neutral-500 mt-2" data-sync-status="${escapeHtml(key)}"></div>
+                            <div class="p-4 space-y-4 text-sm">
+                                <div>
+                                    <h5 class="text-xs font-semibold text-primary-900 mb-1">New Columns in Source</h5>
+                                    ${renderColumnItems(diff.addedColumns, 'No new columns')}
+                                </div>
+                                <div>
+                                    <h5 class="text-xs font-semibold text-primary-900 mb-1">Columns Missing from Source</h5>
+                                    ${renderColumnItems(diff.removedColumns, 'No removed columns')}
+                                </div>
+                                <div>
+                                    <h5 class="text-xs font-semibold text-primary-900 mb-1">Changed Columns</h5>
+                                    ${renderChangedColumns(diff.changedColumns)}
+                                </div>
+                            </div>
+                        </div>
+                    `;
+                }).join('')}
+            </div>
+        </section>
+    `;
+}
+
+function renderTargetOnlySection(details, targetEnv) {
+    if (!Array.isArray(details) || details.length === 0) return '';
+    return `
+        <section class="space-y-3">
+            <div>
+                <h4 class="text-sm font-semibold text-warning-900">Tables only in ${escapeHtml(targetEnv)} (${details.length})</h4>
+                <p class="text-xs text-neutral-500">These tables are missing in source. Review before manual cleanup.</p>
+            </div>
+            <div class="space-y-3">
+                ${details.map(detail => `
+                    <div class="border border-neutral-200 rounded-xl p-4 bg-white/70">
+                        <div class="text-sm font-semibold text-neutral-800">${escapeHtml(detail.name)}</div>
+                        <p class="text-xs text-neutral-500">${escapeHtml(detail.reason || '')}</p>
+                        <div class="mt-3">
+                            <h5 class="text-xs font-semibold text-neutral-800 mb-1">Columns</h5>
+                            ${renderColumnItems(detail.columns, 'No columns found')}
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        </section>
+    `;
+}
+
+function attachPublicTableSyncHandlers(root) {
+    if (!root) return;
+    root.querySelectorAll('[data-sync-table]').forEach(button => {
+        if (button.dataset.syncBound === 'true') return;
+        button.addEventListener('click', handlePublicTableSync);
+        button.dataset.syncBound = 'true';
+    });
+}
+
+function setSyncButtonLoading(button, isLoading) {
+    if (!button) return;
+    const spinner = button.querySelector('.loading-spinner');
+    const label = button.querySelector('.sync-label');
+    const defaultLabel = button.dataset.label || 'Sync schema';
+    if (spinner) spinner.classList.toggle('hidden', !isLoading);
+    if (label) label.textContent = isLoading ? 'Syncing...' : defaultLabel;
+    button.disabled = isLoading;
+    button.classList.toggle('opacity-70', isLoading);
+}
+
+async function handlePublicTableSync(event) {
+    event.preventDefault();
+    const button = event.currentTarget;
+    if (!button || button.disabled) return;
+    const tableName = button.dataset.syncTable;
+    const schemaName = button.dataset.syncSchema || 'public';
+    const sourceEnv = button.dataset.source;
+    const targetEnv = button.dataset.target;
+    const statusKey = button.dataset.syncStatusKey;
+    const statusSelector = statusKey ? `[data-sync-status="${escapeCssIdentifier(statusKey)}"]` : null;
+    const statusEl = statusSelector ? document.querySelector(statusSelector) : null;
+
+    if (!tableName || !sourceEnv || !targetEnv) {
+        return;
+    }
+
+    setSyncButtonLoading(button, true);
+    if (statusEl) {
+        statusEl.textContent = 'Syncing schema...';
+        statusEl.classList.remove('text-error-600', 'text-success-600');
+        statusEl.classList.add('text-neutral-500');
+    }
+
+    try {
+        const response = await fetch('/api/schema/public-table-sync', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+                sourceEnv,
+                targetEnv,
+                tableName,
+                schemaName
+            })
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(payload.error || 'Failed to sync table schema');
+        }
+
+        if (statusEl) {
+            statusEl.textContent = payload.message || 'Schema synced successfully.';
+            statusEl.classList.remove('text-neutral-500', 'text-error-600');
+            statusEl.classList.add('text-success-600');
+        }
+
+        setTimeout(() => {
+            runPublicTableComparison();
+        }, 400);
+    } catch (error) {
+        if (statusEl) {
+            statusEl.textContent = error.message || 'Failed to sync schema.';
+            statusEl.classList.remove('text-neutral-500', 'text-success-600');
+            statusEl.classList.add('text-error-600');
+        }
+    } finally {
+        setSyncButtonLoading(button, false);
+    }
+}
+
+function showPublicTableComparisonError(message) {
+    const errorDiv = document.getElementById('publicTableComparisonError');
+    if (!errorDiv) return;
+
+    if (message) {
+        errorDiv.textContent = message;
+        errorDiv.classList.remove('hidden');
+    } else {
+        errorDiv.textContent = '';
+        errorDiv.classList.add('hidden');
+    }
+}
+
+function renderPublicTableComparison(data, sourceEnv, targetEnv) {
+    const container = document.getElementById('publicTableComparisonResult');
+    if (!container) return;
+    container.classList.remove('hidden');
+
+    const summary = data.summary || {};
+    const summaryItems = [
+        { label: 'Source Tables', value: summary.sourceTables },
+        { label: 'Target Tables', value: summary.targetTables },
+        { label: 'Added (source-only)', value: summary.sourceOnly },
+        { label: 'Removed (target-only)', value: summary.targetOnly },
+        { label: 'Changed Tables', value: summary.changed }
+    ];
+
+    const summaryHtml = summaryItems.map(item => `
+        <div class="border border-primary-100 rounded-xl p-3 text-center bg-primary-50/60">
+            <div class="text-2xl font-semibold text-primary-700">${item.value ?? 0}</div>
+            <div class="text-xs uppercase tracking-wide text-primary-600">${escapeHtml(item.label)}</div>
+        </div>
+    `).join('');
+
+    const buildTableList = (items, emptyText) => {
+        if (!items || items.length === 0) {
+            return `<p class="text-sm text-neutral-500">${escapeHtml(emptyText)}</p>`;
+        }
+        return `
+            <ul class="space-y-1 text-sm text-neutral-700">
+                ${items.map(item => `<li class="flex items-center space-x-2">
+                    <span class="w-2 h-2 bg-primary-400 rounded-full"></span>
+                    <span>${escapeHtml(item)}</span>
+                </li>`).join('')}
+            </ul>
+        `;
+    };
+
+    const metaHtml = `
+        <div class="border border-neutral-200 rounded-xl p-4 bg-white/70">
+            <h4 class="text-sm font-semibold text-primary-900 mb-2">New in Source (${data.sourceOnlyTables?.length || 0})</h4>
+            ${buildTableList(data.sourceOnlyTables, 'No new tables in source.')}
+        </div>
+        <div class="border border-neutral-200 rounded-xl p-4 bg-white/70">
+            <h4 class="text-sm font-semibold text-primary-900 mb-2">Missing in Source (${data.targetOnlyTables?.length || 0})</h4>
+            ${buildTableList(data.targetOnlyTables, 'No tables removed from source.')}
+        </div>
+        <div class="border border-neutral-200 rounded-xl p-4 bg-white/70">
+            <h4 class="text-sm font-semibold text-primary-900 mb-2">Changed Tables (${data.changedTables?.length || 0})</h4>
+            ${buildTableList((data.changedTables || []).map(t => t.name), 'No schema changes detected.')}
+        </div>
+    `;
+
+    const sourceOnlyDetails = data.sourceOnlyDetails || [];
+    const targetOnlyDetails = data.targetOnlyDetails || [];
+    const changedTables = data.changedTables || [];
+    const sections = [
+        renderSourceOnlySection(sourceOnlyDetails, sourceEnv, targetEnv),
+        renderChangedTablesSection(changedTables, sourceEnv, targetEnv),
+        renderTargetOnlySection(targetOnlyDetails, targetEnv)
+    ].filter(Boolean);
+
+    const detailsHtml = sections.length === 0
+        ? '<p class="text-sm text-neutral-500">No schema differences detected between matching tables.</p>'
+        : sections.join('');
+
+    container.innerHTML = `
+        <div class="space-y-4">
+            <div class="text-sm text-neutral-600">Comparing <span class="font-semibold text-primary-700">${escapeHtml(sourceEnv)}</span> → <span class="font-semibold text-primary-700">${escapeHtml(targetEnv)}</span></div>
+            <div class="grid grid-cols-2 md:grid-cols-5 gap-3">${summaryHtml}</div>
+            <div id="publicTableComparisonMeta" class="grid grid-cols-1 md:grid-cols-3 gap-4">${metaHtml}</div>
+            <div id="publicTableComparisonDetails" class="space-y-4">${detailsHtml}</div>
+        </div>
+    `;
+
+    attachPublicTableSyncHandlers(container);
+}
+
+function setPoliciesComparisonLoading(isLoading) {
+    const spinner = document.getElementById('policiesComparisonLoading');
+    const submitBtn = document.querySelector('#policiesComparisonForm button[type="submit"]');
+    if (spinner) spinner.classList.toggle('hidden', !isLoading);
+    if (submitBtn) {
+        submitBtn.disabled = isLoading;
+        submitBtn.classList.toggle('opacity-70', isLoading);
+    }
+}
+
+function showPoliciesComparisonError(message) {
+    const errorDiv = document.getElementById('policiesComparisonError');
+    if (!errorDiv) return;
+    if (message) {
+        errorDiv.textContent = message;
+        errorDiv.classList.remove('hidden');
+    } else {
+        errorDiv.textContent = '';
+        errorDiv.classList.add('hidden');
+    }
+}
+
+async function runPoliciesComparison() {
+    const sourceEnv = document.getElementById('policiesSource')?.value;
+    const targetEnv = document.getElementById('policiesTarget')?.value;
+    if (!sourceEnv || !targetEnv) {
+        showPoliciesComparisonError('Please select both source and target environments.');
+        return;
+    }
+    if (sourceEnv === targetEnv) {
+        showPoliciesComparisonError('Source and target environments must be different.');
+        return;
+    }
+
+    showPoliciesComparisonError('');
+    setPoliciesComparisonLoading(true);
+    const container = document.getElementById('policiesComparisonResult');
+    if (container) {
+        container.classList.add('hidden');
+        container.innerHTML = '';
+    }
+
+    try {
+        const response = await fetch(`/api/schema/policies-diff?sourceEnv=${encodeURIComponent(sourceEnv)}&targetEnv=${encodeURIComponent(targetEnv)}`, {
+            headers: getAuthHeaders()
+        });
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ error: 'Unable to fetch policies comparison results' }));
+            throw new Error(error.error || 'Unable to fetch policies comparison results');
+        }
+        const data = await response.json();
+        renderPoliciesComparison(data, sourceEnv, targetEnv);
+    } catch (error) {
+        showPoliciesComparisonError(error.message || 'Failed to compare policies.');
+    } finally {
+        setPoliciesComparisonLoading(false);
+    }
+}
+
+function renderPoliciesComparison(data, sourceEnv, targetEnv) {
+    const container = document.getElementById('policiesComparisonResult');
+    if (!container) return;
+    container.classList.remove('hidden');
+
+    const summary = data.summary || {};
+    const summaryCards = [
+        { label: 'Policies Added', value: summary.policies?.added ?? 0 },
+        { label: 'Policies Removed', value: summary.policies?.removed ?? 0 },
+        { label: 'Role Changes', value: summary.roles?.changed ?? 0 },
+        { label: 'User Role Adds', value: summary.userRoles?.added ?? 0 }
+    ];
+
+    const summaryHtml = summaryCards.map(item => `
+        <div class="border border-primary-100 rounded-xl p-3 text-center bg-primary-50/60">
+            <div class="text-2xl font-semibold text-primary-700">${item.value}</div>
+            <div class="text-xs uppercase tracking-wide text-primary-600">${escapeHtml(item.label)}</div>
+        </div>
+    `).join('');
+
+    const sections = [
+        renderPolicySection(data.policies || {}),
+        renderGrantSection(data.grants || {}),
+        renderRoleSection(data.roles || {}),
+        renderUserRoleSection(data.userRoles || {})
+    ].filter(Boolean).join('');
+
+    container.innerHTML = `
+        <div class="space-y-4">
+            <div class="text-sm text-neutral-600">Comparing <span class="font-semibold text-primary-700">${escapeHtml(sourceEnv)}</span> → <span class="font-semibold text-primary-700">${escapeHtml(targetEnv)}</span></div>
+            <div class="grid grid-cols-1 md:grid-cols-4 gap-3">${summaryHtml}</div>
+            <div class="space-y-4">
+                ${sections || '<p class="text-sm text-neutral-500">No policy differences detected.</p>'}
+            </div>
+        </div>
+    `;
+
+    attachPoliciesSyncHandlers(container);
+}
+
+function renderPolicySection(policiesData) {
+    const added = policiesData.added || [];
+    const removed = policiesData.removed || [];
+    const changed = policiesData.changed || [];
+    if (!added.length && !removed.length && !changed.length) return '';
+
+    const buildGroup = (items, heading, action, emptyText) => {
+        if (!items || items.length === 0) {
+            return `<p class="text-xs text-neutral-500">${escapeHtml(emptyText)}</p>`;
+        }
+        return `
+            <div class="space-y-3">
+                <h5 class="text-xs font-semibold text-primary-900">${escapeHtml(heading)}</h5>
+                ${items.map(item => renderPolicyEntry(item, action)).join('')}
+            </div>
+        `;
+    };
+
+    return `
+        <div class="border border-neutral-200 rounded-xl bg-white/80 p-4 space-y-4">
+            <div>
+                <h4 class="text-sm font-semibold text-primary-900">Public schema policies</h4>
+                <p class="text-xs text-neutral-500">Row level security policies on public tables.</p>
+            </div>
+            ${buildGroup(added, 'Only in source', 'create', 'No policies to add.')}
+            ${buildGroup(removed, 'Only in target', 'drop', 'No policies to remove.')}
+            ${buildGroup(changed, 'Modified definitions', 'update', 'No policy changes detected.')}
+        </div>
+    `;
+}
+
+function renderPolicyEntry(item, action) {
+    const record = item.policy ? item : (item.source || {});
+    const schema = record.schema || 'public';
+    const table = record.table || record.table_name || 'unknown';
+    const policy = record.policy || record.policy_name || 'unknown';
+    const key = `${schema}.${table}.${policy}`;
+    const details = [];
+    if (record.roles) {
+        const roles = Array.isArray(record.roles) ? record.roles.join(', ') : record.roles;
+        details.push(`<div><span class="text-neutral-500">Roles:</span> ${escapeHtml(roles || 'all')}</div>`);
+    }
+    if (record.command) {
+        details.push(`<div><span class="text-neutral-500">Command:</span> ${escapeHtml(record.command)}</div>`);
+    }
+    if (record.using) {
+        details.push(`<div><span class="text-neutral-500">USING:</span> <span class="font-mono text-[11px] text-neutral-700">${escapeHtml(record.using)}</span></div>`);
+    }
+    if (record.check) {
+        details.push(`<div><span class="text-neutral-500">WITH CHECK:</span> <span class="font-mono text-[11px] text-neutral-700">${escapeHtml(record.check)}</span></div>`);
+    }
+    const diffDetails = item.differences ? Object.entries(item.differences).map(([field, diff]) => `
+        <div class="text-[11px] text-neutral-600 flex justify-between">
+            <span class="text-neutral-500 uppercase">${escapeHtml(field)}</span>
+            <span class="text-neutral-800 font-semibold">${escapeHtml(diff.source || '∅')}</span>
+            <span class="text-neutral-400">→</span>
+            <span class="text-primary-700 font-semibold">${escapeHtml(diff.target || '∅')}</span>
+        </div>
+    `).join('') : '';
+
+    const buttonLabel = action === 'drop' ? 'Remove from target' : (action === 'update' ? 'Apply changes' : 'Create in target');
+    const buttonHtml = createPoliciesSyncButton({
+        type: 'policy',
+        action,
+        label: buttonLabel,
+        dataset: {
+            schema,
+            table,
+            policy,
+            statusKey: key
+        }
+    });
+
+    return `
+        <div class="border border-neutral-100 rounded-lg p-3 bg-neutral-50/70 space-y-2">
+            <div class="flex items-start justify-between gap-3">
+                <div>
+                    <div class="text-sm font-semibold text-neutral-900">${escapeHtml(`${schema}.${table}`)}</div>
+                    <div class="text-xs text-neutral-600">${escapeHtml(policy)}</div>
+                </div>
+                ${buttonHtml}
+            </div>
+            <div class="text-[11px] text-neutral-500" data-policies-sync-status="${escapeHtml(key)}"></div>
+            <div class="space-y-1 text-xs text-neutral-700">${details.join('')}</div>
+            ${diffDetails ? `<div class="border-t border-neutral-200 pt-2">${diffDetails}</div>` : ''}
+        </div>
+    `;
+}
+
+function renderGrantSection(grantsData) {
+    const added = grantsData.added || [];
+    const removed = grantsData.removed || [];
+    const changed = grantsData.changed || [];
+    if (!added.length && !removed.length && !changed.length) return '';
+
+    const build = (items, heading, action, emptyText) => {
+        if (!items || items.length === 0) {
+            return `<p class="text-xs text-neutral-500">${escapeHtml(emptyText)}</p>`;
+        }
+        return `
+            <div class="space-y-3">
+                <h5 class="text-xs font-semibold text-primary-900">${escapeHtml(heading)}</h5>
+                ${items.map(item => renderGrantEntry(item, action)).join('')}
+            </div>
+        `;
+    };
+
+    return `
+        <div class="border border-neutral-200 rounded-xl bg-white/80 p-4 space-y-4">
+            <div>
+                <h4 class="text-sm font-semibold text-primary-900">Table grants</h4>
+                <p class="text-xs text-neutral-500">Privileges applied to public tables.</p>
+            </div>
+            ${build(added, 'Only in source', 'create', 'No grants to add.')}
+            ${build(removed, 'Only in target', 'drop', 'No grants to remove.')}
+            ${build(changed, 'Grant option differences', 'create', 'No grant option differences detected.')}
+        </div>
+    `;
+}
+
+function renderGrantEntry(item, action) {
+    const schema = item.schema || 'public';
+    const table = item.table;
+    const grantee = item.grantee;
+    const privilege = item.privilege;
+    const key = `${schema}.${table}.${grantee}.${privilege}`;
+    const grantable = (item.grantable || '').toString().toUpperCase() === 'YES' ? 'Yes' : 'No';
+    const buttonLabel = action === 'drop' ? 'Remove grant' : 'Sync grant';
+
+    const buttonHtml = createPoliciesSyncButton({
+        type: 'grant',
+        action,
+        label: buttonLabel,
+        dataset: {
+            schema,
+            table,
+            grantee,
+            privilege,
+            statusKey: key
+        }
+    });
+
+    const diffDetails = item.differences ? Object.entries(item.differences).map(([field, diff]) => `
+        <div class="text-[11px] text-neutral-600 flex justify-between">
+            <span class="text-neutral-500 uppercase">${escapeHtml(field)}</span>
+            <span class="text-neutral-800 font-semibold">${escapeHtml(diff.source || '∅')}</span>
+            <span class="text-neutral-400">→</span>
+            <span class="text-primary-700 font-semibold">${escapeHtml(diff.target || '∅')}</span>
+        </div>
+    `).join('') : '';
+
+    return `
+        <div class="border border-neutral-100 rounded-lg p-3 bg-neutral-50/70 space-y-2">
+            <div class="flex items-start justify-between gap-3">
+                <div>
+                    <div class="text-sm font-semibold text-neutral-900">${escapeHtml(`${schema}.${table}`)}</div>
+                    <div class="text-xs text-neutral-600">${escapeHtml(privilege)} → ${escapeHtml(grantee)} (Grantable: ${escapeHtml(grantable)})</div>
+                </div>
+                ${buttonHtml}
+            </div>
+            <div class="text-[11px] text-neutral-500" data-policies-sync-status="${escapeHtml(key)}"></div>
+            ${diffDetails ? `<div class="pt-1">${diffDetails}</div>` : ''}
+        </div>
+    `;
+}
+
+function renderRoleSection(roleData) {
+    const added = roleData.added || [];
+    const removed = roleData.removed || [];
+    const changed = roleData.changed || [];
+    if (!added.length && !removed.length && !changed.length) return '';
+
+    const build = (items, heading, action, emptyText) => {
+        if (!items || items.length === 0) {
+            return `<p class="text-xs text-neutral-500">${escapeHtml(emptyText)}</p>`;
+        }
+        return `
+            <div class="space-y-3">
+                <h5 class="text-xs font-semibold text-primary-900">${escapeHtml(heading)}</h5>
+                ${items.map(item => renderRoleEntry(item, action)).join('')}
+            </div>
+        `;
+    };
+
+    return `
+        <div class="border border-neutral-200 rounded-xl bg-white/80 p-4 space-y-4">
+            <div>
+                <h4 class="text-sm font-semibold text-primary-900">Auth roles</h4>
+                <p class="text-xs text-neutral-500">Entries from auth.roles.</p>
+            </div>
+            ${build(added, 'Only in source', 'create', 'No roles to add.')}
+            ${build(removed, 'Only in target', 'drop', 'No roles to remove.')}
+            ${build(changed, 'Changed roles', 'create', 'No role differences detected.')}
+        </div>
+    `;
+}
+
+function renderRoleEntry(item, action) {
+    const record = item.role ? item : (item.source || {});
+    const role = record.role || record.name || 'unknown';
+    const description = record.description || record.comment || '';
+    const key = `role-${role}`;
+    const buttonLabel = action === 'drop' ? 'Remove role' : (item.differences ? 'Apply changes' : 'Sync role');
+
+    const buttonHtml = createPoliciesSyncButton({
+        type: 'role',
+        action,
+        label: buttonLabel,
+        dataset: {
+            role: role,
+            statusKey: key
+        }
+    });
+
+    const diffDetails = item.differences ? Object.entries(item.differences).map(([field, diff]) => `
+        <div class="text-[11px] text-neutral-600 flex justify-between">
+            <span class="text-neutral-500 uppercase">${escapeHtml(field)}</span>
+            <span class="text-neutral-800 font-semibold">${escapeHtml(diff.source || '∅')}</span>
+            <span class="text-neutral-400">→</span>
+            <span class="text-primary-700 font-semibold">${escapeHtml(diff.target || '∅')}</span>
+        </div>
+    `).join('') : '';
+
+    return `
+        <div class="border border-neutral-100 rounded-lg p-3 bg-neutral-50/70 space-y-2">
+            <div class="flex items-center justify-between gap-3">
+                <div>
+                    <div class="text-sm font-semibold text-neutral-900">${escapeHtml(role)}</div>
+                    <div class="text-xs text-neutral-600">${escapeHtml(description || 'No description')}</div>
+                </div>
+                ${buttonHtml}
+            </div>
+            <div class="text-[11px] text-neutral-500" data-policies-sync-status="${escapeHtml(key)}"></div>
+            ${diffDetails ? `<div class="pt-1">${diffDetails}</div>` : ''}
+        </div>
+    `;
+}
+
+function renderUserRoleSection(userRoleData) {
+    const added = userRoleData.added || [];
+    const removed = userRoleData.removed || [];
+    if (!added.length && !removed.length) return '';
+
+    const build = (items, heading, action, emptyText) => {
+        if (!items || items.length === 0) {
+            return `<p class="text-xs text-neutral-500">${escapeHtml(emptyText)}</p>`;
+        }
+        return `
+            <div class="space-y-3">
+                <h5 class="text-xs font-semibold text-primary-900">${escapeHtml(heading)}</h5>
+                ${items.map(item => renderUserRoleEntry(item, action)).join('')}
+            </div>
+        `;
+    };
+
+    return `
+        <div class="border border-neutral-200 rounded-xl bg-white/80 p-4 space-y-4">
+            <div>
+                <h4 class="text-sm font-semibold text-primary-900">auth.user_roles</h4>
+                <p class="text-xs text-neutral-500">User to role assignments.</p>
+            </div>
+            ${build(added, 'Assignments only in source', 'create', 'No assignments to add.')}
+            ${build(removed, 'Assignments only in target', 'drop', 'No assignments to remove.')}
+        </div>
+    `;
+}
+
+function renderUserRoleEntry(item, action) {
+    const userId = item.user_id || item.userId || item.userid;
+    const role = item.role;
+    const key = `user-role-${userId}-${role}`;
+    const buttonLabel = action === 'drop' ? 'Remove assignment' : 'Sync assignment';
+
+    const buttonHtml = createPoliciesSyncButton({
+        type: 'user_role',
+        action,
+        label: buttonLabel,
+        dataset: {
+            'user-id': userId,
+            role,
+            statusKey: key
+        }
+    });
+
+    return `
+        <div class="border border-neutral-100 rounded-lg p-3 bg-neutral-50/70 space-y-2">
+            <div class="flex items-center justify-between gap-3">
+                <div>
+                    <div class="text-sm font-semibold text-neutral-900">User: ${escapeHtml(userId || 'unknown')}</div>
+                    <div class="text-xs text-neutral-600">Role: ${escapeHtml(role)}</div>
+                </div>
+                ${buttonHtml}
+            </div>
+            <div class="text-[11px] text-neutral-500" data-policies-sync-status="${escapeHtml(key)}"></div>
+        </div>
+    `;
+}
+
+function attachPoliciesSyncHandlers(root) {
+    if (!root) return;
+    root.querySelectorAll('[data-policy-sync="true"]').forEach(button => {
+        if (button.dataset.syncBound === 'true') return;
+        button.addEventListener('click', handlePoliciesSync);
+        button.dataset.syncBound = 'true';
+    });
+}
+
+async function handlePoliciesSync(event) {
+    event.preventDefault();
+    const button = event.currentTarget;
+    if (!button || button.disabled) return;
+
+    const sourceEnv = document.getElementById('policiesSource')?.value;
+    const targetEnv = document.getElementById('policiesTarget')?.value;
+    if (!sourceEnv || !targetEnv) {
+        showPoliciesComparisonError('Please select both environments before syncing.');
+        return;
+    }
+
+    const payload = {
+        sourceEnv,
+        targetEnv,
+        type: button.dataset.syncType,
+        action: button.dataset.syncAction || 'create'
+    };
+
+    if (button.dataset.syncSchema) payload.schemaName = button.dataset.syncSchema;
+    if (button.dataset.syncTable) payload.tableName = button.dataset.syncTable;
+    if (button.dataset.syncPolicy) payload.policyName = button.dataset.syncPolicy;
+    if (button.dataset.syncGrantee) payload.grantee = button.dataset.syncGrantee;
+    if (button.dataset.syncPrivilege) payload.privilege = button.dataset.syncPrivilege;
+    if (button.dataset.syncRole) payload.roleName = button.dataset.syncRole;
+    if (button.dataset.syncUserId) payload.userId = button.dataset.syncUserId;
+
+    const statusKey = button.dataset.syncStatusKey;
+    const statusEl = statusKey ? document.querySelector(`[data-policies-sync-status="${escapeCssIdentifier(statusKey)}"]`) : null;
+
+    const setStatus = (text, variant = 'neutral') => {
+        if (!statusEl) return;
+        statusEl.textContent = text;
+        statusEl.classList.remove('text-neutral-500', 'text-success-600', 'text-error-600');
+        if (variant === 'success') {
+            statusEl.classList.add('text-success-600');
+        } else if (variant === 'error') {
+            statusEl.classList.add('text-error-600');
+        } else {
+            statusEl.classList.add('text-neutral-500');
+        }
+    };
+
+    const spinner = button.querySelector('.loading-spinner');
+    const labelEl = button.querySelector('.sync-label');
+    const defaultLabel = labelEl?.textContent || 'Sync';
+
+    setStatus('Syncing...', 'neutral');
+    button.disabled = true;
+    button.classList.add('opacity-70');
+    if (spinner) spinner.classList.remove('hidden');
+    if (labelEl) labelEl.textContent = 'Syncing...';
+
+    try {
+        const response = await fetch('/api/schema/policies-sync', {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify(payload)
+        });
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(result.error || 'Failed to sync policies');
+        }
+        setStatus('Synced successfully.', 'success');
+        setTimeout(() => runPoliciesComparison(), 400);
+    } catch (error) {
+        setStatus(error.message || 'Sync failed.', 'error');
+    } finally {
+        button.disabled = false;
+        button.classList.remove('opacity-70');
+        if (spinner) spinner.classList.add('hidden');
+        if (labelEl) labelEl.textContent = defaultLabel;
+    }
 }
 
 // Show result message with modern styling
@@ -299,6 +1172,13 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+function escapeCssIdentifier(value) {
+    if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+        return CSS.escape(value);
+    }
+    return (value || '').replace(/[^a-zA-Z0-9_-]/g, '\\$&');
 }
 
 // Format date for display
@@ -2967,6 +3847,22 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             performEdgeComparison(source, target, { auto: false });
+        });
+    }
+    
+    const publicTableForm = document.getElementById('publicTableComparisonForm');
+    if (publicTableForm) {
+        publicTableForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            runPublicTableComparison();
+        });
+    }
+    
+    const policiesForm = document.getElementById('policiesComparisonForm');
+    if (policiesForm) {
+        policiesForm.addEventListener('submit', (event) => {
+            event.preventDefault();
+            runPoliciesComparison();
         });
     }
     

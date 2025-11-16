@@ -474,11 +474,8 @@ run_pg_tool_with_fallback() {
 }
 
 # Check if direct connection is available (DNS resolution test)
-check_direct_connection_available() {
-    local project_ref=$1
-    local hostname="db.${project_ref}.supabase.co"
-    
-    # Try DNS resolution (quick check)
+check_hostname_resolves() {
+    local hostname=$1
     if command -v nslookup >/dev/null 2>&1; then
         nslookup "$hostname" >/dev/null 2>&1
         return $?
@@ -489,9 +486,119 @@ check_direct_connection_available() {
         dig +short "$hostname" >/dev/null 2>&1
         return $?
     fi
+    return 1
+}
+
+resolve_db_hostname() {
+    local project_ref=$1
+    local candidate
     
-    # If no DNS tools available, assume it might work
-    return 0
+    candidate="db.${project_ref}.supabase.co"
+    if check_hostname_resolves "$candidate"; then
+        echo "$candidate"
+        return 0
+    fi
+    
+    candidate="db.${project_ref}.supabase.net"
+    if check_hostname_resolves "$candidate"; then
+        echo "$candidate"
+        return 0
+    fi
+    
+    candidate="db.${project_ref}.supabase.in"
+    if check_hostname_resolves "$candidate"; then
+        echo "$candidate"
+        return 0
+    fi
+    
+    # Fallback to .co even if resolution failed (caller may still try)
+    echo "db.${project_ref}.supabase.co"
+    return 1
+}
+
+get_direct_db_host_for_env() {
+    local env_name=$1
+    local project_ref=${2:-}
+    local key
+    key=$(normalize_env_key "$env_name")
+    
+    if [ -n "$key" ]; then
+        local override_var="SUPABASE_${key}_DB_HOST_OVERRIDE"
+        local override_host="${!override_var:-}"
+        if [ -n "$override_host" ]; then
+            echo "$override_host"
+            return 0
+        fi
+
+        local custom_var="SUPABASE_${key}_DB_HOST"
+        local custom_host="${!custom_var:-}"
+        if [ -n "$custom_host" ]; then
+            echo "$custom_host"
+            return 0
+        fi
+        if [ -z "$project_ref" ]; then
+            local ref_var="SUPABASE_${key}_PROJECT_REF"
+            project_ref="${!ref_var:-}"
+        fi
+    fi
+    
+    if [ -z "$project_ref" ]; then
+        echo ""
+        return 1
+    fi
+    
+    resolve_db_hostname "$project_ref"
+}
+
+get_direct_db_host_candidates() {
+    local env_name=$1
+    local project_ref=${2:-}
+    local -a candidates=()
+
+    local primary_host=""
+    primary_host=$(get_direct_db_host_for_env "$env_name" "$project_ref" 2>/dev/null || echo "")
+    if [ -n "$primary_host" ]; then
+        candidates+=("$primary_host")
+    fi
+
+    if [ -z "$project_ref" ] && [ -n "$env_name" ]; then
+        local normalized
+        normalized=$(normalize_env_key "$env_name")
+        if [ -n "$normalized" ]; then
+            local ref_var="SUPABASE_${normalized}_PROJECT_REF"
+            project_ref="${!ref_var:-$project_ref}"
+        fi
+    fi
+
+    if [ -n "$project_ref" ]; then
+        local fallback_hosts=("db.${project_ref}.supabase.co" "db.${project_ref}.supabase.net" "db.${project_ref}.supabase.in")
+        local host
+        for host in "${fallback_hosts[@]}"; do
+            local exists=0
+            for existing in "${candidates[@]}"; do
+                if [ "$existing" = "$host" ]; then
+                    exists=1
+                    break
+                fi
+            done
+            if [ $exists -eq 0 ]; then
+                candidates+=("$host")
+            fi
+        done
+    fi
+
+    if [ ${#candidates[@]} -eq 0 ] && [ -n "$project_ref" ]; then
+        candidates=("db.${project_ref}.supabase.co")
+    fi
+
+    printf "%s\n" "${candidates[@]}"
+}
+
+check_direct_connection_available() {
+    local project_ref=$1
+    local hostname
+    hostname=$(resolve_db_hostname "$project_ref")
+    check_hostname_resolves "$hostname"
 }
 
 # Get connection string for pg_dump/pg_restore
