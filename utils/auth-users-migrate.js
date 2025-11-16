@@ -380,6 +380,51 @@ async function main() {
     exitWithError('No overlapping columns between source and target auth.identities tables.');
   }
 
+  // Get source counts before export
+  const countUsersSql = 'SELECT COUNT(*) FROM auth.users;';
+  const countIdentitiesSql = 'SELECT COUNT(*) FROM auth.identities;';
+  const sourceUsersCount = parseInt(
+    attemptWithEndpoints(
+      sourceConfig,
+      'Counting auth.users in source',
+      (endpoint) => runPsql('Count source users', endpoint, sourceConfig.dbPassword, ['-t', '-A', '-c', countUsersSql], logStream).trim(),
+      logStream
+    ) || '0',
+    10
+  );
+  const sourceIdentitiesCount = parseInt(
+    attemptWithEndpoints(
+      sourceConfig,
+      'Counting auth.identities in source',
+      (endpoint) => runPsql('Count source identities', endpoint, sourceConfig.dbPassword, ['-t', '-A', '-c', countIdentitiesSql], logStream).trim(),
+      logStream
+    ) || '0',
+    10
+  );
+
+  // Get target counts BEFORE migration
+  const targetUsersBefore = parseInt(
+    attemptWithEndpoints(
+      targetConfig,
+      'Counting auth.users in target (before)',
+      (endpoint) => runPsql('Count target users before', endpoint, targetConfig.dbPassword, ['-t', '-A', '-c', countUsersSql], logStream).trim(),
+      logStream
+    ) || '0',
+    10
+  );
+  const targetIdentitiesBefore = parseInt(
+    attemptWithEndpoints(
+      targetConfig,
+      'Counting auth.identities in target (before)',
+      (endpoint) => runPsql('Count target identities before', endpoint, targetConfig.dbPassword, ['-t', '-A', '-c', countIdentitiesSql], logStream).trim(),
+      logStream
+    ) || '0',
+    10
+  );
+
+  logInfo(`Source: ${sourceUsersCount} users, ${sourceIdentitiesCount} identities`, logStream);
+  logInfo(`Target (before): ${targetUsersBefore} users, ${targetIdentitiesBefore} identities`, logStream);
+
   logInfo('Exporting auth.users from source ...', logStream);
   exportToCsv(sourceConfig, `SELECT ${commonUserColumns.join(', ')} FROM auth.users ORDER BY created_at`, sourceUsersCsv, logStream);
   logInfo('Exporting auth.identities from source ...', logStream);
@@ -418,13 +463,12 @@ async function main() {
   );
   logSuccess('Auth users import completed.', logStream);
 
-  const countUsersSql = 'SELECT COUNT(*) FROM auth.users;';
-  const countIdentitiesSql = 'SELECT COUNT(*) FROM auth.identities;';
+  // Get target counts AFTER migration
   const targetUsersAfter = parseInt(
     attemptWithEndpoints(
       targetConfig,
-      'Counting auth.users in target',
-      (endpoint) => runPsql('Count target users', endpoint, targetConfig.dbPassword, ['-t', '-A', '-c', countUsersSql], logStream).trim(),
+      'Counting auth.users in target (after)',
+      (endpoint) => runPsql('Count target users after', endpoint, targetConfig.dbPassword, ['-t', '-A', '-c', countUsersSql], logStream).trim(),
       logStream
     ) || '0',
     10
@@ -432,14 +476,62 @@ async function main() {
   const targetIdentitiesAfter = parseInt(
     attemptWithEndpoints(
       targetConfig,
-      'Counting auth.identities in target',
-      (endpoint) => runPsql('Count target identities', endpoint, targetConfig.dbPassword, ['-t', '-A', '-c', countIdentitiesSql], logStream).trim(),
+      'Counting auth.identities in target (after)',
+      (endpoint) => runPsql('Count target identities after', endpoint, targetConfig.dbPassword, ['-t', '-A', '-c', countIdentitiesSql], logStream).trim(),
       logStream
     ) || '0',
     10
   );
 
+  // Calculate migration statistics
+  const usersMigrated = replace ? targetUsersAfter : Math.max(0, targetUsersAfter - targetUsersBefore);
+  const identitiesMigrated = replace ? targetIdentitiesAfter : Math.max(0, targetIdentitiesAfter - targetIdentitiesBefore);
+  const usersAdded = targetUsersAfter - targetUsersBefore;
+  const identitiesAdded = targetIdentitiesAfter - targetIdentitiesBefore;
+
   await verifyWithSupabase(targetConfig, targetUsersAfter, logStream);
+
+  // Display migration results prominently
+  console.log('');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('  Auth Users Migration Results');
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(`  Source: ${sourceUsersCount} users, ${sourceIdentitiesCount} identities`);
+  console.log(`  Target (before): ${targetUsersBefore} users, ${targetIdentitiesBefore} identities`);
+  console.log(`  Target (after): ${targetUsersAfter} users, ${targetIdentitiesAfter} identities`);
+  console.log('');
+  if (replace) {
+    console.log(`  ✅ ${usersMigrated} users migrated (replace mode)`);
+    console.log(`  ✅ ${identitiesMigrated} identities migrated (replace mode)`);
+  } else {
+    console.log(`  ✅ ${usersAdded} users added to target (incremental mode)`);
+    console.log(`  ✅ ${identitiesAdded} identities added to target (incremental mode)`);
+    if (usersAdded < sourceUsersCount) {
+      console.log(`  ℹ️  ${sourceUsersCount - usersAdded} users already existed in target (preserved)`);
+    }
+  }
+  console.log('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log('');
+
+  // Log the same to log stream
+  logInfo('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', logStream);
+  logInfo('  Auth Users Migration Results', logStream);
+  logInfo('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', logStream);
+  logInfo(`  Source: ${sourceUsersCount} users, ${sourceIdentitiesCount} identities`, logStream);
+  logInfo(`  Target (before): ${targetUsersBefore} users, ${targetIdentitiesBefore} identities`, logStream);
+  logInfo(`  Target (after): ${targetUsersAfter} users, ${targetIdentitiesAfter} identities`, logStream);
+  logInfo('', logStream);
+  if (replace) {
+    logInfo(`  ✅ ${usersMigrated} users migrated (replace mode)`, logStream);
+    logInfo(`  ✅ ${identitiesMigrated} identities migrated (replace mode)`, logStream);
+  } else {
+    logInfo(`  ✅ ${usersAdded} users added to target (incremental mode)`, logStream);
+    logInfo(`  ✅ ${identitiesAdded} identities added to target (incremental mode)`, logStream);
+    if (usersAdded < sourceUsersCount) {
+      logInfo(`  ℹ️  ${sourceUsersCount - usersAdded} users already existed in target (preserved)`, logStream);
+    }
+  }
+  logInfo('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━', logStream);
 
   const summaryFile = path.join(migrationDir, 'auth_users_migration_summary.txt');
   const summary = [
@@ -450,10 +542,33 @@ async function main() {
     `**Date**: ${new Date().toString()}`,
     `**Mode**: ${replace ? 'Replace' : 'Incremental (upsert)'}`,
     '',
-    '## Counts',
+    '## Migration Statistics',
     '',
-    `- Target auth.users rows: ${targetUsersAfter}`,
-    `- Target auth.identities rows: ${targetIdentitiesAfter}`,
+    `### Source Environment`,
+    `- Users: ${sourceUsersCount}`,
+    `- Identities: ${sourceIdentitiesCount}`,
+    '',
+    `### Target Environment (Before Migration)`,
+    `- Users: ${targetUsersBefore}`,
+    `- Identities: ${targetIdentitiesBefore}`,
+    '',
+    `### Target Environment (After Migration)`,
+    `- Users: ${targetUsersAfter}`,
+    `- Identities: ${targetIdentitiesAfter}`,
+    '',
+    `### Migration Results`,
+    replace
+      ? [
+          `- **Users migrated**: ${usersMigrated} (replace mode - all target users replaced)`,
+          `- **Identities migrated**: ${identitiesMigrated} (replace mode - all target identities replaced)`
+        ].join('\n')
+      : [
+          `- **Users added**: ${usersAdded} (incremental mode)`,
+          `- **Identities added**: ${identitiesAdded} (incremental mode)`,
+          usersAdded < sourceUsersCount
+            ? `- **Users preserved**: ${sourceUsersCount - usersAdded} (already existed in target)`
+            : ''
+        ].filter(Boolean).join('\n'),
     '',
     '## Notes',
     '',
