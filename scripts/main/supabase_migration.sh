@@ -1148,19 +1148,26 @@ EOF
     
     log_success "Result page generated: $result_file"
     
-    # Also generate HTML version
+    # Also generate HTML version (non-fatal if it fails)
     if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
         log_info "Generating HTML result page..."
-        source "$PROJECT_ROOT/lib/html_generator.sh"
-        local html_file=$(generate_result_html "$migration_dir" "$status" "$comparison_data_file")
-        if [ -n "$html_file" ] && [ -f "$html_file" ]; then
-            log_success "HTML result page generated: $html_file"
-            log_info "Open in browser: file://$(realpath "$html_file")"
+        if source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null; then
+            local html_file=""
+            if html_file=$(generate_result_html "$migration_dir" "$status" "$comparison_data_file" 2>&1); then
+                if [ -n "$html_file" ] && [ -f "$html_file" ]; then
+                    log_success "HTML result page generated: $html_file"
+                    log_info "Open in browser: file://$(realpath "$html_file" 2>/dev/null || echo "$html_file")"
+                else
+                    log_warning "HTML generation completed but file not found (non-fatal)"
+                fi
+            else
+                log_warning "HTML generation had issues (non-fatal - migration still successful)"
+            fi
         else
-            log_warning "HTML generation may have failed, check logs"
+            log_warning "HTML generator script could not be sourced (non-fatal)"
         fi
     else
-        log_warning "HTML generator not found: $PROJECT_ROOT/lib/html_generator.sh"
+        log_warning "HTML generator not found: $PROJECT_ROOT/lib/html_generator.sh (non-fatal)"
     fi
 }
 
@@ -1609,10 +1616,15 @@ perform_migration() {
     fi
     
     # Always generate result files (both success and failure)
+    # Note: Result file generation failures are non-fatal and won't affect migration success
     log_info "Generating result files in: $actual_migration_dir"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Generating result.md and result.html files..." >> "$actual_migration_dir/migration.log" 2>/dev/null || true
     
-    if [ $exit_code -eq 0 ]; then
+    # Store original exit code before result generation (which should not affect migration status)
+    local migration_exit_code=$exit_code
+    local result_gen_success=true
+    
+    if [ $migration_exit_code -eq 0 ]; then
         # Give Supabase a moment to settle before generating reports
         sleep 2
         
@@ -1622,11 +1634,31 @@ perform_migration() {
         if generate_result_md "$actual_migration_dir" "✅ Completed" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log"; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] result.md and result.html generated successfully with post-migration counts" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         else
-            log_warning "Result generation had errors, but continuing..."
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] Result generation completed with warnings" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
+            result_gen_success=false
+            log_warning "Result file generation had issues (non-fatal - migration succeeded)"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] Result generation completed with warnings (migration still successful)" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         fi
-        log_success "Migration completed: $actual_migration_dir"
-        log_success "Result files: $actual_migration_dir/result.md and $actual_migration_dir/result.html"
+        
+        # Generate HTML result if available
+        if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
+            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
+            if generate_result_html "$actual_migration_dir" "✅ Completed" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log" 2>/dev/null; then
+                log_success "HTML result page generated: $actual_migration_dir/result.html"
+                log_info "Open in browser: file://$(realpath "$actual_migration_dir/result.html" 2>/dev/null || echo "$actual_migration_dir/result.html")"
+            else
+                log_warning "HTML result generation had issues (non-fatal)"
+            fi
+        else
+            log_warning "HTML generator not found, skipping HTML result generation"
+        fi
+        
+        if [ "$result_gen_success" = "true" ]; then
+            log_success "Migration completed: $actual_migration_dir"
+            log_success "Result files: $actual_migration_dir/result.md and $actual_migration_dir/result.html"
+        else
+            log_success "Migration completed: $actual_migration_dir"
+            log_warning "Result files may be incomplete (check $actual_migration_dir/result.md and $actual_migration_dir/result.html)"
+        fi
         
         # Cleanup old migration records (keep only the last 3)
         log_info "Cleaning up old migration records (keeping last 3)..."
@@ -1637,16 +1669,29 @@ perform_migration() {
             log_warning "cleanup_old_migration_records function not available, skipping cleanup"
         fi
     else
-        # Generate result files for failure case
+        # Generate result files for failure case - but don't let result generation failure mask actual migration failure
+        log_warning "Migration components reported errors - generating result files with failure status..."
         if generate_result_md "$actual_migration_dir" "❌ Failed (check migration.log)" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log"; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] result.md and result.html generated with failure status" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] result.md and result.html generated with failure status" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         else
-            log_warning "Result generation had errors, but continuing..."
+            log_warning "Result file generation had issues (check migration.log for actual migration errors)"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] Result generation completed with warnings" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         fi
+        
+        # Generate HTML result if available
+        if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
+            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
+            local error_details=""
+            if [ -f "$actual_migration_dir/migration.log" ]; then
+                error_details=$(grep -iE "(ERROR|FATAL|failed|error:)" "$actual_migration_dir/migration.log" 2>/dev/null | tail -20 || echo "")
+            fi
+            generate_result_html "$actual_migration_dir" "❌ Failed" "$comparison_data_file" "$error_details" 2>&1 | tee -a "$actual_migration_dir/migration.log" 2>/dev/null || log_warning "HTML result generation had issues"
+        fi
+        
         log_error "Migration failed: $actual_migration_dir"
         log_info "Result files: $actual_migration_dir/result.md and $actual_migration_dir/result.html"
-        return $exit_code
+        log_info "Check $actual_migration_dir/migration.log for detailed error information"
+        return $migration_exit_code
     fi
     
     return 0
@@ -1803,10 +1848,16 @@ main() {
         log_success "  MIGRATION COMPLETED SUCCESSFULLY"
         log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         
-        # Generate result files even on success (they should already be generated)
+        # Generate result files even on success (they should already be generated, but try again if needed)
         if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
-            source "$PROJECT_ROOT/lib/html_generator.sh"
-            generate_result_html "$migration_dir" "✅ Completed" "$migration_dir/comparison_details.txt" 2>&1 | tee -a "$migration_dir/migration.log" || true
+            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
+            if generate_result_html "$migration_dir" "✅ Completed" "$migration_dir/comparison_details.txt" 2>&1 | tee -a "$migration_dir/migration.log" 2>/dev/null; then
+                log_info "HTML result file generated"
+            else
+                log_warning "HTML result generation had issues (non-fatal - migration succeeded)"
+            fi
+        else
+            log_warning "HTML generator not found, skipping HTML result generation"
         fi
         
         log_info "Migration folder kept: $migration_dir"
@@ -1824,20 +1875,30 @@ main() {
             error_details=$(grep -iE "(ERROR|FATAL|failed|error:)" "$migration_dir/migration.log" 2>/dev/null | tail -20 || echo "")
         fi
         
-        # Generate result files with error details
+        # Generate result files with error details (non-fatal if generation fails)
         log_info "Generating result files with error details..."
         if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
-            source "$PROJECT_ROOT/lib/html_generator.sh"
+            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
             # Pass error details as 4th parameter
-            generate_result_html "$migration_dir" "❌ Failed" "$migration_dir/comparison_details.txt" "$error_details" 2>&1 | tee -a "$migration_dir/migration.log" || true
+            if generate_result_html "$migration_dir" "❌ Failed" "$migration_dir/comparison_details.txt" "$error_details" 2>&1 | tee -a "$migration_dir/migration.log" 2>/dev/null; then
+                log_info "HTML result file generated"
+            else
+                log_warning "HTML result generation had issues (non-fatal)"
+            fi
+        else
+            log_warning "HTML generator not found, skipping HTML result generation"
         fi
         
-        # Generate result.md with error details
-        generate_result_md "$migration_dir" "❌ Failed" "$migration_dir/comparison_details.txt" "$error_details" 2>&1 | tee -a "$migration_dir/migration.log" || true
+        # Generate result.md with error details (non-fatal if generation fails)
+        if generate_result_md "$migration_dir" "❌ Failed" "$migration_dir/comparison_details.txt" "$error_details" 2>&1 | tee -a "$migration_dir/migration.log" 2>/dev/null; then
+            log_info "Result markdown file generated"
+        else
+            log_warning "Result markdown generation had issues (non-fatal - check migration.log for actual errors)"
+        fi
         
         log_warning "Migration folder kept for debugging: $migration_dir"
         log_info "Check $migration_dir/migration.log for details"
-        log_info "Results: $migration_dir/result.md and $migration_dir/result.html"
+        log_info "Results: $migration_dir/result.md and $migration_dir/result.html (may be incomplete if generation had issues)"
         exit 1
     fi
 }

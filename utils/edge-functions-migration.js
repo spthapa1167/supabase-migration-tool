@@ -469,17 +469,21 @@ function findFunctionDirectory(rootDir, functionName) {
     return null;
 }
 
-async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword) {
+async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword, quiet = false) {
     let finalFunctionPath = path.join(downloadDir, functionName);
     try {
-        logInfo(`    Downloading function code: ${functionName}...`);
+        if (!quiet) {
+            logInfo(`    Downloading function code: ${functionName}...`);
+        }
 
         if (managementClient) {
             const maxAttempts = 3;
             for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
                 const apiTempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-api-${functionName}-${attempt}-`));
                 try {
-                    logInfo(`    Attempting Management API bundle download (attempt ${attempt}/${maxAttempts})...`);
+                    if (!quiet) {
+                        logInfo(`    Attempting Management API bundle download (attempt ${attempt}/${maxAttempts})...`);
+                    }
                     await managementClient.downloadFunctionCode(projectRef, functionName, apiTempDir);
                     const apiFunctionDir = findFunctionDirectory(apiTempDir, functionName);
                     if (apiFunctionDir) {
@@ -487,22 +491,32 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
                         fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
                         fs.cpSync(apiFunctionDir, finalFunctionPath, { recursive: true });
                         normalizeFunctionLayout(finalFunctionPath, downloadDir);
-                        logSuccess(`    ✓ Downloaded function via Management API: ${functionName}`);
+                        if (!quiet) {
+                            logSuccess(`    ✓ Downloaded function via Management API: ${functionName}`);
+                        }
                         fs.rmSync(apiTempDir, { recursive: true, force: true });
                         return true;
                     }
-                    logWarning(`    Management API download succeeded but function files were not located; retrying...`);
+                    if (!quiet) {
+                        logWarning(`    Management API download succeeded but function files were not located; retrying...`);
+                    }
                 } catch (apiError) {
-                    logWarning(`    Management API download attempt ${attempt}/${maxAttempts} failed (${apiError.message})`);
+                    if (!quiet) {
+                        logWarning(`    Management API download attempt ${attempt}/${maxAttempts} failed (${apiError.message})`);
+                    }
                 } finally {
                     fs.rmSync(apiTempDir, { recursive: true, force: true });
                 }
             }
-            logWarning(`    Management API download failed after retries; falling back to CLI options`);
+            if (!quiet) {
+                logWarning(`    Management API download failed after retries; falling back to CLI options`);
+            }
         }
 
         if (!checkDocker()) {
-            logError(`    ✗ Docker is not running - required for downloading functions via CLI`);
+            if (!quiet) {
+                logError(`    ✗ Docker is not running - required for downloading functions via CLI`);
+            }
             throw new Error('Docker is not running');
         }
 
@@ -516,7 +530,9 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
 
             process.chdir(tempDir);
 
-            logInfo(`    Linking to source project for CLI download...`);
+            if (!quiet) {
+                logInfo(`    Linking to source project for CLI download...`);
+            }
             if (!linkProject(projectRef, dbPassword)) {
                 throw new Error('Failed to link to project');
             }
@@ -536,7 +552,9 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
                     /eszip v2/i.test(combinedOutput);
 
                 if (needsLegacyBundle) {
-                    logInfo(`    Regular download failed, trying legacy bundle...`);
+                    if (!quiet) {
+                        logInfo(`    Regular download failed, trying legacy bundle...`);
+                    }
                     try {
                         execSync(`supabase functions download --legacy-bundle ${functionName}`, {
                             stdio: 'pipe',
@@ -565,7 +583,9 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             fs.cpSync(downloadedFunctionPath, finalFunctionPath, { recursive: true });
             normalizeFunctionLayout(finalFunctionPath, downloadDir);
 
-            logSuccess(`    ✓ Downloaded function via CLI: ${functionName}`);
+            if (!quiet) {
+                logSuccess(`    ✓ Downloaded function via CLI: ${functionName}`);
+            }
             return true;
         } finally {
             process.chdir(originalCwd);
@@ -574,16 +594,137 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
     } catch (error) {
         const fallbackDir = path.join(PROJECT_ROOT, 'supabase', 'functions', functionName);
         if (fs.existsSync(fallbackDir)) {
-            logWarning(`    Using local repository copy for ${functionName} (remote download failed)`);
+            if (!quiet) {
+                logWarning(`    Using local repository copy for ${functionName} (remote download failed)`);
+            }
             fs.rmSync(finalFunctionPath, { recursive: true, force: true });
             fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
             fs.cpSync(fallbackDir, finalFunctionPath, { recursive: true });
             normalizeFunctionLayout(finalFunctionPath, downloadDir);
-            logSuccess(`    ✓ Copied local function source for ${functionName}`);
+            if (!quiet) {
+                logSuccess(`    ✓ Copied local function source for ${functionName}`);
+            }
             return true;
         }
-        logError(`    ✗ Failed to download function ${functionName}: ${error.message}`);
+        if (!quiet) {
+            logError(`    ✗ Failed to download function ${functionName}: ${error.message}`);
+        }
         return false;
+    }
+}
+
+// Compare two function directories to check if they're identical (100% code comparison)
+function compareFunctionDirectories(sourceDir, targetDir) {
+    try {
+        if (!fs.existsSync(sourceDir) || !fs.existsSync(targetDir)) {
+            return false;
+        }
+
+        // Get all code files from both directories (including config files, but excluding build artifacts)
+        const sourceFiles = getAllCodeFiles(sourceDir);
+        const targetFiles = getAllCodeFiles(targetDir);
+
+        // Sort for consistent comparison
+        sourceFiles.sort();
+        targetFiles.sort();
+
+        // Check if file counts match
+        if (sourceFiles.length !== targetFiles.length) {
+            return false;
+        }
+
+        // Verify all files exist in both directories
+        const sourceSet = new Set(sourceFiles);
+        const targetSet = new Set(targetFiles);
+        
+        // Check if file lists are identical
+        if (sourceFiles.length !== targetSet.size || targetFiles.length !== sourceSet.size) {
+            return false;
+        }
+        
+        for (const file of sourceFiles) {
+            if (!targetSet.has(file)) {
+                return false;
+            }
+        }
+
+        // Compare each file byte-for-byte (100% accuracy)
+        for (const file of sourceFiles) {
+            const sourcePath = path.join(sourceDir, file);
+            const targetPath = path.join(targetDir, file);
+
+            if (!fs.existsSync(sourcePath) || !fs.existsSync(targetPath)) {
+                return false;
+            }
+
+            const sourceStat = fs.statSync(sourcePath);
+            const targetStat = fs.statSync(targetPath);
+
+            // Compare file types (must both be files or both be directories)
+            if (sourceStat.isDirectory() !== targetStat.isDirectory()) {
+                return false;
+            }
+
+            // Skip directories (they're handled recursively)
+            if (sourceStat.isDirectory()) {
+                continue;
+            }
+
+            // Quick check: file sizes must match
+            if (sourceStat.size !== targetStat.size) {
+                return false;
+            }
+
+            // Byte-for-byte comparison of file contents (100% accuracy)
+            const sourceContent = fs.readFileSync(sourcePath);
+            const targetContent = fs.readFileSync(targetPath);
+            
+            // Use Buffer.compare for exact byte comparison
+            if (sourceContent.compare(targetContent) !== 0) {
+                return false;
+            }
+        }
+
+        return true;
+    } catch (error) {
+        // If comparison fails, assume they're different (safer to redeploy)
+        return false;
+    }
+}
+
+// Get all code files recursively from a directory (including config files)
+// Excludes only build artifacts and version control files
+function getAllCodeFiles(dir, baseDir = dir, fileList = []) {
+    try {
+        const files = fs.readdirSync(dir);
+        files.forEach(file => {
+            const filePath = path.join(dir, file);
+            const relativePath = path.relative(baseDir, filePath);
+            const stat = fs.statSync(filePath);
+            
+            // Skip build artifacts and version control (but include .env, .deno, config files)
+            if (file === 'node_modules' || 
+                file === '.git' || 
+                file === '.svn' ||
+                file === 'dist' ||
+                file === 'build' ||
+                file === '.next' ||
+                file === '.cache' ||
+                (file.startsWith('.') && file !== '.env' && file !== '.deno' && !file.endsWith('.json') && !file.endsWith('.toml') && !file.endsWith('.yaml') && !file.endsWith('.yml'))) {
+                return;
+            }
+            
+            if (stat.isDirectory()) {
+                getAllCodeFiles(filePath, baseDir, fileList);
+            } else {
+                // Include all code files: .ts, .js, .tsx, .jsx, .json, .toml, .yaml, .yml, .md, .txt, .env, etc.
+                fileList.push(relativePath);
+            }
+        });
+        return fileList;
+    } catch (error) {
+        // If we can't read the directory, return what we have
+        return fileList;
     }
 }
 
@@ -855,19 +996,15 @@ async function migrateEdgeFunctions() {
             if (isNew) {
                 logInfo(`  Status: NEW - will create in target`);
             } else {
-                logInfo(`  Status: EXISTS - will update in target`);
+                logInfo(`  Status: EXISTS - checking for updates`);
                 logInfo(`  Source ID: ${sourceFunction.id || 'N/A'}`);
                 logInfo(`  Target ID: ${existing?.id || 'N/A'}`);
-                if (versionMatches) {
-                    logInfo(`  Note: Versions match; redeploying due to full-sync mode`);
-                } else if (updatedMatches) {
-                    logInfo(`  Note: Last updated timestamps match; redeploy required (full-sync mode)`);
-                }
             }
             
             // Download function from source
             const functionDir = path.join(functionsDir, functionName);
-            const downloadSuccess = await downloadEdgeFunction(functionName, SOURCE_REF, functionsDir, sourceConfig.dbPassword);
+            logInfo(`  Downloading edge function from source...`);
+            const downloadSuccess = await downloadEdgeFunction(functionName, SOURCE_REF, functionsDir, sourceConfig.dbPassword, false);
             
             if (!downloadSuccess) {
                 logWarning(`  ⚠ Could not download function code - skipping deployment`);
@@ -883,6 +1020,53 @@ async function migrateEdgeFunctions() {
                 failedFunctions.push(functionName);
                 console.log('');
                 continue;
+            }
+            
+            logSuccess(`  ✓ Downloaded function: ${functionName}`);
+            
+            // For existing functions, compare with target before deploying
+            if (!isNew) {
+                logInfo(`  Comparing with target function...`);
+                
+                // Download target function for comparison (quiet mode to reduce noise)
+                const targetCompareDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-compare-${functionName}-`));
+                try {
+                    const targetDownloadSuccess = await downloadEdgeFunction(functionName, TARGET_REF, targetCompareDir, targetConfig.dbPassword, true);
+                    
+                    if (targetDownloadSuccess) {
+                        const targetFunctionDir = path.join(targetCompareDir, functionName);
+                        if (fs.existsSync(targetFunctionDir)) {
+                            // Get file counts for logging
+                            const sourceFiles = getAllCodeFiles(functionDir);
+                            const targetFiles = getAllCodeFiles(targetFunctionDir);
+                            logInfo(`  Comparing ${sourceFiles.length} code files (byte-for-byte)...`);
+                            
+                            const areIdentical = compareFunctionDirectories(functionDir, targetFunctionDir);
+                            
+                            if (areIdentical) {
+                                logInfo(`  ✓ All ${sourceFiles.length} files are identical - skipping deployment.`);
+                                skippedFunctions.push(functionName);
+                                console.log('');
+                                // Cleanup
+                                fs.rmSync(targetCompareDir, { recursive: true, force: true });
+                                continue;
+                            } else {
+                                logInfo(`  ✗ Code differences detected - redeploying...`);
+                            }
+                        } else {
+                            logInfo(`  Target function directory not found - will deploy`);
+                        }
+                    } else {
+                        logInfo(`  Could not download target function for comparison - will deploy`);
+                    }
+                } catch (compareError) {
+                    logInfo(`  Comparison failed (${compareError.message}) - will deploy to be safe`);
+                } finally {
+                    // Cleanup target comparison directory
+                    if (fs.existsSync(targetCompareDir)) {
+                        fs.rmSync(targetCompareDir, { recursive: true, force: true });
+                    }
+                }
             }
             
             // Deploy function to target
