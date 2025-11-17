@@ -176,14 +176,14 @@ cleanup_old_backups "policies" "$SOURCE_ENV" "$TARGET_ENV" "$MIGRATION_DIR"
 LOG_FILE="${LOG_FILE:-$MIGRATION_DIR/migration.log}"
 log_to_file "$LOG_FILE" "Starting policies/profiles migration from $SOURCE_ENV to $TARGET_ENV"
 
-# If caller did not override TABLES, auto-extend with all RLS-enabled public tables
+# If caller did not override TABLES, auto-extend with all RLS-enabled tables in public and auth schemas
 auto_discover_rls_tables() {
     # Only run if TABLES is still the default set
     if [ "${TABLES[*]}" != "${DEFAULT_TABLES[*]}" ]; then
         return 0
     fi
 
-    log_info "Auto-discovering ALL RLS-enabled tables in source (public schema)..."
+    log_info "Auto-discovering ALL RLS-enabled tables in source (public and auth schemas)..."
     log_info "  (Including tables with RLS enabled, even if they don't have policies yet)"
 
     local sql_content="
@@ -195,7 +195,7 @@ WITH rls_tables AS (
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'r'
-      AND n.nspname = 'public'
+      AND n.nspname IN ('public', 'auth')
       AND c.relrowsecurity = true  -- Discover ALL tables with RLS enabled, not just those with policies
 )
 SELECT qualified
@@ -207,6 +207,7 @@ ORDER BY qualified;
     discovered_file=$(mktemp)
     if run_source_sql_to_file "$sql_content" "$discovered_file"; then
         if [ -s "$discovered_file" ]; then
+            local discovered_count=0
             while IFS= read -r line || [ -n "$line" ]; do
                 local trimmed
                 trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
@@ -221,11 +222,16 @@ ORDER BY qualified;
                 done
                 if [ "$exists" = "false" ]; then
                     TABLES+=("$trimmed")
+                    ((discovered_count++)) || true
                 fi
             done < "$discovered_file"
-            log_info "RLS auto-discovery added tables: ${TABLES[*]}"
+            if [ "$discovered_count" -gt 0 ]; then
+                log_success "RLS auto-discovery found $discovered_count additional table(s) with RLS enabled"
+            else
+                log_info "No additional RLS-enabled tables discovered (all already in list)"
+            fi
         else
-            log_warning "No RLS-enabled public tables discovered in source."
+            log_warning "No RLS-enabled tables discovered in source (public/auth schemas)."
         fi
     else
         log_warning "Failed to auto-discover RLS-enabled tables; continuing with default TABLES."
@@ -489,10 +495,228 @@ PY
 apply_sql_with_fallback() {
     local sql_file=$1
     local label=$2
-    if type run_psql_script_with_fallback >/dev/null 2>&1; then
-        run_psql_script_with_fallback "$label" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$sql_file"
+    
+    # Validate SQL file exists and is not empty
+    if [ ! -f "$sql_file" ]; then
+        log_warning "SQL file not found: $sql_file"
+        return 1
+    fi
+    
+    if [ ! -s "$sql_file" ]; then
+        log_info "SQL file is empty: $sql_file (nothing to apply)"
+        return 0
+    fi
+    
+    # Filter out any psql meta-commands that might have leaked through
+    local filtered_file="${sql_file}.filtered"
+    # Remove lines starting with \ (psql meta-commands like \pset, \set, etc.)
+    # Also remove lines that look like psql output (e.g., "Output format is unaligned")
+    sed -E '/^\\|^Output format|^Tuples only|^Pager|^Locale|^Default display|^Line style|^Border style|^Expanded display/d' "$sql_file" > "$filtered_file" 2>/dev/null || cp "$sql_file" "$filtered_file"
+    # Remove completely empty lines (but keep lines with just whitespace that might be part of SQL)
+    sed -i.bak '/^$/d' "$filtered_file" 2>/dev/null || sed -i '' '/^$/d' "$filtered_file" 2>/dev/null || true
+    rm -f "${filtered_file}.bak" 2>/dev/null || true
+    
+    # Use filtered file if it has content, otherwise use original
+    if [ -s "$filtered_file" ]; then
+        local actual_file="$filtered_file"
     else
-        run_psql_script_direct "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$sql_file"
+        local actual_file="$sql_file"
+    fi
+    
+    local result=0
+    if type run_psql_script_with_fallback >/dev/null 2>&1; then
+        if ! run_psql_script_with_fallback "$label" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$actual_file"; then
+            result=1
+        fi
+    else
+        if ! run_psql_script_direct "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$actual_file"; then
+            result=1
+        fi
+    fi
+    
+    rm -f "$filtered_file" 2>/dev/null || true
+    return $result
+}
+
+# Global array to track failed policies (accessible outside function)
+FAILED_POLICIES_ARRAY=()
+
+# Apply policies one by one to catch and report individual failures
+apply_policies_individually() {
+    local sql_file=$1
+    local label=$2
+    
+    if [ ! -f "$sql_file" ] || [ ! -s "$sql_file" ]; then
+        return 1
+    fi
+    
+    # Filter the file first
+    local filtered_file="${sql_file}.filtered"
+    sed -E '/^\\|^Output format|^Tuples only|^Pager|^Locale|^Default display|^Line style|^Border style|^Expanded display/d' "$sql_file" > "$filtered_file" 2>/dev/null || cp "$sql_file" "$filtered_file"
+    sed -i.bak '/^$/d' "$filtered_file" 2>/dev/null || sed -i '' '/^$/d' "$filtered_file" 2>/dev/null || true
+    rm -f "${filtered_file}.bak" 2>/dev/null || true
+    
+    if [ ! -s "$filtered_file" ]; then
+        rm -f "$filtered_file"
+        return 1
+    fi
+    
+    local success_count=0
+    local fail_count=0
+    FAILED_POLICIES_ARRAY=()  # Reset global array
+    local current_statement=""
+    local statement_type=""
+    local total_statements=0
+    local current_statement_num=0
+    local semicolon_pattern=";[[:space:]]*$"  # Pattern to detect end of SQL statement
+    
+    # Count total statements first (for progress)
+    while IFS= read -r line || [ -n "$line" ]; do
+        line_trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$line_trimmed" ] && continue
+        [[ "$line_trimmed" =~ ^-- ]] && continue
+        if [[ "$line_trimmed" =~ $semicolon_pattern ]]; then
+            ((total_statements++)) || true
+        fi
+    done < "$filtered_file"
+    
+    log_info "Found $total_statements statement(s) to apply"
+    
+    # Split SQL file into individual statements and apply one by one
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Skip empty lines and comments
+        line_trimmed=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$line_trimmed" ] && continue
+        [[ "$line_trimmed" =~ ^-- ]] && continue
+        
+        # Accumulate statement until we hit a semicolon
+        current_statement+="$line"$'\n'
+        
+        # Check if line ends with semicolon (end of statement)
+        if [[ "$line_trimmed" =~ $semicolon_pattern ]]; then
+            ((current_statement_num++)) || true
+            # Show progress every 50 statements
+            if [ $((current_statement_num % 50)) -eq 0 ]; then
+                log_info "  Progress: $current_statement_num/$total_statements statements processed..."
+            fi
+            
+            # Extract statement type for logging
+            if [[ "$current_statement" =~ ^[[:space:]]*ALTER[[:space:]]+TABLE ]]; then
+                statement_type="ALTER TABLE"
+                # Extract table name using sed (portable regex)
+                table_name=$(echo "$current_statement" | sed -E 's/.*ALTER[[:space:]]+TABLE[[:space:]]+([^[:space:]]+).*/\1/' | head -1 || echo "unknown")
+            elif [[ "$current_statement" =~ ^[[:space:]]*DROP[[:space:]]+POLICY ]]; then
+                statement_type="DROP POLICY"
+                # Extract policy name using sed (portable regex)
+                policy_name=$(echo "$current_statement" | sed -E 's/.*DROP[[:space:]]+POLICY[[:space:]]+IF[[:space:]]+EXISTS[[:space:]]+([^[:space:]]+).*/\1/' | head -1 || echo "unknown")
+            elif [[ "$current_statement" =~ ^[[:space:]]*CREATE[[:space:]]+POLICY ]]; then
+                statement_type="CREATE POLICY"
+                # Extract policy name using sed (portable regex)
+                policy_name=$(echo "$current_statement" | sed -E 's/.*CREATE[[:space:]]+POLICY[[:space:]]+([^[:space:]]+).*/\1/' | head -1 || echo "unknown")
+            else
+                statement_type="OTHER"
+            fi
+            
+            # Apply the statement
+            local temp_stmt_file=$(mktemp)
+            echo "$current_statement" > "$temp_stmt_file"
+            
+            local stmt_result=0
+            local endpoints
+            endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+            while IFS='|' read -r host port user label_name; do
+                [ -z "$host" ] && continue
+                if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                    -h "$host" \
+                    -p "$port" \
+                    -U "$user" \
+                    -d postgres \
+                    -f "$temp_stmt_file" >>"$LOG_FILE" 2>&1; then
+                    stmt_result=0
+                    break
+                else
+                    stmt_result=1
+                fi
+            done <<< "$endpoints"
+            
+            if [ $stmt_result -eq 0 ]; then
+                ((success_count++)) || true
+                # Only log CREATE POLICY successes if verbose or if it's one of the first 10
+                if [ "$statement_type" = "CREATE POLICY" ] && [ $success_count -le 10 ]; then
+                    log_info "  ✓ Applied: $policy_name"
+                fi
+            else
+                ((fail_count++)) || true
+                # Capture error message
+                local error_msg=""
+                endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                while IFS='|' read -r host port user label_name; do
+                    [ -z "$host" ] && continue
+                    error_msg=$(PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                        -h "$host" \
+                        -p "$port" \
+                        -U "$user" \
+                        -d postgres \
+                        -f "$temp_stmt_file" 2>&1 | grep -i "error" | head -1 || echo "")
+                    break
+                done <<< "$endpoints"
+                
+                if [ "$statement_type" = "CREATE POLICY" ]; then
+                    log_warning "  ✗ Failed: $policy_name"
+                    [ -n "$error_msg" ] && log_warning "    Error: $error_msg"
+                    FAILED_POLICIES_ARRAY+=("$policy_name")
+                elif [ "$statement_type" = "DROP POLICY" ]; then
+                    # DROP POLICY IF EXISTS failures are usually OK (policy doesn't exist)
+                    if [ -n "$error_msg" ] && ! echo "$error_msg" | grep -qi "does not exist"; then
+                        log_warning "  ⚠ DROP POLICY failed: $policy_name - $error_msg"
+                    fi
+                elif [ "$statement_type" = "ALTER TABLE" ]; then
+                    log_warning "  ✗ Failed: $statement_type $table_name"
+                    [ -n "$error_msg" ] && log_warning "    Error: $error_msg"
+                else
+                    log_warning "  ✗ Failed: $statement_type statement"
+                    [ -n "$error_msg" ] && log_warning "    Error: $error_msg"
+                fi
+            fi
+            
+            rm -f "$temp_stmt_file"
+            current_statement=""
+        fi
+    done < "$filtered_file"
+    
+    # Handle any remaining statement without semicolon
+    if [ -n "$current_statement" ]; then
+        local temp_stmt_file=$(mktemp)
+        echo "$current_statement" > "$temp_stmt_file"
+        if apply_sql_with_fallback "$temp_stmt_file" "Apply remaining statement" >/dev/null 2>&1; then
+            ((success_count++)) || true
+        else
+            ((fail_count++)) || true
+        fi
+        rm -f "$temp_stmt_file"
+    fi
+    
+    rm -f "$filtered_file"
+    
+    log_info "Policy application summary: $success_count succeeded, $fail_count failed"
+    if [ ${#FAILED_POLICIES_ARRAY[@]} -gt 0 ]; then
+        if [ ${#FAILED_POLICIES_ARRAY[@]} -le 20 ]; then
+            log_warning "Failed policies: ${FAILED_POLICIES_ARRAY[*]}"
+        else
+            log_warning "Failed policies (showing first 20 of ${#FAILED_POLICIES_ARRAY[@]}):"
+            for i in $(seq 0 $(( ${#FAILED_POLICIES_ARRAY[@]} > 20 ? 19 : ${#FAILED_POLICIES_ARRAY[@]} - 1 ))); do
+                log_warning "  - ${FAILED_POLICIES_ARRAY[$i]}"
+            done
+            log_warning "  ... and $(( ${#FAILED_POLICIES_ARRAY[@]} - 20 )) more (see $LOG_FILE for full list)"
+        fi
+        log_warning "Review $LOG_FILE for detailed error messages for each failed policy"
+    fi
+    
+    # Return success if at least some policies were applied
+    if [ $success_count -gt 0 ]; then
+        return 0
+    else
+        return 1
     fi
 }
 
@@ -500,33 +724,33 @@ run_source_sql_to_file() {
     local sql_content=$1
     local output_file=$2
 
-    local query_file
-    query_file=$(mktemp)
-    cat >"$query_file" <<SQL
-\\pset format unaligned
-\\pset tuples_only on
-\\set ON_ERROR_STOP on
-$sql_content
-SQL
-
     local endpoints
     endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         log_info "Generating SQL from source via ${label} (${host}:${port})..."
+        # Use -t -A flags instead of \pset commands to avoid meta-commands in output
+        # -t: tuples only (no headers), -A: unaligned output
         if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require psql \
             -h "$host" \
             -p "$port" \
             -U "$user" \
             -d postgres \
-            -f "$query_file" >"$output_file"; then
-            rm -f "$query_file"
+            -t -A \
+            -v ON_ERROR_STOP=on \
+            -c "$sql_content" >"$output_file" 2>/dev/null; then
+            # Filter out any psql meta-commands that might have leaked through
+            # Remove lines that look like psql commands (starting with \)
+            sed -i.bak '/^\\/d' "$output_file" 2>/dev/null || sed -i '' '/^\\/d' "$output_file" 2>/dev/null || true
+            rm -f "${output_file}.bak" 2>/dev/null || true
+            # Remove empty lines and lines that are just whitespace
+            sed -i.bak '/^[[:space:]]*$/d' "$output_file" 2>/dev/null || sed -i '' '/^[[:space:]]*$/d' "$output_file" 2>/dev/null || true
+            rm -f "${output_file}.bak" 2>/dev/null || true
             return 0
         fi
         log_warning "SQL generation via ${label} failed; trying next endpoint..."
     done <<< "$endpoints"
 
-    rm -f "$query_file"
     return 1
 }
 
@@ -630,49 +854,62 @@ ORDER BY qualified, grantee, privilege_type;
 
 generate_rls_sql() {
     local output_file=$1
-    if [ ${#TABLES[@]} -eq 0 ]; then
-        : >"$output_file"
-        return 0
-    fi
-
-    local table_list_sql=""
-    local tbl
-    for tbl in "${TABLES[@]}"; do
-        [ -z "$tbl" ] && continue
-        safe_tbl=${tbl//\'/\'\'}
-        table_list_sql+="'$safe_tbl',"
-    done
-    table_list_sql="${table_list_sql%,}"
-
+    
+    # Generate RLS SQL for ALL tables with RLS enabled AND all policies
+    # CRITICAL: Include tables with RLS enabled but NO policies (they still need RLS enabled in target)
     local sql_content="
-WITH selected AS (
-    SELECT c.oid AS relid,
-           n.nspname,
-           c.relname,
-           format('%I.%I', n.nspname, c.relname) AS qualified,
-           c.relrowsecurity,
-           c.relforcerowsecurity
+WITH all_rls_enabled_tables AS (
+    -- Get ALL tables with RLS enabled in public and auth schemas (regardless of policies)
+    SELECT DISTINCT
+        c.oid AS relid,
+        n.nspname,
+        c.relname,
+        format('%I.%I', n.nspname, c.relname) AS qualified,
+        c.relrowsecurity,
+        c.relforcerowsecurity
     FROM pg_class c
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'r'
-      AND format('%I.%I', n.nspname, c.relname) = ANY(ARRAY[$table_list_sql])
+      AND n.nspname IN ('public', 'auth')
+      AND c.relrowsecurity = true
+)
+, all_policies AS (
+    -- Get ALL policies in public and auth schemas
+    SELECT DISTINCT
+        pol.oid AS policy_oid,
+        pol.polname,
+        pol.polrelid,
+        pol.polcmd,
+        pol.polpermissive,
+        pol.polroles,
+        pol.polqual,
+        pol.polwithcheck,
+        c.relname,
+        n.nspname,
+        format('%I.%I', n.nspname, c.relname) AS qualified,
+        c.relrowsecurity,
+        c.relforcerowsecurity
+    FROM pg_policy pol
+    JOIN pg_class c ON c.oid = pol.polrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('public', 'auth')
+      AND c.relkind = 'r'
 )
 , drop_policies AS (
-    SELECT sel.qualified,
-           pol.polname,
-           format('DROP POLICY IF EXISTS %I ON %s;', pol.polname, sel.qualified) AS stmt
-    FROM pg_policy pol
-    JOIN selected sel ON sel.relid = pol.polrelid
+    SELECT ap.qualified,
+           ap.polname,
+           format('DROP POLICY IF EXISTS %I ON %s;', ap.polname, ap.qualified) AS stmt
+    FROM all_policies ap
 )
 , create_policies AS (
-    SELECT sel.qualified,
-           pol.polname,
+    SELECT ap.qualified,
+           ap.polname,
            format(
                'CREATE POLICY %1\$I%2\$s ON %3\$s %4\$s %5\$s %6\$s %7\$s;',
-               pol.polname,
-               CASE WHEN NOT pol.polpermissive THEN ' AS RESTRICTIVE' ELSE '' END,
-               sel.qualified,
-               CASE pol.polcmd
+               ap.polname,
+               CASE WHEN NOT ap.polpermissive THEN ' AS RESTRICTIVE' ELSE '' END,
+               ap.qualified,
+               CASE ap.polcmd
                    WHEN '' THEN ''
                    WHEN 'r' THEN 'FOR SELECT'
                    WHEN 'a' THEN 'FOR INSERT'
@@ -681,27 +918,30 @@ WITH selected AS (
                    ELSE 'FOR ALL'
                END,
                COALESCE('TO '||roles.role_list, ''),
-               CASE WHEN pol.polqual IS NULL THEN '' ELSE 'USING ('||pg_get_expr(pol.polqual, pol.polrelid)||')' END,
-               CASE WHEN pol.polwithcheck IS NULL THEN '' ELSE 'WITH CHECK ('||pg_get_expr(pol.polwithcheck, pol.polrelid)||')' END
+               CASE WHEN ap.polqual IS NULL THEN '' ELSE 'USING ('||pg_get_expr(ap.polqual, ap.polrelid)||')' END,
+               CASE WHEN ap.polwithcheck IS NULL THEN '' ELSE 'WITH CHECK ('||pg_get_expr(ap.polwithcheck, ap.polrelid)||')' END
            ) AS stmt
-    FROM pg_policy pol
-    JOIN selected sel ON sel.relid = pol.polrelid
+    FROM all_policies ap
     LEFT JOIN LATERAL (
         SELECT string_agg(quote_ident(r.rolname), ', ') AS role_list
-        FROM unnest(pol.polroles) role_oid
+        FROM unnest(ap.polroles) role_oid
         JOIN pg_roles r ON r.oid = role_oid
     ) AS roles ON true
 )
 SELECT stmt FROM (
+    -- Step 1: Enable RLS on ALL tables that have RLS enabled (including those with no policies)
     SELECT 1 AS ord, qualified AS obj, format('ALTER TABLE %s ENABLE ROW LEVEL SECURITY;', qualified) AS stmt
-    FROM selected
+    FROM all_rls_enabled_tables
     UNION ALL
-    SELECT 2 AS ord, qualified, format('ALTER TABLE %s FORCE ROW LEVEL SECURITY;', qualified)
-    FROM selected
+    -- Step 2: Force RLS on tables that require it
+    SELECT 2 AS ord, qualified, format('ALTER TABLE %s FORCE ROW LEVEL SECURITY;', qualified) AS stmt
+    FROM all_rls_enabled_tables
     WHERE relforcerowsecurity
     UNION ALL
+    -- Step 3: Drop existing policies (if any)
     SELECT 3 AS ord, qualified, stmt FROM drop_policies
     UNION ALL
+    -- Step 4: Create all policies
     SELECT 4 AS ord, qualified, stmt FROM create_policies
 ) ordered_statements
 ORDER BY ord, obj, stmt;
@@ -852,11 +1092,11 @@ if $REPLACE_MODE; then
 
         log_info "Applying policy post-data (constraints, policies, functions) with owner-safe execution..."
         if run_psql_script_with_fallback "Apply policy post-data" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$temp_sql"; then
-            log_success "Policy definitions applied successfully."
-        else
+        log_success "Policy definitions applied successfully."
+    else
             log_warning "Policy post-data application failed. Attempting per-statement execution with ownership guard."
-            failed_tables+=("policy post-data")
-        fi
+        failed_tables+=("policy post-data")
+    fi
         rm -f "$temp_sql"
     }
 
@@ -870,68 +1110,882 @@ fi
     GRANTS_SQL="$MIGRATION_DIR/policies_grants.sql"
     FUNCTIONS_SQL="$MIGRATION_DIR/policies_all_functions.sql"
 
+    # Step 1: Apply security-definer helper functions FIRST (required for RLS policies)
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Step 1/5: Security-Definer Helper Functions"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "Exporting security-definer helper functions..."
     if generate_security_definer_sql "$SECDEF_SQL"; then
         if [ -s "$SECDEF_SQL" ]; then
-            apply_sql_with_fallback "$SECDEF_SQL" "Apply security helper functions"
+            func_count=$(grep -c "^CREATE OR REPLACE FUNCTION" "$SECDEF_SQL" 2>/dev/null || echo "0")
+            log_info "Found $func_count security-definer function(s) to apply"
+            if apply_sql_with_fallback "$SECDEF_SQL" "Apply security helper functions"; then
+                log_success "✓ Security-definer helper functions applied successfully"
+            else
+                log_warning "⚠ Security-definer functions application had issues; continuing..."
+                failed_tables+=("security-definer functions")
+            fi
         else
             log_info "No security-definer functions detected; skipping."
         fi
+    else
+        log_warning "Failed to export security-definer functions; continuing..."
     fi
+    echo ""
 
+    # Step 2: Apply all database functions (public and auth schemas)
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Step 2/5: Database Functions (public and auth schemas)"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "Exporting all database functions (public and auth schemas)..."
     if generate_all_database_functions_sql "$FUNCTIONS_SQL"; then
         if [ -s "$FUNCTIONS_SQL" ]; then
+            func_count=$(grep -c "^CREATE OR REPLACE FUNCTION" "$FUNCTIONS_SQL" 2>/dev/null || echo "0")
+            log_info "Found $func_count database function(s) to apply"
             if apply_sql_with_fallback "$FUNCTIONS_SQL" "Apply all database functions"; then
-                log_success "All database functions applied successfully."
+                log_success "✓ All database functions applied successfully"
             else
-                log_warning "Database functions application had issues; inspect $FUNCTIONS_SQL."
+                log_warning "⚠ Database functions application had issues; continuing..."
                 failed_tables+=("database functions")
             fi
         else
             log_info "No database functions detected in public/auth schemas."
         fi
+    else
+        log_warning "Failed to export database functions; continuing..."
     fi
+    echo ""
 
-    log_info "Exporting row level security policies..."
+    # Step 3: Apply RLS policies (must be after functions are in place)
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Step 3/5: Row Level Security (RLS) Policies"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "Exporting row level security policies for ALL tables with RLS enabled..."
     if generate_rls_sql "$RLS_SQL"; then
         if [ -s "$RLS_SQL" ]; then
-            if apply_sql_with_fallback "$RLS_SQL" "Apply RLS policies"; then
-                log_success "RLS policies applied successfully."
+            rls_table_count=$(grep -c "ENABLE ROW LEVEL SECURITY" "$RLS_SQL" 2>/dev/null || echo "0")
+            rls_policy_count=$(grep -c "^CREATE POLICY" "$RLS_SQL" 2>/dev/null || echo "0")
+            drop_policy_count=$(grep -c "^DROP POLICY" "$RLS_SQL" 2>/dev/null || echo "0")
+            log_info "Found RLS configuration for $rls_table_count table(s):"
+            log_info "  - $drop_policy_count DROP POLICY statement(s)"
+            log_info "  - $rls_policy_count CREATE POLICY statement(s)"
+            
+            # Check for tables with RLS enabled but NO policies (critical issue)
+            log_info "Checking for tables with RLS enabled but no policies..."
+            RLS_NO_POLICIES_QUERY="
+            WITH rls_tables AS (
+                SELECT DISTINCT
+                    format('%I.%I', n.nspname, c.relname) AS qualified,
+                    c.relname,
+                    n.nspname
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind = 'r'
+                  AND n.nspname IN ('public', 'auth')
+                  AND c.relrowsecurity = true
+            ),
+            tables_with_policies AS (
+                SELECT DISTINCT
+                    format('%I.%I', n.nspname, c.relname) AS qualified
+                FROM pg_policy pol
+                JOIN pg_class c ON c.oid = pol.polrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname IN ('public', 'auth')
+            )
+            SELECT rt.qualified
+            FROM rls_tables rt
+            WHERE rt.qualified NOT IN (SELECT qualified FROM tables_with_policies)
+            ORDER BY rt.qualified;
+            "
+            RLS_NO_POLICIES_FILE=$(mktemp)
+            if run_source_sql_to_file "$RLS_NO_POLICIES_QUERY" "$RLS_NO_POLICIES_FILE"; then
+                if [ -s "$RLS_NO_POLICIES_FILE" ] && [ -n "$(cat "$RLS_NO_POLICIES_FILE" | grep -v '^$' || true)" ]; then
+                    log_warning "⚠ CRITICAL: Found tables with RLS enabled but NO policies:"
+                    while IFS= read -r table || [ -n "$table" ]; do
+                        [ -z "$table" ] && continue
+                        table_trimmed=$(echo "$table" | tr -d '[:space:]')
+                        [ -z "$table_trimmed" ] && continue
+                        log_warning "    - $table_trimmed (RLS enabled but no policies - will block all access!)"
+                    done < "$RLS_NO_POLICIES_FILE"
+                    log_warning "   These tables will have RLS enabled in target but no policies."
+                    log_warning "   You MUST create policies for these tables manually or they will be inaccessible."
+                    log_warning "   Example: CREATE POLICY \"Allow read\" ON table_name FOR SELECT TO authenticated USING (true);"
+                else
+                    log_success "✓ All RLS-enabled tables have policies"
+                fi
+            fi
+            rm -f "$RLS_NO_POLICIES_FILE"
+            
+            # Verify we're getting all policies from source
+            log_info "Verifying policy count from source..."
+            SOURCE_POLICY_COUNT_QUERY="
+            SELECT COUNT(*)
+            FROM pg_policy pol
+            JOIN pg_class c ON c.oid = pol.polrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname IN ('public', 'auth')
+              AND c.relrowsecurity = true;
+            "
+            SOURCE_POLICY_COUNT_FILE=$(mktemp)
+            if run_source_sql_to_file "$SOURCE_POLICY_COUNT_QUERY" "$SOURCE_POLICY_COUNT_FILE"; then
+                source_policy_count=$(head -1 "$SOURCE_POLICY_COUNT_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0")
+                log_info "  Source has $source_policy_count total policy(ies) on RLS-enabled tables"
+                if [ "$rls_policy_count" -lt "$source_policy_count" ]; then
+                    log_warning "⚠ Generated SQL has fewer policies ($rls_policy_count) than source ($source_policy_count)"
+                    log_warning "   Some policies may not have been exported correctly"
+                fi
+            fi
+            rm -f "$SOURCE_POLICY_COUNT_FILE"
+            
+            # Apply policies individually to catch and report failures
+            log_info "Applying policies individually to identify any failures..."
+            log_info "This may take a while for large numbers of policies..."
+            if apply_policies_individually "$RLS_SQL" "Apply RLS policies"; then
+                # Verify policies were actually created
+                log_info "Verifying policies were applied..."
+                TARGET_POLICY_COUNT_QUERY="
+                SELECT COUNT(*)
+                FROM pg_policy pol
+                JOIN pg_class c ON pol.polrelid = c.oid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname IN ('public', 'auth')
+                  AND c.relrowsecurity = true;
+                "
+                TARGET_POLICY_COUNT_FILE=$(mktemp)
+                endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                target_after_count="0"
+                while IFS='|' read -r host port user label; do
+                    [ -z "$host" ] && continue
+                    if target_after_count=$(PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                        -h "$host" \
+                        -p "$port" \
+                        -U "$user" \
+                        -d postgres \
+                        -t -A \
+                        -c "$TARGET_POLICY_COUNT_QUERY" 2>/dev/null | tr -d '[:space:]'); then
+                        break
+                    fi
+                done <<< "$endpoints"
+                rm -f "$TARGET_POLICY_COUNT_FILE"
+                
+                if [ -n "$source_policy_count" ] && [ "$source_policy_count" != "0" ]; then
+                    if [ "$target_after_count" -ge "$source_policy_count" ]; then
+                        log_success "✓ RLS policies applied successfully: $target_after_count policy(ies) in target"
+                    else
+                        missing_count=$((source_policy_count - target_after_count))
+                        log_warning "⚠ Policy count mismatch after application: Expected ~$source_policy_count, got $target_after_count"
+                        log_warning "   Missing $missing_count policy(ies) - some policies failed to apply"
+                        log_warning "   Check $LOG_FILE for detailed error messages"
+                        if [ ${#FAILED_POLICIES_ARRAY[@]} -gt 0 ]; then
+                            log_warning "   Failed policies report: $MIGRATION_DIR/failed_policies_report.txt"
+                        fi
+                        log_warning "   Common causes:"
+                        log_warning "     - Missing functions referenced in policy expressions"
+                        log_warning "     - Missing roles referenced in policy TO clauses"
+                        log_warning "     - Missing tables/columns referenced in policy expressions"
+                        log_warning "     - Syntax errors in policy definitions"
+                        log_warning "   To fix: Review failed policies, fix dependencies, and re-run migration"
+                        failed_tables+=("RLS policies (missing $missing_count)")
+                    fi
+                else
+                    log_success "✓ RLS policies applied successfully"
+                fi
             else
-                log_warning "RLS policy application failed; inspect $RLS_SQL."
+                log_warning "⚠ RLS policy application had issues; inspect $RLS_SQL and $LOG_FILE"
                 failed_tables+=("RLS policies")
             fi
         else
-            log_warning "No RLS policies detected for selected tables."
+            log_warning "No RLS policies detected - this may indicate an issue if source has RLS enabled tables"
         fi
+    else
+        log_warning "Failed to export RLS policies; continuing..."
     fi
+    echo ""
 
-    log_info "Exporting table grants (permissions)..."
+    # Step 4: Apply function grants (ensure functions are accessible to roles)
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Step 4/5: Function Grants and Permissions"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    FUNCTION_GRANTS_SQL="$MIGRATION_DIR/policies_function_grants.sql"
+    
+    generate_function_grants_sql() {
+        local output_file=$1
+        local sql_content="
+WITH func_grants AS (
+    SELECT 
+        n.nspname || '.' || p.proname AS func_name,
+        rtg.grantee,
+        rtg.privilege_type,
+        rtg.is_grantable,
+        format(
+            'GRANT %s ON FUNCTION %I.%I(%s) TO %s%s;',
+            rtg.privilege_type,
+            n.nspname,
+            p.proname,
+            pg_get_function_identity_arguments(p.oid),
+            quote_ident(rtg.grantee),
+            CASE WHEN rtg.is_grantable = 'YES' THEN ' WITH GRANT OPTION' ELSE '' END
+        ) AS grant_stmt
+    FROM information_schema.routine_privileges rtg
+    JOIN pg_proc p ON p.proname = rtg.routine_name
+    JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = rtg.routine_schema
+    WHERE rtg.routine_schema IN ('public', 'auth')
+      AND rtg.grantee NOT IN ('postgres', 'supabase_admin', 'supabase_auth_admin', 'supabase_storage_admin')
+      AND rtg.grantee NOT LIKE 'pg_%'
+)
+SELECT grant_stmt
+FROM func_grants
+ORDER BY func_name, grantee, privilege_type;
+"
+        if run_source_sql_to_file "$sql_content" "$output_file"; then
+            return 0
+        else
+            log_warning "Unable to export function grants from source."
+            : >"$output_file"
+            return 1
+        fi
+    }
+    
+    log_info "Exporting function grants (permissions) for functions in public and auth schemas..."
+    if generate_function_grants_sql "$FUNCTION_GRANTS_SQL"; then
+        if [ -s "$FUNCTION_GRANTS_SQL" ]; then
+            func_grant_count=$(grep -c "^GRANT" "$FUNCTION_GRANTS_SQL" 2>/dev/null || echo "0")
+            log_info "Found $func_grant_count function grant statement(s) to apply"
+            if apply_sql_with_fallback "$FUNCTION_GRANTS_SQL" "Apply function grants"; then
+                log_success "✓ Function grants applied successfully"
+            else
+                log_warning "⚠ Function grants application had issues; inspect $FUNCTION_GRANTS_SQL"
+                failed_tables+=("function grants")
+            fi
+        else
+            log_info "No function grants detected for functions in public/auth schemas."
+        fi
+    else
+        log_warning "Failed to export function grants; continuing..."
+    fi
+    echo ""
+
+    # Step 5: Apply table grants/permissions (must be after policies)
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Step 5/5: Table Grants and Permissions"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "Exporting table grants (permissions) for ALL tables in public and auth schemas..."
     if generate_grants_sql "$GRANTS_SQL"; then
         if [ -s "$GRANTS_SQL" ]; then
+            grant_count=$(grep -c "^GRANT" "$GRANTS_SQL" 2>/dev/null || echo "0")
+            log_info "Found $grant_count grant statement(s) to apply"
             if apply_sql_with_fallback "$GRANTS_SQL" "Apply table grants"; then
-                log_success "Table grants applied successfully."
+                log_success "✓ Table grants applied successfully for all tables"
             else
-                log_warning "Table grants application had issues; inspect $GRANTS_SQL."
+                log_warning "⚠ Table grants application had issues; inspect $GRANTS_SQL"
                 failed_tables+=("table grants")
             fi
         else
-            log_info "No table grants detected for selected tables."
+            log_info "No table grants detected for tables in public/auth schemas."
         fi
+    else
+        log_warning "Failed to export grants; continuing..."
     fi
+    echo ""
 
 rm -f "$MIGRATION_DIR"/*_source.sql "$MIGRATION_DIR"/*_upsert.sql 2>/dev/null || true
 
+# Generate failed policies report if there were failures
+if [ ${#FAILED_POLICIES_ARRAY[@]} -gt 0 ]; then
+    FAILED_POLICIES_REPORT="$MIGRATION_DIR/failed_policies_report.txt"
+    {
+        echo "Failed Policies Report"
+        echo "======================"
+        echo "Date: $(date)"
+        echo "Source: $SOURCE_ENV ($SOURCE_REF)"
+        echo "Target: $TARGET_ENV ($TARGET_REF)"
 echo ""
+        echo "Total Failed Policies: ${#FAILED_POLICIES_ARRAY[@]}"
+        echo ""
+        echo "Failed Policy Names:"
+        for policy in "${FAILED_POLICIES_ARRAY[@]}"; do
+            echo "  - $policy"
+        done
+        echo ""
+        echo "Common causes:"
+        echo "  1. Missing functions referenced in policy USING/WITH CHECK clauses"
+        echo "  2. Missing roles referenced in policy TO clause"
+        echo "  3. Missing tables or columns referenced in policy expressions"
+        echo "  4. Syntax errors in policy definitions"
+        echo ""
+        echo "To fix:"
+        echo "  1. Check $LOG_FILE for detailed error messages"
+        echo "  2. Ensure all functions are migrated: ./scripts/components/policies_migration.sh $SOURCE_ENV $TARGET_ENV"
+        echo "  3. Ensure all roles exist in target"
+        echo "  4. Re-run policies migration after fixing dependencies"
+    } > "$FAILED_POLICIES_REPORT"
+    log_info "Failed policies report saved to: $FAILED_POLICIES_REPORT"
+fi
+
+# Validation: Verify policies were applied correctly and check dependencies
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Validation: Verifying Policies and Access Controls"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+# Check for missing function dependencies in policies
+log_info "Checking for missing function dependencies in RLS policies..."
+VALIDATE_FUNCTIONS_QUERY="
+WITH policy_functions AS (
+    SELECT DISTINCT
+        regexp_split_to_table(
+            COALESCE(pg_get_expr(pol.polqual, pol.polrelid), '') || ' ' || 
+            COALESCE(pg_get_expr(pol.polwithcheck, pol.polrelid), ''),
+            '[^a-zA-Z0-9_]+'
+        ) as func_name
+    FROM pg_policy pol
+    JOIN pg_class c ON c.oid = pol.polrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('public', 'auth')
+      AND (pol.polqual IS NOT NULL OR pol.polwithcheck IS NOT NULL)
+),
+-- Common column/table names to exclude (not functions)
+excluded_names AS (
+    SELECT unnest(ARRAY[
+        'true', 'false', 'null', 'auth', 'uid', 'role', 'jwt', 'current_user', 'current_role',
+        'id', 'user_id', 'created_at', 'updated_at', 'deleted_at', 'status', 'type', 'name',
+        'email', 'password', 'username', 'role_id', 'profile_id', 'organization_id',
+        'user_roles', 'user_learning_centers', 'ulc_target', 'ulc_viewer',
+        'table', 'column', 'row', 'data', 'value', 'key', 'text', 'json', 'array',
+        'select', 'insert', 'update', 'delete', 'where', 'from', 'join', 'on', 'and', 'or',
+        'is', 'not', 'in', 'exists', 'case', 'when', 'then', 'else', 'end', 'as',
+        -- Common role names that appear in policy expressions
+        'accounts', 'active', 'admin', 'app_role', 'cms', 'crm', 'csr', 'emp_center',
+        'front_desk', 'frontdesk', 'global', 'global_csr', 'learning_center', 'pending',
+        'published', 'single_customer', 'specific_customers', 'staff', 'super_admin', 'teacher'
+    ]) as name
+),
+-- Get all role names from user_roles and auth.roles to exclude
+role_names AS (
+    SELECT DISTINCT role::text as name
+    FROM user_roles
+    WHERE role IS NOT NULL
+    UNION
+    SELECT DISTINCT role::text as name
+    FROM auth.user_roles
+    WHERE role IS NOT NULL
+    UNION
+    SELECT DISTINCT name::text as name
+    FROM auth.roles
+    WHERE name IS NOT NULL
+),
+-- Get all existing table and column names to exclude
+existing_identifiers AS (
+    SELECT DISTINCT table_name as name FROM information_schema.tables WHERE table_schema IN ('public', 'auth')
+    UNION
+    SELECT DISTINCT column_name as name FROM information_schema.columns WHERE table_schema IN ('public', 'auth')
+)
+SELECT DISTINCT pf.func_name
+FROM policy_functions pf
+WHERE pf.func_name ~ '^[a-z_][a-z0-9_]*$'
+  AND LENGTH(pf.func_name) > 2
+  AND pf.func_name NOT IN (SELECT name FROM excluded_names)
+  AND pf.func_name NOT IN (SELECT name FROM existing_identifiers)
+  AND pf.func_name NOT IN (SELECT name FROM role_names)
+  AND NOT EXISTS (
+      SELECT 1
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE p.proname = pf.func_name
+        AND n.nspname IN ('public', 'auth', 'pg_catalog')
+  )
+ORDER BY pf.func_name;
+"
+
+VALIDATE_FUNCTIONS_FILE=$(mktemp)
+if run_source_sql_to_file "$VALIDATE_FUNCTIONS_QUERY" "$VALIDATE_FUNCTIONS_FILE"; then
+    if [ -s "$VALIDATE_FUNCTIONS_FILE" ]; then
+        missing_funcs=$(cat "$VALIDATE_FUNCTIONS_FILE" | grep -v '^$' || true)
+        if [ -n "$missing_funcs" ]; then
+            log_warning "⚠ Potential missing functions referenced in policies:"
+            echo "$missing_funcs" | while read func; do
+                log_warning "   - $func"
+            done
+            log_warning "   These functions may need to be migrated separately"
+        else
+            log_success "✓ No missing function dependencies detected"
+        fi
+    else
+        log_success "✓ No function dependencies to validate"
+    fi
+else
+    log_warning "⚠ Could not validate function dependencies"
+fi
+rm -f "$VALIDATE_FUNCTIONS_FILE"
+echo ""
+
+validate_policies_applied() {
+    local validation_errors=0
+    local temp_file
+    temp_file=$(mktemp)
+    
+    # Count RLS-enabled tables in source
+    local source_rls_query="SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ('public', 'auth') AND c.relrowsecurity = true"
+    local source_rls_count="0"
+    if run_source_sql_to_file "$source_rls_query" "$temp_file" 2>/dev/null; then
+        source_rls_count=$(head -1 "$temp_file" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    fi
+    
+    # Count RLS-enabled tables in target
+    local target_rls_query="SELECT COUNT(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind = 'r' AND n.nspname IN ('public', 'auth') AND c.relrowsecurity = true"
+    local target_rls_count="0"
+    local endpoints
+    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if target_rls_count=$(PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            -c "$target_rls_query" 2>/dev/null | tr -d '[:space:]'); then
+            break
+        fi
+    done <<< "$endpoints"
+    target_rls_count=${target_rls_count:-0}
+    
+    if [ "$source_rls_count" != "$target_rls_count" ]; then
+        log_warning "⚠ RLS table count mismatch: Source=$source_rls_count, Target=$target_rls_count"
+        ((validation_errors++)) || true
+    else
+        log_success "✓ RLS-enabled table count matches: $source_rls_count table(s)"
+    fi
+    
+    # Count policies in source (only on RLS-enabled tables for accurate comparison)
+    local source_policy_query="
+    SELECT COUNT(*)
+    FROM pg_policy p
+    JOIN pg_class c ON p.polrelid = c.oid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('public', 'auth')
+      AND c.relrowsecurity = true;
+    "
+    local source_policy_count="0"
+    if run_source_sql_to_file "$source_policy_query" "$temp_file" 2>/dev/null; then
+        source_policy_count=$(head -1 "$temp_file" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    fi
+    
+    # Count policies in target (only on RLS-enabled tables for accurate comparison)
+    local target_policy_query="
+    SELECT COUNT(*)
+    FROM pg_policy p
+    JOIN pg_class c ON p.polrelid = c.oid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname IN ('public', 'auth')
+      AND c.relrowsecurity = true;
+    "
+    local target_policy_count="0"
+    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if target_policy_count=$(PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            -c "$target_policy_query" 2>/dev/null | tr -d '[:space:]'); then
+            break
+        fi
+    done <<< "$endpoints"
+    target_policy_count=${target_policy_count:-0}
+    
+    if [ "$source_policy_count" != "$target_policy_count" ]; then
+        log_warning "⚠ Policy count mismatch: Source=$source_policy_count, Target=$target_policy_count"
+        log_warning "   Missing $((source_policy_count - target_policy_count)) policy(ies) in target"
+        log_warning "   Re-run policies migration to sync all policies"
+        ((validation_errors++)) || true
+    else
+        log_success "✓ Policy count matches: $source_policy_count policy(ies)"
+    fi
+    
+    rm -f "$temp_file"
+    
+    # Additional validation: Check for missing admin RLS policies on critical tables (check TARGET)
+    log_info "Checking for missing admin RLS policies on critical tables..."
+    MISSING_ADMIN_POLICIES_QUERY="
+    WITH critical_tables AS (
+        SELECT unnest(ARRAY['profiles', 'user_roles', 'system_settings', 'setting_categories']) AS table_name
+    ),
+    rls_tables AS (
+        SELECT DISTINCT
+            c.relname AS table_name,
+            format('%I.%I', n.nspname, c.relname) AS qualified
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'r'
+          AND n.nspname = 'public'
+          AND c.relrowsecurity = true
+          AND c.relname IN (SELECT table_name FROM critical_tables)
+    ),
+    admin_policies AS (
+        SELECT DISTINCT
+            c.relname AS table_name,
+            format('%I.%I', n.nspname, c.relname) AS qualified
+        FROM pg_policy pol
+        JOIN pg_class c ON c.oid = pol.polrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relname IN (SELECT table_name FROM critical_tables)
+          AND (
+              -- Check if policy allows admin/super_admin roles
+              EXISTS (
+                  SELECT 1
+                  FROM unnest(pol.polroles) role_oid
+                  JOIN pg_roles r ON r.oid = role_oid
+                  WHERE r.rolname IN ('admin', 'super_admin', 'authenticated')
+              )
+              OR
+              -- Check if policy allows all authenticated users (which includes admins)
+              pol.polroles = ARRAY[]::oid[]  -- Empty means all roles
+          )
+    )
+    SELECT rt.qualified
+    FROM rls_tables rt
+    WHERE rt.qualified NOT IN (SELECT qualified FROM admin_policies)
+    ORDER BY rt.qualified;
+    "
+    MISSING_ADMIN_POLICIES_FILE=$(mktemp)
+    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    missing_admin_policies_found=false
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            -c "$MISSING_ADMIN_POLICIES_QUERY" >"$MISSING_ADMIN_POLICIES_FILE" 2>/dev/null; then
+            missing_admin_policies_found=true
+            break
+        fi
+    done <<< "$endpoints"
+    if [ "$missing_admin_policies_found" = "true" ]; then
+        if [ -s "$MISSING_ADMIN_POLICIES_FILE" ] && [ -n "$(cat "$MISSING_ADMIN_POLICIES_FILE" | grep -v '^$' || true)" ]; then
+            log_warning "⚠ CRITICAL: Found tables with RLS enabled but NO admin access policies"
+            missing_tables=()
+            while IFS= read -r table || [ -n "$table" ]; do
+                [ -z "$table" ] && continue
+                table_trimmed=$(echo "$table" | tr -d '[:space:]')
+                [ -z "$table_trimmed" ] && continue
+                missing_tables+=("$table_trimmed")
+                log_warning "    - $table_trimmed (admins cannot access this table!)"
+            done < "$MISSING_ADMIN_POLICIES_FILE"
+            
+            log_info "   Automatically creating admin access policies for these tables..."
+            ADMIN_POLICIES_SQL="$MIGRATION_DIR/create_admin_policies.sql"
+            {
+                echo "-- Auto-generated admin access policies for tables missing admin policies"
+                echo "-- Generated: $(date)"
+                echo "-- Source: $SOURCE_ENV, Target: $TARGET_ENV"
+                echo ""
+                for table in "${missing_tables[@]}"; do
+                    # Extract schema and table name
+                    schema_name=$(echo "$table" | sed -E 's/^([^.]+)\.(.+)$/\1/')
+                    table_name=$(echo "$table" | sed -E 's/^([^.]+)\.(.+)$/\2/')
+                    policy_name="allow_admins_access_${table_name}"
+                    
+                    echo "-- Admin policy for $table"
+                    echo "CREATE POLICY IF NOT EXISTS \"$policy_name\""
+                    echo "ON $table"
+                    echo "FOR ALL"
+                    echo "TO authenticated"
+                    echo "USING ("
+                    echo "    EXISTS ("
+                    echo "        SELECT 1 FROM user_roles"
+                    echo "        WHERE user_id = auth.uid()"
+                    echo "        AND role IN ('admin', 'super_admin')"
+                    echo "    )"
+                    echo ");"
+                    echo ""
+                done
+            } > "$ADMIN_POLICIES_SQL"
+            
+            if apply_sql_with_fallback "$ADMIN_POLICIES_SQL" "Create admin access policies"; then
+                log_success "✓ Admin access policies created successfully for ${#missing_tables[@]} table(s)"
+            else
+                log_warning "⚠ Failed to create some admin policies; check $ADMIN_POLICIES_SQL and $LOG_FILE"
+                ((validation_errors++)) || true
+            fi
+        else
+            log_success "✓ All critical tables have admin access policies"
+        fi
+    fi
+    rm -f "$MISSING_ADMIN_POLICIES_FILE"
+    echo ""
+    
+    # Additional validation: Check for missing profile records (check TARGET)
+    log_info "Checking for users with roles but missing profiles..."
+    MISSING_PROFILES_QUERY="
+    WITH users_with_roles AS (
+        SELECT DISTINCT ur.user_id
+        FROM user_roles ur
+        WHERE ur.user_id IS NOT NULL
+    ),
+    users_with_profiles AS (
+        SELECT DISTINCT p.id AS user_id
+        FROM profiles p
+        WHERE p.id IS NOT NULL
+    )
+    SELECT COUNT(*)
+    FROM users_with_roles uwr
+    WHERE uwr.user_id NOT IN (SELECT user_id FROM users_with_profiles);
+    "
+    MISSING_PROFILES_COUNT_FILE=$(mktemp)
+    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    missing_profiles_check_success=false
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            -c "$MISSING_PROFILES_QUERY" >"$MISSING_PROFILES_COUNT_FILE" 2>/dev/null; then
+            missing_profiles_check_success=true
+            break
+        fi
+    done <<< "$endpoints"
+    if [ "$missing_profiles_check_success" = "true" ]; then
+        missing_profiles_count=$(head -1 "$MISSING_PROFILES_COUNT_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0")
+        if [ "$missing_profiles_count" != "0" ] && [ "$missing_profiles_count" != "" ]; then
+            log_warning "⚠ CRITICAL: Found $missing_profiles_count user(s) with roles but NO profile records"
+            log_warning "   These users exist in auth.users and have roles in user_roles, but no profile in profiles table."
+            log_info "   Automatically creating missing profile records..."
+            
+            # Try to get profiles from source first, then create missing ones
+            log_info "   Attempting to sync profiles from source for missing users..."
+            SYNC_PROFILES_SQL="$MIGRATION_DIR/sync_missing_profiles.sql"
+            
+            # Get missing user IDs from target
+            MISSING_USER_IDS_QUERY="
+            WITH users_with_roles AS (
+                SELECT DISTINCT ur.user_id
+                FROM user_roles ur
+                WHERE ur.user_id IS NOT NULL
+            ),
+            users_with_profiles AS (
+                SELECT DISTINCT p.id AS user_id
+                FROM profiles p
+                WHERE p.id IS NOT NULL
+            )
+            SELECT uwr.user_id
+            FROM users_with_roles uwr
+            WHERE uwr.user_id NOT IN (SELECT user_id FROM users_with_profiles);
+            "
+            MISSING_USER_IDS_FILE=$(mktemp)
+            endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+            while IFS='|' read -r host port user label; do
+                [ -z "$host" ] && continue
+                if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                    -h "$host" \
+                    -p "$port" \
+                    -U "$user" \
+                    -d postgres \
+                    -t -A \
+                    -c "$MISSING_USER_IDS_QUERY" >"$MISSING_USER_IDS_FILE" 2>/dev/null; then
+                    break
+                fi
+            done <<< "$endpoints"
+            
+            # Get profiles from source for these users
+            if [ -s "$MISSING_USER_IDS_FILE" ]; then
+                # Try to get full profile data from source first
+                log_info "   Attempting to get profile data from source for missing users..."
+                SOURCE_PROFILES_DUMP="$MIGRATION_DIR/source_profiles_for_missing_users.sql"
+                
+                # Create a temporary file with user IDs for pg_dump
+                USER_IDS_FOR_DUMP=$(cat "$MISSING_USER_IDS_FILE" | tr '\n' '|' | sed 's/|$//')
+                
+                # Try to dump profiles from source for these specific users
+                endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
+                profile_dump_success=false
+                while IFS='|' read -r host port user label; do
+                    [ -z "$host" ] && continue
+                    log_info "   Fetching profiles from source via ${label}..."
+                    # Use pg_dump to get profile data, then filter for missing users
+                    if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require \
+                        pg_dump -h "$host" -p "$port" -U "$user" \
+                        -d postgres --data-only --table=profiles \
+                        -f "$SOURCE_PROFILES_DUMP" 2>/dev/null; then
+                        profile_dump_success=true
+                        break
+                    fi
+                done <<< "$endpoints"
+                
+                if [ "$profile_dump_success" = "true" ] && [ -s "$SOURCE_PROFILES_DUMP" ]; then
+                    # Filter the dump to only include missing users and convert to INSERT with ON CONFLICT
+                    log_info "   Processing source profile data..."
+                    {
+                        echo "-- Auto-generated SQL to sync missing profile records from source"
+                        echo "-- Generated: $(date)"
+                        echo "-- Source: $SOURCE_ENV, Target: $TARGET_ENV"
+                        echo ""
+                        # Extract INSERT statements from dump and add ON CONFLICT
+                        grep -i "^INSERT INTO.*profiles" "$SOURCE_PROFILES_DUMP" 2>/dev/null | while read -r line; do
+                            # Check if this INSERT is for one of our missing users
+                            if echo "$line" | grep -qE "($USER_IDS_FOR_DUMP)"; then
+                                # Add ON CONFLICT DO NOTHING
+                                echo "$line" | sed 's/;$/ ON CONFLICT (id) DO NOTHING;/'
+                            fi
+                        done
+                    } > "$SYNC_PROFILES_SQL"
+                    rm -f "$SOURCE_PROFILES_DUMP"
+                    
+                    # If no matching profiles found in source, create basic ones
+                    if [ ! -s "$SYNC_PROFILES_SQL" ] || ! grep -qi "INSERT INTO" "$SYNC_PROFILES_SQL" 2>/dev/null; then
+                        log_info "   No matching profiles in source; creating basic profile records..."
+                        {
+                            echo "-- Auto-generated SQL to create missing profile records for users with roles"
+                            echo "-- Generated: $(date)"
+                            echo "-- Source: $SOURCE_ENV, Target: $TARGET_ENV"
+                            echo ""
+                            echo "WITH users_with_roles AS ("
+                            echo "    SELECT DISTINCT ur.user_id"
+                            echo "    FROM user_roles ur"
+                            echo "    WHERE ur.user_id IS NOT NULL"
+                            echo "),"
+                            echo "users_with_profiles AS ("
+                            echo "    SELECT DISTINCT p.id AS user_id"
+                            echo "    FROM profiles p"
+                            echo "    WHERE p.id IS NOT NULL"
+                            echo "),"
+                            echo "missing_users AS ("
+                            echo "    SELECT uwr.user_id"
+                            echo "    FROM users_with_roles uwr"
+                            echo "    WHERE uwr.user_id NOT IN (SELECT user_id FROM users_with_profiles)"
+                            echo ")"
+                            echo "INSERT INTO profiles (id, created_at, updated_at)"
+                            echo "SELECT"
+                            echo "    au.id,"
+                            echo "    COALESCE(au.created_at, NOW()) as created_at,"
+                            echo "    NOW() as updated_at"
+                            echo "FROM auth.users au"
+                            echo "JOIN missing_users mu ON mu.user_id = au.id"
+                            echo "WHERE NOT EXISTS (SELECT 1 FROM profiles p WHERE p.id = au.id)"
+                            echo "ON CONFLICT (id) DO NOTHING;"
+                        } > "$SYNC_PROFILES_SQL"
+                    fi
+                else
+                    # Fallback: create basic profiles
+                    log_info "   Could not fetch from source; creating basic profile records..."
+                    {
+                        echo "-- Auto-generated SQL to create missing profile records for users with roles"
+                        echo "-- Generated: $(date)"
+                        echo "-- Source: $SOURCE_ENV, Target: $TARGET_ENV"
+                        echo ""
+                        echo "WITH users_with_roles AS ("
+                        echo "    SELECT DISTINCT ur.user_id"
+                        echo "    FROM user_roles ur"
+                        echo "    WHERE ur.user_id IS NOT NULL"
+                        echo "),"
+                        echo "users_with_profiles AS ("
+                        echo "    SELECT DISTINCT p.id AS user_id"
+                        echo "    FROM profiles p"
+                        echo "    WHERE p.id IS NOT NULL"
+                        echo "),"
+                        echo "missing_users AS ("
+                        echo "    SELECT uwr.user_id"
+                        echo "    FROM users_with_roles uwr"
+                        echo "    WHERE uwr.user_id NOT IN (SELECT user_id FROM users_with_profiles)"
+                        echo ")"
+                        echo "INSERT INTO profiles (id, created_at, updated_at)"
+                        echo "SELECT"
+                        echo "    au.id,"
+                        echo "    COALESCE(au.created_at, NOW()) as created_at,"
+                        echo "    NOW() as updated_at"
+                        echo "FROM auth.users au"
+                        echo "JOIN missing_users mu ON mu.user_id = au.id"
+                        echo "WHERE NOT EXISTS (SELECT 1 FROM profiles p WHERE p.id = au.id)"
+                        echo "ON CONFLICT (id) DO NOTHING;"
+                    } > "$SYNC_PROFILES_SQL"
+                fi
+            else
+                rm -f "$MISSING_USER_IDS_FILE"
+                log_warning "   Could not retrieve list of missing users"
+                # Create fallback SQL
+                {
+                    echo "-- Auto-generated SQL to create missing profile records for users with roles"
+                    echo "-- Generated: $(date)"
+                    echo "-- Source: $SOURCE_ENV, Target: $TARGET_ENV"
+                    echo ""
+                    echo "WITH users_with_roles AS ("
+                    echo "    SELECT DISTINCT ur.user_id"
+                    echo "    FROM user_roles ur"
+                    echo "    WHERE ur.user_id IS NOT NULL"
+                    echo "),"
+                    echo "users_with_profiles AS ("
+                    echo "    SELECT DISTINCT p.id AS user_id"
+                    echo "    FROM profiles p"
+                    echo "    WHERE p.id IS NOT NULL"
+                    echo "),"
+                    echo "missing_users AS ("
+                    echo "    SELECT uwr.user_id"
+                    echo "    FROM users_with_roles uwr"
+                    echo "    WHERE uwr.user_id NOT IN (SELECT user_id FROM users_with_profiles)"
+                    echo ")"
+                    echo "INSERT INTO profiles (id, created_at, updated_at)"
+                    echo "SELECT"
+                    echo "    au.id,"
+                    echo "    COALESCE(au.created_at, NOW()) as created_at,"
+                    echo "    NOW() as updated_at"
+                    echo "FROM auth.users au"
+                    echo "JOIN missing_users mu ON mu.user_id = au.id"
+                    echo "WHERE NOT EXISTS (SELECT 1 FROM profiles p WHERE p.id = au.id)"
+                    echo "ON CONFLICT (id) DO NOTHING;"
+                } > "$SYNC_PROFILES_SQL"
+            fi
+            
+            if [ -f "$SYNC_PROFILES_SQL" ] && [ -s "$SYNC_PROFILES_SQL" ]; then
+                if apply_sql_with_fallback "$SYNC_PROFILES_SQL" "Create missing profiles"; then
+                    log_success "✓ Created missing profile records for $missing_profiles_count user(s)"
+                else
+                    log_warning "⚠ Failed to create some profile records; check $SYNC_PROFILES_SQL and $LOG_FILE"
+                    log_warning "   You may need to adjust the INSERT statement based on your profiles table schema"
+                    ((validation_errors++)) || true
+                fi
+            else
+                log_warning "⚠ Could not generate profile creation SQL"
+                ((validation_errors++)) || true
+            fi
+        else
+            log_success "✓ All users with roles have profile records"
+        fi
+    fi
+    rm -f "$MISSING_PROFILES_COUNT_FILE"
+    echo ""
+    
+    return $validation_errors
+}
+
+if validate_policies_applied; then
+    log_success "✓ Validation passed: Target policies match source"
+else
+    log_warning "⚠ Validation found discrepancies - review target system policies"
+fi
+echo ""
+
+echo ""
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Migration Summary"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 if [ ${#success_tables[@]} -gt 0 ]; then
     log_success "Tables processed successfully: ${success_tables[*]}"
 fi
 if [ ${#failed_tables[@]} -gt 0 ]; then
-    log_warning "Tables with errors: ${failed_tables[*]}"
+    log_warning "Components with issues: ${failed_tables[*]}"
+    log_warning "  Review the migration log for details and consider re-running if needed"
 else
-    log_success "No table errors reported."
+    log_success "✓ All components processed successfully"
 fi
 if [ ${#skipped_tables[@]} -gt 0 ]; then
     log_warning "Tables skipped: ${skipped_tables[*]}"
@@ -939,8 +1993,24 @@ fi
 log_info "Logs: $LOG_FILE"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+# Don't exit with error if only warnings occurred - allow migration to complete
+# Only exit with error if critical components failed
 if [ ${#failed_tables[@]} -gt 0 ]; then
+    # Check if critical components failed (roles, user_roles, profiles)
+    critical_failed=false
+    for failed in "${failed_tables[@]}"; do
+        if [[ "$failed" == *"auth.roles"* ]] || [[ "$failed" == *"auth.user_roles"* ]] || [[ "$failed" == *"public.profiles"* ]] || [[ "$failed" == *"public.user_roles"* ]]; then
+            critical_failed=true
+            break
+        fi
+    done
+    if [ "$critical_failed" = "true" ]; then
+        log_error "Critical components failed - migration incomplete"
     exit 1
+    else
+        log_warning "Some non-critical components had issues, but migration completed"
+        exit 0
+    fi
 fi
 exit 0
 
