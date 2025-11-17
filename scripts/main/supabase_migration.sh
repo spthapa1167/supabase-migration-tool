@@ -31,6 +31,7 @@ BACKUP_TARGET=false
 INCLUDE_DATA=false   # Default: false  - don't migrate database row data by default
 INCLUDE_FILES=false  # Default: false  - don't migrate bucket files by default
 INCLUDE_USERS=false  # Default: false  - don't migrate auth.users / identities unless --users is specified
+INCLUDE_SECRETS=false # Default: false - don't migrate secrets unless --secret is specified
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
 INCREMENTAL_MODE=false     # Default: false - full sync for data unless --increment is provided
 
@@ -67,6 +68,7 @@ Options:
   --replace-data          With --data, REPLACE all target table data with source data (destructive). Without this flag, data sync runs in delta/append mode.
   --users                 Include authentication users/identities migration (default: disabled; auth users are NOT copied unless this is set)
   --files                 Include storage bucket files migration (default: disabled)
+  --secret                Include secrets migration (default: disabled; secrets are NOT migrated unless this is set)
   --env-file <file>       Environment file (default: .env.local)
   --dry-run               Preview migration without executing
   --backup                Create backup before migration
@@ -80,19 +82,20 @@ Options:
   -h, --help              Show this help message
 
 Default Behavior:
-  By default, the main migration runs a COMPLETE SCHEMA + POLICY sync, but does NOT copy table data, files, or auth users:
+  By default, the main migration runs a COMPLETE SCHEMA + POLICY sync, but does NOT copy table data, files, auth users, or secrets:
   - Database: Schema only (tables, indexes, constraints, functions, RLS policies, etc.)
   - Auth: auth schema (structure) only; auth users/identities are NOT copied unless --users is provided
   - Policies & Roles: roles, user_roles, and RLS policies are synchronized to match source
   - Storage: Bucket configurations only (no files)
   - Edge Functions: Migrated
-  - Secrets: Keys synchronized incrementally (no existing values overwritten; new keys added only)
+  - Secrets: NOT migrated by default (use --secret to add new secret keys incrementally)
 
   Use --data to include database row migration.
   Use --data --increment for incremental/delta data sync (append / upsert semantics where possible).
   Use --data --replace-data for a full data REPLACE (target table data is truncated/replaced by source).
   Use --files to include storage bucket file migration.
   Use --users to copy auth users/identities so login state matches source.
+  Use --secret to migrate secrets (adds new secret keys incrementally; existing values are never overwritten).
   Use --full for an all-in-one migration (schema + data + users + files).
 
 Examples:
@@ -180,6 +183,10 @@ parse_args() {
                 ;;
             --files)
                 INCLUDE_FILES=true
+                shift
+                ;;
+            --secret|--secrets)
+                INCLUDE_SECRETS=true
                 shift
                 ;;
             --env-file)
@@ -1261,8 +1268,9 @@ perform_migration() {
         echo "  Include Data: $INCLUDE_DATA"
         echo "  Include Users: $INCLUDE_USERS"
         echo "  Include Files: $INCLUDE_FILES"
+        echo "  Include Secrets: $INCLUDE_SECRETS"
         echo "  Backup: ${BACKUP_TARGET:-false}"
-        echo "  Components: All (database, storage, edge functions, secrets)"
+        echo "  Components: All (database, storage, edge functions, policies/RLS$([ "$INCLUDE_SECRETS" = "true" ] && echo ", secrets" || echo ""))"
         echo ""
         echo "Migration directory: $migration_dir"
         echo ""
@@ -1433,28 +1441,33 @@ perform_migration() {
         fi
     fi
     
-    # Step 4: Migrate secrets
-    log_info "Migrating secrets..."
-    # Call secrets_migration.sh component script
-    local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target" "$migration_dir")
-    if [ "$INCREMENTAL_MODE" = "true" ]; then
-        secrets_migration_cmd+=("--increment")
-    fi
-    if [ "$AUTO_CONFIRM" = "true" ]; then
-        secrets_migration_cmd+=("--auto-confirm")
-    fi
-    if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
-        log_warning "Secrets migration skipped by user."
-        SKIPPED_COMPONENTS+=("secrets")
-    else
-        if "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-            log_success "Secrets migrated successfully (structure created - values need manual update)"
-            SUCCEEDED_COMPONENTS+=("secrets")
-        else
-            log_warning "Secrets migration had errors, continuing..."
-            FAILED_COMPONENTS+=("secrets")
-            exit_code=1
+    # Step 4: Migrate secrets (only if --secret flag is provided)
+    if [ "$INCLUDE_SECRETS" = "true" ]; then
+        log_info "Migrating secrets..."
+        # Call secrets_migration.sh component script
+        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target" "$migration_dir")
+        if [ "$INCREMENTAL_MODE" = "true" ]; then
+            secrets_migration_cmd+=("--increment")
         fi
+        if [ "$AUTO_CONFIRM" = "true" ]; then
+            secrets_migration_cmd+=("--auto-confirm")
+        fi
+        if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
+            log_warning "Secrets migration skipped by user."
+            SKIPPED_COMPONENTS+=("secrets")
+        else
+            if "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                log_success "Secrets migrated successfully (structure created - values need manual update)"
+                SUCCEEDED_COMPONENTS+=("secrets")
+            else
+                log_warning "Secrets migration had errors, continuing..."
+                FAILED_COMPONENTS+=("secrets")
+                exit_code=1
+            fi
+        fi
+    else
+        log_info "Secrets migration skipped (use --secret to migrate secrets)"
+        SKIPPED_COMPONENTS+=("secrets")
     fi
 
     # Step 5: Migrate policies / roles / RLS (profiles, user_roles, etc.)
@@ -1688,9 +1701,9 @@ perform_migration() {
             generate_result_html "$actual_migration_dir" "❌ Failed" "$comparison_data_file" "$error_details" 2>&1 | tee -a "$actual_migration_dir/migration.log" 2>/dev/null || log_warning "HTML result generation had issues"
         fi
         
-        log_error "Migration failed: $actual_migration_dir"
+        log_warning "Migration completed with issues: $actual_migration_dir"
         log_info "Result files: $actual_migration_dir/result.md and $actual_migration_dir/result.html"
-        log_info "Check $actual_migration_dir/migration.log for detailed error information"
+        log_info "Check $actual_migration_dir/migration.log for detailed information"
         return $migration_exit_code
     fi
     
@@ -1865,9 +1878,9 @@ main() {
         exit 0
     else
         migration_success=false
-        log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        log_error "  MIGRATION FAILED"
-        log_error "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log_warning "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        log_warning "  MIGRATION COMPLETED WITH ISSUES"
+        log_warning "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         
         # Extract error details from log
         local error_details=""

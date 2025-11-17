@@ -150,6 +150,7 @@ let filterList = [];
 let filterFilePath = null;
 let allowPartialFilter = false;
 let incrementalMode = false;
+let replaceMode = false;
 
 for (const rawArg of additionalArgs) {
     if (!rawArg) continue;
@@ -163,6 +164,8 @@ for (const rawArg of additionalArgs) {
         allowPartialFilter = true;
     } else if (rawArg === '--incremental' || rawArg === '--increment') {
         incrementalMode = true;
+    } else if (rawArg === '--replace') {
+        replaceMode = true;
     } else if (rawArg.trim().length > 0) {
         logWarning(`Unknown argument ignored: ${rawArg}`);
     }
@@ -680,6 +683,46 @@ function getAllCodeFiles(dir, baseDir = dir, fileList = []) {
     }
 }
 
+// Delete edge function using Supabase CLI
+function deleteEdgeFunction(functionName, targetRef, dbPassword) {
+    const originalCwd = process.cwd();
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-delete-${functionName}-`));
+    
+    try {
+        const supabaseDir = path.join(tempDir, 'supabase');
+        fs.mkdirSync(supabaseDir, { recursive: true });
+        fs.writeFileSync(path.join(supabaseDir, 'config.toml'), `project_id = "${targetRef}"\n`);
+        
+        process.chdir(tempDir);
+        
+        // Link to target project
+        if (!linkProject(targetRef, dbPassword)) {
+            throw new Error('Failed to link to target project');
+        }
+        
+        // Delete function (project is already linked)
+        execSync(`supabase functions delete ${functionName}`, {
+            stdio: 'pipe',
+            timeout: 60000
+        });
+        
+        process.chdir(originalCwd);
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        
+        return true;
+    } catch (error) {
+        process.chdir(originalCwd);
+        if (fs.existsSync(tempDir)) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        }
+        // If function doesn't exist, that's okay - it's already deleted
+        if (error.message && error.message.includes('not found')) {
+            return true;
+        }
+        throw error;
+    }
+}
+
 // Deploy edge function using Supabase CLI
 function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
     try {
@@ -842,10 +885,56 @@ async function migrateEdgeFunctions() {
     const targetFunctionMap = new Map(targetFunctions.map(f => [f.name, f]));
     console.log('');
     
+    // Step 2.5: If replace mode, delete all target functions first
+    if (replaceMode && targetFunctions.length > 0) {
+        logSeparator();
+        logWarning(`${colors.bright}REPLACE MODE: Deleting all target edge functions${colors.reset}`);
+        logSeparator();
+        logWarning(`  This will delete ${targetFunctions.length} function(s) from target before redeploying from source.`);
+        console.log('');
+        
+        const deletedFunctions = [];
+        const deleteFailedFunctions = [];
+        
+        for (const targetFunction of targetFunctions) {
+            const functionName = targetFunction.name;
+            if (!functionName) continue;
+            
+            logInfo(`Deleting function: ${functionName}...`);
+            try {
+                if (deleteEdgeFunction(functionName, TARGET_REF, targetConfig.dbPassword)) {
+                    logSuccess(`  ✓ Deleted function: ${functionName}`);
+                    deletedFunctions.push(functionName);
+                } else {
+                    logWarning(`  ⚠ Failed to delete function: ${functionName}`);
+                    deleteFailedFunctions.push(functionName);
+                }
+            } catch (error) {
+                logWarning(`  ⚠ Error deleting function ${functionName}: ${error.message}`);
+                deleteFailedFunctions.push(functionName);
+            }
+        }
+        
+        console.log('');
+        if (deletedFunctions.length > 0) {
+            logSuccess(`Deleted ${deletedFunctions.length} function(s) from target.`);
+        }
+        if (deleteFailedFunctions.length > 0) {
+            logWarning(`${deleteFailedFunctions.length} function(s) could not be deleted (may not exist): ${deleteFailedFunctions.join(', ')}`);
+        }
+        console.log('');
+        
+        // Clear target function map since we're replacing everything
+        targetFunctionMap.clear();
+    }
+    
     // Step 3: Smart migration - compare functions
     logSeparator();
     logInfo(`${colors.bright}Starting Edge Functions Migration${colors.reset}`);
     logSeparator();
+    if (replaceMode) {
+        logInfo(`${colors.yellow}Replace mode: All source functions will be deployed (target was cleared)${colors.reset}`);
+    }
     console.log('');
     
     let migratedCount = 0;
@@ -861,8 +950,8 @@ async function migrateEdgeFunctions() {
     // Step 4: Smart migration - compare functions and deploy only what's needed
     logInfo(`Function comparison:`);
     logInfo(`  Source: ${sourceFunctions.length} function(s)`);
-    logInfo(`  Target: ${targetFunctions.length} function(s)`);
-    logInfo(`  Incremental mode: ${incrementalMode ? 'enabled' : 'disabled (will redeploy existing functions)'}`);
+    logInfo(`  Target: ${targetFunctions.length} function(s)${replaceMode ? ' (cleared in replace mode)' : ''}`);
+    logInfo(`  Mode: ${replaceMode ? 'REPLACE (all functions will be redeployed)' : incrementalMode ? 'incremental (skip identical)' : 'standard (redeploy existing)'}`);
     console.log('');
     
     // Determine which functions need migration
@@ -870,14 +959,14 @@ async function migrateEdgeFunctions() {
     
     for (const sourceFunction of sourceFunctions) {
         const functionName = sourceFunction.name;
-        const existingFunction = targetFunctionMap.get(functionName);
+        const existingFunction = replaceMode ? null : targetFunctionMap.get(functionName);
         
         if (!functionName) {
             failedFunctions.push('(unnamed)');
             continue;
         }
         
-        if (existingFunction) {
+        if (existingFunction && !replaceMode) {
             const sourceVersion = typeof sourceFunction.version === 'number' ? sourceFunction.version : Number(sourceFunction.version);
             const targetVersion = typeof existingFunction.version === 'number' ? existingFunction.version : Number(existingFunction.version);
             const versionMatches = Number.isFinite(sourceVersion) && Number.isFinite(targetVersion) && sourceVersion === targetVersion;
@@ -902,7 +991,7 @@ async function migrateEdgeFunctions() {
                 updatedMatches
             });
         } else {
-            // New function - needs deployment
+            // New function (or replace mode - treat all as new)
             functionsToMigrate.push({ function: sourceFunction, isNew: true });
         }
     }
@@ -976,8 +1065,8 @@ async function migrateEdgeFunctions() {
             
             logSuccess(`  ✓ Downloaded function: ${functionName}`);
             
-            // For existing functions, compare with target before deploying
-            if (!isNew) {
+            // For existing functions, compare with target before deploying (skip comparison in replace mode)
+            if (!isNew && !replaceMode) {
                 logInfo(`  Comparing with target function...`);
                 
                 // Download target function for comparison (quiet mode to reduce noise)
