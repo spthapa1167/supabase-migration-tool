@@ -1201,15 +1201,42 @@ fi
             if run_source_sql_to_file "$RLS_NO_POLICIES_QUERY" "$RLS_NO_POLICIES_FILE"; then
                 if [ -s "$RLS_NO_POLICIES_FILE" ] && [ -n "$(cat "$RLS_NO_POLICIES_FILE" | grep -v '^$' || true)" ]; then
                     log_warning "⚠ CRITICAL: Found tables with RLS enabled but NO policies:"
+                    tables_without_policies=()
                     while IFS= read -r table || [ -n "$table" ]; do
                         [ -z "$table" ] && continue
                         table_trimmed=$(echo "$table" | tr -d '[:space:]')
                         [ -z "$table_trimmed" ] && continue
+                        tables_without_policies+=("$table_trimmed")
                         log_warning "    - $table_trimmed (RLS enabled but no policies - will block all access!)"
                     done < "$RLS_NO_POLICIES_FILE"
-                    log_warning "   These tables will have RLS enabled in target but no policies."
-                    log_warning "   You MUST create policies for these tables manually or they will be inaccessible."
-                    log_warning "   Example: CREATE POLICY \"Allow read\" ON table_name FOR SELECT TO authenticated USING (true);"
+                    
+                    log_info "   Automatically creating basic SELECT policies for these tables..."
+                    BASIC_POLICIES_SQL="$MIGRATION_DIR/create_basic_policies_for_no_policy_tables.sql"
+                    {
+                        echo "-- Auto-generated basic policies for tables with RLS enabled but no policies"
+                        echo "-- Generated: $(date)"
+                        echo "-- Source: $SOURCE_ENV, Target: $TARGET_ENV"
+                        echo ""
+                        for table in "${tables_without_policies[@]}"; do
+                            table_name_clean=$(echo "$table" | sed -E 's/^[^.]+\.(.+)$/\1/')
+                            policy_name="allow_authenticated_select_${table_name_clean}"
+                            
+                            echo "-- Basic SELECT policy for $table"
+                            echo "DROP POLICY IF EXISTS \"$policy_name\" ON $table;"
+                            echo "CREATE POLICY \"$policy_name\""
+                            echo "ON $table"
+                            echo "FOR SELECT"
+                            echo "TO authenticated"
+                            echo "USING (true);"
+                            echo ""
+                        done
+                    } > "$BASIC_POLICIES_SQL"
+                    
+                    if apply_sql_with_fallback "$BASIC_POLICIES_SQL" "Create basic policies for tables without policies"; then
+                        log_success "✓ Created basic SELECT policies for ${#tables_without_policies[@]} table(s)"
+                    else
+                        log_warning "⚠ Failed to create some basic policies; check $BASIC_POLICIES_SQL and $LOG_FILE"
+                    fi
                 else
                     log_success "✓ All RLS-enabled tables have policies"
                 fi
@@ -1230,12 +1257,85 @@ fi
             if run_source_sql_to_file "$SOURCE_POLICY_COUNT_QUERY" "$SOURCE_POLICY_COUNT_FILE"; then
                 source_policy_count=$(head -1 "$SOURCE_POLICY_COUNT_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0")
                 log_info "  Source has $source_policy_count total policy(ies) on RLS-enabled tables"
-                if [ "$rls_policy_count" -lt "$source_policy_count" ]; then
-                    log_warning "⚠ Generated SQL has fewer policies ($rls_policy_count) than source ($source_policy_count)"
-                    log_warning "   Some policies may not have been exported correctly"
+                
+                # Count CREATE POLICY statements in generated SQL
+                create_policy_count=$(grep -c "^CREATE POLICY" "$RLS_SQL" 2>/dev/null || echo "0")
+                log_info "  Generated SQL contains $create_policy_count CREATE POLICY statement(s)"
+                
+                if [ "$create_policy_count" -lt "$source_policy_count" ]; then
+                    log_warning "⚠ Generated SQL has fewer CREATE POLICY statements ($create_policy_count) than source policies ($source_policy_count)"
+                    log_warning "   Missing $((source_policy_count - create_policy_count)) policy(ies) in generated SQL"
+                    log_warning "   This may indicate an issue with policy export from source"
+                    
+                    # List policies that might be missing
+                    log_info "   Checking which policies might be missing from generated SQL..."
+                    SOURCE_POLICY_NAMES_QUERY="
+                    SELECT 
+                        format('%I.%I', n.nspname, c.relname) || '.' || pol.polname AS policy_full_name
+                    FROM pg_policy pol
+                    JOIN pg_class c ON c.oid = pol.polrelid
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname IN ('public', 'auth')
+                      AND c.relrowsecurity = true
+                    ORDER BY format('%I.%I', n.nspname, c.relname), pol.polname;
+                    "
+                    SOURCE_POLICY_NAMES_FILE=$(mktemp)
+                    if run_source_sql_to_file "$SOURCE_POLICY_NAMES_QUERY" "$SOURCE_POLICY_NAMES_FILE"; then
+                        missing_in_sql=0
+                        while IFS= read -r policy_full_name || [ -n "$policy_full_name" ]; do
+                            [ -z "$policy_full_name" ] && continue
+                            policy_name=$(echo "$policy_full_name" | sed -E 's/^[^.]+\.[^.]+\.(.+)$/\1/')
+                            if ! grep -q "CREATE POLICY.*$policy_name" "$RLS_SQL" 2>/dev/null; then
+                                if [ "$missing_in_sql" -eq 0 ]; then
+                                    log_warning "   Policies not found in generated SQL:"
+                                fi
+                                missing_in_sql=$((missing_in_sql + 1))
+                                if [ "$missing_in_sql" -le 10 ]; then
+                                    log_warning "     - $policy_full_name"
+                                fi
+                            fi
+                        done < "$SOURCE_POLICY_NAMES_FILE"
+                        if [ "$missing_in_sql" -gt 10 ]; then
+                            log_warning "     ... and $((missing_in_sql - 10)) more"
+                        fi
+                        if [ "$missing_in_sql" -gt 0 ]; then
+                            log_warning "   Total: $missing_in_sql policy(ies) missing from generated SQL"
+                        fi
+                    fi
+                    rm -f "$SOURCE_POLICY_NAMES_FILE"
+                else
+                    log_success "✓ Generated SQL contains all source policies"
                 fi
             fi
             rm -f "$SOURCE_POLICY_COUNT_FILE"
+            
+            # Verify policy count BEFORE application
+            log_info "Verifying policy count before application..."
+            TARGET_POLICY_COUNT_BEFORE_QUERY="
+            SELECT COUNT(*)
+            FROM pg_policy pol
+            JOIN pg_class c ON pol.polrelid = c.oid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname IN ('public', 'auth')
+              AND c.relrowsecurity = true;
+            "
+            TARGET_POLICY_COUNT_BEFORE_FILE=$(mktemp)
+            endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+            target_before_count="0"
+            while IFS='|' read -r host port user label; do
+                [ -z "$host" ] && continue
+                if target_before_count=$(PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                    -h "$host" \
+                    -p "$port" \
+                    -U "$user" \
+                    -d postgres \
+                    -t -A \
+                    -c "$TARGET_POLICY_COUNT_BEFORE_QUERY" 2>/dev/null | tr -d '[:space:]'); then
+                    break
+                fi
+            done <<< "$endpoints"
+            rm -f "$TARGET_POLICY_COUNT_BEFORE_FILE"
+            log_info "  Target has $target_before_count policy(ies) before migration"
             
             # Apply policies individually to catch and report failures
             log_info "Applying policies individually to identify any failures..."
@@ -1275,10 +1375,111 @@ fi
                         missing_count=$((source_policy_count - target_after_count))
                         log_warning "⚠ Policy count mismatch after application: Expected ~$source_policy_count, got $target_after_count"
                         log_warning "   Missing $missing_count policy(ies) - some policies failed to apply"
+                        
+                        # Generate detailed missing policies report
+                        log_info "   Generating detailed missing policies report..."
+                        SOURCE_POLICIES_DETAILED_QUERY="
+                        SELECT 
+                            format('%I.%I', n.nspname, c.relname) AS table_qualified,
+                            c.relname AS table_name,
+                            pol.polname AS policy_name,
+                            CASE pol.polcmd
+                                WHEN 'r' THEN 'SELECT'
+                                WHEN 'a' THEN 'INSERT'
+                                WHEN 'w' THEN 'UPDATE'
+                                WHEN 'd' THEN 'DELETE'
+                                WHEN '' THEN 'ALL'
+                                ELSE 'UNKNOWN'
+                            END AS policy_command,
+                            pol.polname || '|' || format('%I.%I', n.nspname, c.relname) AS policy_identifier
+                        FROM pg_policy pol
+                        JOIN pg_class c ON c.oid = pol.polrelid
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname IN ('public', 'auth')
+                          AND c.relrowsecurity = true
+                        ORDER BY format('%I.%I', n.nspname, c.relname), pol.polname;
+                        "
+                        MISSING_POLICIES_DETAILED_FILE="$MIGRATION_DIR/missing_policies_detailed.txt"
+                        source_policies_list_file=$(mktemp)
+                        if run_source_sql_to_file "$SOURCE_POLICIES_DETAILED_QUERY" "$source_policies_list_file"; then
+                            # Get target policies for comparison
+                            TARGET_POLICIES_LIST_QUERY="
+                            SELECT 
+                                pol.polname || '|' || format('%I.%I', n.nspname, c.relname) AS policy_identifier
+                            FROM pg_policy pol
+                            JOIN pg_class c ON c.oid = pol.polrelid
+                            JOIN pg_namespace n ON n.oid = c.relnamespace
+                            WHERE n.nspname IN ('public', 'auth')
+                              AND c.relrowsecurity = true;
+                            "
+                            target_policies_list_file=$(mktemp)
+                            endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                            while IFS='|' read -r host port user label; do
+                                [ -z "$host" ] && continue
+                                if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                                    -h "$host" \
+                                    -p "$port" \
+                                    -U "$user" \
+                                    -d postgres \
+                                    -t -A \
+                                    -c "$TARGET_POLICIES_LIST_QUERY" >"$target_policies_list_file" 2>/dev/null; then
+                                    break
+                                fi
+                            done <<< "$endpoints"
+                            
+                            # Compare and generate report
+                            if [ -s "$source_policies_list_file" ]; then
+                                {
+                                    echo "Missing Policies Detailed Report"
+                                    echo "=============================="
+                                    echo "Date: $(date)"
+                                    echo "Source: $SOURCE_ENV ($SOURCE_REF)"
+                                    echo "Target: $TARGET_ENV ($TARGET_REF)"
+                                    echo ""
+                                    echo "Source Policy Count: $source_policy_count"
+                                    echo "Target Policy Count (before): $target_before_count"
+                                    echo "Target Policy Count (after): $target_after_count"
+                                    echo "Missing Policies: $missing_count"
+                                    echo ""
+                                    echo "Missing Policies by Table:"
+                                    echo "--------------------------"
+                                
+                                    # Read target policies into associative array (if supported) or use grep
+                                    missing_found=0
+                                    current_table=""
+                                    while IFS='|' read -r table_qualified table_name policy_name policy_command policy_identifier || [ -n "$table_qualified" ]; do
+                                        [ -z "$table_qualified" ] && continue
+                                        # Check if this policy exists in target
+                                        if ! grep -qF "$policy_identifier" "$target_policies_list_file" 2>/dev/null; then
+                                            missing_found=$((missing_found + 1))
+                                            if [ "$table_qualified" != "$current_table" ]; then
+                                                current_table="$table_qualified"
+                                                echo ""
+                                                echo "Table: $table_qualified"
+                                            fi
+                                            echo "  - Policy: $policy_name ($policy_command)"
+                                        fi
+                                    done < "$source_policies_list_file"
+                                
+                                    if [ "$missing_found" -eq 0 ]; then
+                                        echo ""
+                                        echo "No missing policies found (count mismatch may be due to duplicate policies or counting differences)"
+                                    fi
+                                
+                                    echo ""
+                                    echo "These policies exist in source but are missing in target."
+                                    echo "Check $LOG_FILE for detailed error messages during policy application."
+                                } > "$MISSING_POLICIES_DETAILED_FILE"
+                                log_info "   Detailed missing policies report: $MISSING_POLICIES_DETAILED_FILE"
+                            fi
+                            rm -f "$source_policies_list_file" "$target_policies_list_file"
+                        fi
+                        
                         log_warning "   Check $LOG_FILE for detailed error messages"
                         if [ ${#FAILED_POLICIES_ARRAY[@]} -gt 0 ]; then
                             log_warning "   Failed policies report: $MIGRATION_DIR/failed_policies_report.txt"
                         fi
+                        log_warning "   Missing policies report: $MISSING_POLICIES_DETAILED_FILE"
                         log_warning "   Common causes:"
                         log_warning "     - Missing functions referenced in policy expressions"
                         log_warning "     - Missing roles referenced in policy TO clauses"
@@ -1293,6 +1494,87 @@ fi
             else
                 log_warning "⚠ RLS policy application had issues; inspect $RLS_SQL and $LOG_FILE"
                 failed_tables+=("RLS policies")
+                
+                # Try to identify what went wrong
+                if [ ${#FAILED_POLICIES_ARRAY[@]} -gt 0 ]; then
+                    log_warning "   ${#FAILED_POLICIES_ARRAY[@]} policy(ies) failed to apply"
+                    log_warning "   Check $MIGRATION_DIR/failed_policies_report.txt for details"
+                fi
+            fi
+            
+            # Final comprehensive check: Compare source and target policies
+            log_info ""
+            log_info "Performing final comprehensive policy comparison..."
+            FINAL_COMPARISON_QUERY="
+            SELECT 
+                format('%I.%I', n.nspname, c.relname) AS table_name,
+                COUNT(*) AS policy_count
+            FROM pg_policy pol
+            JOIN pg_class c ON c.oid = pol.polrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname IN ('public', 'auth')
+              AND c.relrowsecurity = true
+            GROUP BY format('%I.%I', n.nspname, c.relname)
+            ORDER BY format('%I.%I', n.nspname, c.relname);
+            "
+            
+            # Get source policy counts by table
+            SOURCE_POLICIES_BY_TABLE_FILE=$(mktemp)
+            if run_source_sql_to_file "$FINAL_COMPARISON_QUERY" "$SOURCE_POLICIES_BY_TABLE_FILE"; then
+                # Get target policy counts by table
+                TARGET_POLICIES_BY_TABLE_FILE=$(mktemp)
+                endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                while IFS='|' read -r host port user label; do
+                    [ -z "$host" ] && continue
+                    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                        -h "$host" \
+                        -p "$port" \
+                        -U "$user" \
+                        -d postgres \
+                        -t -A \
+                        -c "$FINAL_COMPARISON_QUERY" >"$TARGET_POLICIES_BY_TABLE_FILE" 2>/dev/null; then
+                        break
+                    fi
+                done <<< "$endpoints"
+                
+                # Compare and report
+                if [ -s "$SOURCE_POLICIES_BY_TABLE_FILE" ] && [ -s "$TARGET_POLICIES_BY_TABLE_FILE" ]; then
+                    tables_with_missing=0
+                    while IFS='|' read -r source_table source_count || [ -n "$source_table" ]; do
+                        [ -z "$source_table" ] && continue
+                        source_table_clean=$(echo "$source_table" | tr -d '[:space:]')
+                        source_count_clean=$(echo "$source_count" | tr -d '[:space:]')
+                        [ -z "$source_table_clean" ] && continue
+                        
+                        # Find matching target count
+                        target_count_clean="0"
+                        while IFS='|' read -r target_table target_count || [ -n "$target_table" ]; do
+                            [ -z "$target_table" ] && continue
+                            target_table_clean=$(echo "$target_table" | tr -d '[:space:]')
+                            if [ "$target_table_clean" = "$source_table_clean" ]; then
+                                target_count_clean=$(echo "$target_count" | tr -d '[:space:]')
+                                break
+                            fi
+                        done < "$TARGET_POLICIES_BY_TABLE_FILE"
+                        
+                        if [ "$target_count_clean" -lt "$source_count_clean" ]; then
+                            if [ "$tables_with_missing" -eq 0 ]; then
+                                log_warning "⚠ Tables with missing policies:"
+                            fi
+                            tables_with_missing=$((tables_with_missing + 1))
+                            missing_policies=$((source_count_clean - target_count_clean))
+                            log_warning "   - $source_table_clean: Source has $source_count_clean, Target has $target_count_clean (missing $missing_policies)"
+                        fi
+                    done < "$SOURCE_POLICIES_BY_TABLE_FILE"
+                    
+                    if [ "$tables_with_missing" -eq 0 ]; then
+                        log_success "✓ All tables have matching policy counts between source and target"
+                    else
+                        log_warning "⚠ Found $tables_with_missing table(s) with missing policies"
+                        log_warning "   Review $MISSING_POLICIES_DETAILED_FILE for detailed list"
+                    fi
+                fi
+                rm -f "$SOURCE_POLICIES_BY_TABLE_FILE" "$TARGET_POLICIES_BY_TABLE_FILE"
             fi
         else
             log_warning "No RLS policies detected - this may indicate an issue if source has RLS enabled tables"
@@ -1608,13 +1890,14 @@ validate_policies_applied() {
     
     rm -f "$temp_file"
     
-    # Additional validation: Check for missing admin RLS policies on critical tables (check TARGET)
-    log_info "Checking for missing admin RLS policies on critical tables..."
-    MISSING_ADMIN_POLICIES_QUERY="
-    WITH critical_tables AS (
-        SELECT unnest(ARRAY['profiles', 'user_roles', 'system_settings', 'setting_categories']) AS table_name
-    ),
-    rls_tables AS (
+    # Additional validation: Check for missing admin/CSR SELECT policies on ALL RLS-enabled tables
+    # First check SOURCE to see what policies should exist, then check TARGET
+    log_info "Checking for missing admin/CSR SELECT policies on RLS-enabled tables..."
+    log_info "   Comparing source and target to identify missing policies..."
+    
+    # Get list of tables that need admin/CSR SELECT policies from SOURCE
+    SOURCE_ADMIN_SELECT_TABLES_QUERY="
+    WITH all_rls_tables AS (
         SELECT DISTINCT
             c.relname AS table_name,
             format('%I.%I', n.nspname, c.relname) AS qualified
@@ -1623,9 +1906,8 @@ validate_policies_applied() {
         WHERE c.relkind = 'r'
           AND n.nspname = 'public'
           AND c.relrowsecurity = true
-          AND c.relname IN (SELECT table_name FROM critical_tables)
     ),
-    admin_policies AS (
+    tables_with_admin_select AS (
         SELECT DISTINCT
             c.relname AS table_name,
             format('%I.%I', n.nspname, c.relname) AS qualified
@@ -1633,23 +1915,83 @@ validate_policies_applied() {
         JOIN pg_class c ON c.oid = pol.polrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'public'
-          AND c.relname IN (SELECT table_name FROM critical_tables)
           AND (
-              -- Check if policy allows admin/super_admin roles
+              pol.polcmd = 'r'  -- SELECT policy
+              OR pol.polcmd = ''  -- ALL operations policy
+          )
+          AND (
               EXISTS (
                   SELECT 1
                   FROM unnest(pol.polroles) role_oid
                   JOIN pg_roles r ON r.oid = role_oid
-                  WHERE r.rolname IN ('admin', 'super_admin', 'authenticated')
+                  WHERE r.rolname IN ('admin', 'super_admin', 'csr', 'staff', 'authenticated')
+              )
+              OR pol.polroles = ARRAY[]::oid[]
+              OR pg_get_expr(pol.polqual, pol.polrelid) LIKE '%user_roles%'
+              OR pg_get_expr(pol.polwithcheck, pol.polrelid) LIKE '%user_roles%'
+          )
+    )
+    SELECT rt.qualified, rt.table_name
+    FROM all_rls_tables rt
+    WHERE rt.qualified NOT IN (SELECT qualified FROM tables_with_admin_select)
+    ORDER BY rt.qualified;
+    "
+    SOURCE_ADMIN_SELECT_FILE=$(mktemp)
+    source_has_missing=false
+    if run_source_sql_to_file "$SOURCE_ADMIN_SELECT_TABLES_QUERY" "$SOURCE_ADMIN_SELECT_FILE"; then
+        if [ -s "$SOURCE_ADMIN_SELECT_FILE" ] && [ -n "$(cat "$SOURCE_ADMIN_SELECT_FILE" | grep -v '^$' || true)" ]; then
+            source_has_missing=true
+            log_info "   Source also has tables missing admin/CSR SELECT policies (will be created in target)"
+        fi
+    fi
+    rm -f "$SOURCE_ADMIN_SELECT_FILE"
+    
+    # Now check TARGET
+    MISSING_ADMIN_POLICIES_QUERY="
+    WITH all_rls_tables AS (
+        -- Get ALL tables with RLS enabled in public schema
+        SELECT DISTINCT
+            c.relname AS table_name,
+            format('%I.%I', n.nspname, c.relname) AS qualified
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relkind = 'r'
+          AND n.nspname = 'public'
+          AND c.relrowsecurity = true
+    ),
+    tables_with_admin_select AS (
+        -- Get tables that have SELECT policies allowing admin/CSR roles
+        SELECT DISTINCT
+            c.relname AS table_name,
+            format('%I.%I', n.nspname, c.relname) AS qualified
+        FROM pg_policy pol
+        JOIN pg_class c ON c.oid = pol.polrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND (
+              pol.polcmd = 'r'  -- SELECT policy
+              OR pol.polcmd = ''  -- ALL operations policy
+          )
+          AND (
+              -- Check if policy allows admin/CSR/super_admin roles
+              EXISTS (
+                  SELECT 1
+                  FROM unnest(pol.polroles) role_oid
+                  JOIN pg_roles r ON r.oid = role_oid
+                  WHERE r.rolname IN ('admin', 'super_admin', 'csr', 'staff', 'authenticated')
               )
               OR
               -- Check if policy allows all authenticated users (which includes admins)
               pol.polroles = ARRAY[]::oid[]  -- Empty means all roles
+              OR
+              -- Check if policy expression checks for admin/CSR roles in user_roles table
+              pg_get_expr(pol.polqual, pol.polrelid) LIKE '%user_roles%'
+              OR pg_get_expr(pol.polwithcheck, pol.polrelid) LIKE '%user_roles%'
           )
     )
-    SELECT rt.qualified
-    FROM rls_tables rt
-    WHERE rt.qualified NOT IN (SELECT qualified FROM admin_policies)
+    SELECT rt.qualified, rt.table_name
+    FROM all_rls_tables rt
+    WHERE rt.qualified NOT IN (SELECT qualified FROM tables_with_admin_select)
     ORDER BY rt.qualified;
     "
     MISSING_ADMIN_POLICIES_FILE=$(mktemp)
@@ -1670,35 +2012,73 @@ validate_policies_applied() {
     done <<< "$endpoints"
     if [ "$missing_admin_policies_found" = "true" ]; then
         if [ -s "$MISSING_ADMIN_POLICIES_FILE" ] && [ -n "$(cat "$MISSING_ADMIN_POLICIES_FILE" | grep -v '^$' || true)" ]; then
-            log_warning "⚠ CRITICAL: Found tables with RLS enabled but NO admin access policies"
+            log_warning "⚠ CRITICAL: Found tables with RLS enabled but NO admin/CSR SELECT policies"
             missing_tables=()
-            while IFS= read -r table || [ -n "$table" ]; do
-                [ -z "$table" ] && continue
-                table_trimmed=$(echo "$table" | tr -d '[:space:]')
-                [ -z "$table_trimmed" ] && continue
-                missing_tables+=("$table_trimmed")
-                log_warning "    - $table_trimmed (admins cannot access this table!)"
+            missing_table_names=()
+            while IFS= read -r line || [ -n "$line" ]; do
+                [ -z "$line" ] && continue
+                # Parse: qualified_table|table_name or just qualified_table
+                if echo "$line" | grep -q '|'; then
+                    table_qualified=$(echo "$line" | cut -d'|' -f1 | tr -d '[:space:]')
+                    table_name=$(echo "$line" | cut -d'|' -f2 | tr -d '[:space:]')
+                else
+                    table_qualified=$(echo "$line" | tr -d '[:space:]')
+                    table_name=$(echo "$table_qualified" | sed -E 's/^[^.]+\.(.+)$/\1/')
+                fi
+                [ -z "$table_qualified" ] && continue
+                missing_tables+=("$table_qualified")
+                missing_table_names+=("$table_name")
+                log_warning "    - $table_qualified (admins/CSR cannot SELECT from this table!)"
             done < "$MISSING_ADMIN_POLICIES_FILE"
             
-            log_info "   Automatically creating admin access policies for these tables..."
-            ADMIN_POLICIES_SQL="$MIGRATION_DIR/create_admin_policies.sql"
+            log_info "   Automatically creating admin/CSR SELECT policies for ${#missing_tables[@]} table(s)..."
+            ADMIN_POLICIES_SQL="$MIGRATION_DIR/create_admin_csr_select_policies.sql"
             {
-                echo "-- Auto-generated admin access policies for tables missing admin policies"
+                echo "-- Auto-generated admin/CSR SELECT policies for tables missing admin access"
                 echo "-- Generated: $(date)"
                 echo "-- Source: $SOURCE_ENV, Target: $TARGET_ENV"
+                echo "-- These policies allow admin, super_admin, csr, and staff roles to SELECT from these tables"
                 echo ""
-                for table in "${missing_tables[@]}"; do
+                for i in "${!missing_tables[@]}"; do
+                    table="${missing_tables[$i]}"
+                    table_name="${missing_table_names[$i]}"
                     # Extract schema and table name
                     schema_name=$(echo "$table" | sed -E 's/^([^.]+)\.(.+)$/\1/')
-                    table_name=$(echo "$table" | sed -E 's/^([^.]+)\.(.+)$/\2/')
-                    policy_name="allow_admins_access_${table_name}"
+                    table_name_clean=$(echo "$table" | sed -E 's/^([^.]+)\.(.+)$/\2/')
                     
-                    echo "-- Admin policy for $table"
-                    echo "CREATE POLICY IF NOT EXISTS \"$policy_name\""
+                    # Create SELECT policy for admin/CSR roles
+                    policy_name_select="allow_admin_csr_select_${table_name_clean}"
+                    echo "-- Admin/CSR SELECT policy for $table"
+                    echo "DROP POLICY IF EXISTS \"$policy_name_select\" ON $table;"
+                    echo "CREATE POLICY \"$policy_name_select\""
+                    echo "ON $table"
+                    echo "FOR SELECT"
+                    echo "TO authenticated"
+                    echo "USING ("
+                    echo "    EXISTS ("
+                    echo "        SELECT 1 FROM user_roles"
+                    echo "        WHERE user_id = auth.uid()"
+                    echo "        AND role IN ('admin', 'super_admin', 'csr', 'staff')"
+                    echo "    )"
+                    echo ");"
+                    echo ""
+                    
+                    # Also create INSERT/UPDATE/DELETE policies for admin/super_admin (not CSR)
+                    policy_name_modify="allow_admin_modify_${table_name_clean}"
+                    echo "-- Admin modify policy for $table (INSERT/UPDATE/DELETE)"
+                    echo "DROP POLICY IF EXISTS \"$policy_name_modify\" ON $table;"
+                    echo "CREATE POLICY \"$policy_name_modify\""
                     echo "ON $table"
                     echo "FOR ALL"
                     echo "TO authenticated"
                     echo "USING ("
+                    echo "    EXISTS ("
+                    echo "        SELECT 1 FROM user_roles"
+                    echo "        WHERE user_id = auth.uid()"
+                    echo "        AND role IN ('admin', 'super_admin')"
+                    echo "    )"
+                    echo ")"
+                    echo "WITH CHECK ("
                     echo "    EXISTS ("
                     echo "        SELECT 1 FROM user_roles"
                     echo "        WHERE user_id = auth.uid()"
@@ -1709,14 +2089,16 @@ validate_policies_applied() {
                 done
             } > "$ADMIN_POLICIES_SQL"
             
-            if apply_sql_with_fallback "$ADMIN_POLICIES_SQL" "Create admin access policies"; then
-                log_success "✓ Admin access policies created successfully for ${#missing_tables[@]} table(s)"
+            if apply_sql_with_fallback "$ADMIN_POLICIES_SQL" "Create admin/CSR SELECT policies"; then
+                log_success "✓ Admin/CSR SELECT policies created successfully for ${#missing_tables[@]} table(s)"
+                log_info "   Created policies allow admin, super_admin, csr, and staff roles to SELECT"
+                log_info "   Created policies allow admin and super_admin roles to INSERT/UPDATE/DELETE"
             else
-                log_warning "⚠ Failed to create some admin policies; check $ADMIN_POLICIES_SQL and $LOG_FILE"
+                log_warning "⚠ Failed to create some admin/CSR policies; check $ADMIN_POLICIES_SQL and $LOG_FILE"
                 ((validation_errors++)) || true
             fi
         else
-            log_success "✓ All critical tables have admin access policies"
+            log_success "✓ All RLS-enabled tables have admin/CSR SELECT policies"
         fi
     fi
     rm -f "$MISSING_ADMIN_POLICIES_FILE"
