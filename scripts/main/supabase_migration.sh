@@ -1309,7 +1309,21 @@ perform_migration() {
     mkdir -p "$migration_dir"
     touch "$LOG_FILE"
     
-    log_to_file "$LOG_FILE" "Starting migration from $source to $target (mode: $MODE, incremental: $INCREMENTAL_MODE)"
+    log_to_file "$LOG_FILE" "=========================================="
+    log_to_file "$LOG_FILE" "MIGRATION STARTED"
+    log_to_file "$LOG_FILE" "=========================================="
+    log_to_file "$LOG_FILE" "Source: $source → Target: $target"
+    log_to_file "$LOG_FILE" "Mode: $MODE"
+    log_to_file "$LOG_FILE" "Incremental: $INCREMENTAL_MODE"
+    log_to_file "$LOG_FILE" "Include Data: $INCLUDE_DATA"
+    log_to_file "$LOG_FILE" "Include Users: $INCLUDE_USERS"
+    log_to_file "$LOG_FILE" "Include Files: $INCLUDE_FILES"
+    log_to_file "$LOG_FILE" "Include Secrets: $INCLUDE_SECRETS"
+    log_to_file "$LOG_FILE" "Replace Data: $REPLACE_TARGET_DATA"
+    log_to_file "$LOG_FILE" "Backup Target: $BACKUP_TARGET"
+    log_to_file "$LOG_FILE" "Migration Directory: $migration_dir"
+    log_to_file "$LOG_FILE" "Timestamp: $(date '+%Y-%m-%d %H:%M:%S')"
+    log_to_file "$LOG_FILE" "=========================================="
     
     export SKIP_COMPONENT_CONFIRM=true
     
@@ -1318,6 +1332,35 @@ perform_migration() {
     local -a SUCCEEDED_COMPONENTS=()
     local -a FAILED_COMPONENTS=()
     local -a SKIPPED_COMPONENTS=()
+    
+    # Pre-flight validation: Check that all component scripts exist
+    log_info "Performing pre-flight validation..."
+    local missing_scripts=()
+    local required_scripts=(
+        "scripts/components/database_migration.sh"
+        "scripts/components/storage_buckets_migration.sh"
+        "scripts/components/edge_functions_migration.sh"
+        "scripts/components/policies_migration.sh"
+    )
+    
+    for script in "${required_scripts[@]}"; do
+        if [ ! -f "$PROJECT_ROOT/$script" ]; then
+            missing_scripts+=("$script")
+            log_error "Required script not found: $script"
+        elif [ ! -x "$PROJECT_ROOT/$script" ]; then
+            log_warning "Script not executable: $script (attempting to fix...)"
+            chmod +x "$PROJECT_ROOT/$script" || log_warning "Could not make $script executable"
+        fi
+    done
+    
+    if [ ${#missing_scripts[@]} -gt 0 ]; then
+        log_error "Pre-flight validation failed: Missing required scripts"
+        log_error "Cannot proceed with migration"
+        return 1
+    fi
+    
+    log_success "Pre-flight validation passed - all required scripts are available"
+    log_to_file "$LOG_FILE" "Pre-flight validation: PASSED"
     # Step 1: Migrate database (schema + optionally data)
     # Check if data migration is requested (either via --data flag or --mode full)
     local migrate_data=false
@@ -1370,14 +1413,23 @@ perform_migration() {
     if ! prompt_proceed "Database Migration" "Proceed with database migration from $source to $target?"; then
         log_warning "Database migration skipped by user."
         SKIPPED_COMPONENTS+=("database")
+        log_to_file "$LOG_FILE" "Database migration: SKIPPED (user cancelled)"
     else
+        log_to_file "$LOG_FILE" "Database migration: STARTING"
+        set +e  # Temporarily disable exit on error for component execution
         if "$PROJECT_ROOT/scripts/components/database_migration.sh" "${db_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            set -e
             log_success "Database migration completed successfully"
             SUCCEEDED_COMPONENTS+=("database")
+            log_to_file "$LOG_FILE" "Database migration: SUCCESS"
         else
-            log_error "Database migration encountered errors (continuing to remaining components)."
+            set -e
+            local db_exit_code=${PIPESTATUS[0]}
+            log_error "Database migration encountered errors (exit code: $db_exit_code)"
+            log_error "Continuing with remaining components..."
             FAILED_COMPONENTS+=("database")
             exit_code=1
+            log_to_file "$LOG_FILE" "Database migration: FAILED (exit code: $db_exit_code)"
         fi
     fi
 
@@ -1402,18 +1454,26 @@ perform_migration() {
     if ! prompt_proceed "Storage Migration" "Proceed with storage bucket migration from $source to $target?"; then
         log_warning "Storage migration skipped by user."
         SKIPPED_COMPONENTS+=("storage")
+        log_to_file "$LOG_FILE" "Storage migration: SKIPPED (user cancelled)"
     else
+        log_to_file "$LOG_FILE" "Storage migration: STARTING"
+        set +e
         if "$PROJECT_ROOT/scripts/components/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            set -e
             if [ "$INCLUDE_FILES" = "true" ]; then
                 log_success "Storage buckets migrated successfully (with files)"
             else
                 log_success "Storage buckets migrated successfully (configuration only)"
             fi
             SUCCEEDED_COMPONENTS+=("storage")
+            log_to_file "$LOG_FILE" "Storage migration: SUCCESS"
         else
-            log_warning "Storage buckets migration had errors, continuing..."
+            set -e
+            local storage_exit_code=${PIPESTATUS[0]}
+            log_warning "Storage buckets migration had errors (exit code: $storage_exit_code), continuing..."
             FAILED_COMPONENTS+=("storage")
             exit_code=1
+            log_to_file "$LOG_FILE" "Storage migration: FAILED (exit code: $storage_exit_code)"
         fi
     fi
     
@@ -1430,14 +1490,22 @@ perform_migration() {
     if ! prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $source to $target?"; then
         log_warning "Edge functions migration skipped by user."
         SKIPPED_COMPONENTS+=("edge functions")
+        log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (user cancelled)"
     else
+        log_to_file "$LOG_FILE" "Edge functions migration: STARTING"
+        set +e
         if "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            set -e
             log_success "Edge functions migrated successfully"
             SUCCEEDED_COMPONENTS+=("edge functions")
+            log_to_file "$LOG_FILE" "Edge functions migration: SUCCESS"
         else
-            log_warning "Edge functions migration had errors, continuing..."
+            set -e
+            local edge_exit_code=${PIPESTATUS[0]}
+            log_warning "Edge functions migration had errors (exit code: $edge_exit_code), continuing..."
             FAILED_COMPONENTS+=("edge functions")
             exit_code=1
+            log_to_file "$LOG_FILE" "Edge functions migration: FAILED (exit code: $edge_exit_code)"
         fi
     fi
     
@@ -1455,14 +1523,22 @@ perform_migration() {
         if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
             log_warning "Secrets migration skipped by user."
             SKIPPED_COMPONENTS+=("secrets")
+            log_to_file "$LOG_FILE" "Secrets migration: SKIPPED (user cancelled)"
         else
+            log_to_file "$LOG_FILE" "Secrets migration: STARTING"
+            set +e
             if "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                set -e
                 log_success "Secrets migrated successfully (structure created - values need manual update)"
                 SUCCEEDED_COMPONENTS+=("secrets")
+                log_to_file "$LOG_FILE" "Secrets migration: SUCCESS"
             else
-                log_warning "Secrets migration had errors, continuing..."
+                set -e
+                local secrets_exit_code=${PIPESTATUS[0]}
+                log_warning "Secrets migration had errors (exit code: $secrets_exit_code), continuing..."
                 FAILED_COMPONENTS+=("secrets")
                 exit_code=1
+                log_to_file "$LOG_FILE" "Secrets migration: FAILED (exit code: $secrets_exit_code)"
             fi
         fi
     else
@@ -1485,17 +1561,29 @@ perform_migration() {
             policies_args+=("--auto-confirm")
         fi
 
-        if ! prompt_proceed "Policies & RLS Migration" "Proceed with policies/roles/RLS migration from $source to $target?"; then
-            log_warning "Policies/roles migration skipped by user."
+        # Policies migration is CRITICAL - always attempt it (but allow user to skip)
+        if ! prompt_proceed "Policies & RLS Migration" "Proceed with policies/roles/RLS migration from $source to $target? (CRITICAL for proper access control)"; then
+            log_warning "⚠️  Policies/roles migration skipped by user."
+            log_warning "   WARNING: Target system may have incorrect RLS policies and access control!"
             SKIPPED_COMPONENTS+=("policies/roles/RLS")
+            log_to_file "$LOG_FILE" "Policies/RLS migration: SKIPPED (user cancelled) - WARNING: This may cause access control issues!"
         else
+            log_to_file "$LOG_FILE" "Policies/RLS migration: STARTING (CRITICAL COMPONENT)"
+            set +e
             if "$policies_script" "${policies_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                set -e
                 log_success "Policies/roles/RLS migration completed successfully"
                 SUCCEEDED_COMPONENTS+=("policies/roles/RLS")
+                log_to_file "$LOG_FILE" "Policies/RLS migration: SUCCESS"
             else
-                log_warning "Policies/roles/RLS migration had errors, continuing..."
+                set -e
+                local policies_exit_code=${PIPESTATUS[0]}
+                log_error "⚠️  Policies/roles/RLS migration had errors (exit code: $policies_exit_code)"
+                log_error "   This is CRITICAL - target system may have incorrect access control!"
+                log_error "   Review $LOG_FILE and consider re-running policies migration"
                 FAILED_COMPONENTS+=("policies/roles/RLS")
                 exit_code=1
+                log_to_file "$LOG_FILE" "Policies/RLS migration: FAILED (exit code: $policies_exit_code) - CRITICAL ISSUE"
             fi
         fi
     else
@@ -1506,35 +1594,60 @@ perform_migration() {
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "  COMPONENT SUMMARY"
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    
+    log_to_file "$LOG_FILE" "=========================================="
+    log_to_file "$LOG_FILE" "MIGRATION COMPONENT SUMMARY"
+    log_to_file "$LOG_FILE" "=========================================="
+    
     if [ ${#SUCCEEDED_COMPONENTS[@]} -gt 0 ]; then
         local joined_success
         joined_success=$(printf '%s, ' "${SUCCEEDED_COMPONENTS[@]}")
         joined_success=${joined_success%, }
-        log_success "Components completed: ${joined_success}"
-        log_to_file "$LOG_FILE" "Components completed successfully: ${joined_success}"
+        log_success "✅ Components completed: ${joined_success}"
+        log_to_file "$LOG_FILE" "SUCCESS: ${joined_success}"
     else
         log_warning "No components completed successfully."
-        log_to_file "$LOG_FILE" "No components completed successfully."
+        log_to_file "$LOG_FILE" "WARNING: No components completed successfully."
     fi
 
     if [ ${#FAILED_COMPONENTS[@]} -gt 0 ]; then
         local joined_failed
         joined_failed=$(printf '%s, ' "${FAILED_COMPONENTS[@]}")
         joined_failed=${joined_failed%, }
-        log_warning "Components with errors: ${joined_failed}"
-        log_to_file "$LOG_FILE" "Components with errors: ${joined_failed}"
+        log_error "❌ Components with errors: ${joined_failed}"
+        log_to_file "$LOG_FILE" "FAILED: ${joined_failed}"
+        
+        # Check if critical components failed
+        local critical_failed=false
+        for component in "${FAILED_COMPONENTS[@]}"; do
+            if [[ "$component" =~ (database|policies) ]]; then
+                critical_failed=true
+                break
+            fi
+        done
+        
+        if [ "$critical_failed" = "true" ]; then
+            log_error "⚠️  CRITICAL: Database or Policies migration failed - target system may be incomplete!"
+            log_to_file "$LOG_FILE" "CRITICAL: Database or Policies migration failed"
+        fi
     else
-        log_success "No component errors reported."
-        log_to_file "$LOG_FILE" "No component errors reported."
+        log_success "✅ No component errors reported."
+        log_to_file "$LOG_FILE" "SUCCESS: No component errors reported."
     fi
 
     if [ ${#SKIPPED_COMPONENTS[@]} -gt 0 ]; then
         local joined_skipped
         joined_skipped=$(printf '%s, ' "${SKIPPED_COMPONENTS[@]}")
         joined_skipped=${joined_skipped%, }
-        log_warning "Components skipped: ${joined_skipped}"
-        log_to_file "$LOG_FILE" "Components skipped: ${joined_skipped}"
+        log_warning "⏭️  Components skipped: ${joined_skipped}"
+        log_to_file "$LOG_FILE" "SKIPPED: ${joined_skipped}"
     fi
+    
+    log_to_file "$LOG_FILE" "=========================================="
+    log_to_file "$LOG_FILE" "Migration completed at: $(date '+%Y-%m-%d %H:%M:%S')"
+    log_to_file "$LOG_FILE" "Final exit code: $exit_code"
+    log_to_file "$LOG_FILE" "=========================================="
+    
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info ""
     

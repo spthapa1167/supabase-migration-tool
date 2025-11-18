@@ -1486,7 +1486,139 @@ fi
                         log_warning "     - Missing tables/columns referenced in policy expressions"
                         log_warning "     - Syntax errors in policy definitions"
                         log_warning "   To fix: Review failed policies, fix dependencies, and re-run migration"
-                        failed_tables+=("RLS policies (missing $missing_count)")
+                        
+                        # Generate retry SQL for missing policies
+                        log_info "   Generating retry SQL for missing policies..."
+                        RETRY_POLICIES_SQL="$MIGRATION_DIR/retry_missing_policies.sql"
+                        
+                        # Get full policy definitions from source for missing policies
+                        if [ -s "$source_policies_list_file" ] && [ -s "$target_policies_list_file" ]; then
+                            # Get list of missing policy identifiers
+                            missing_policy_ids=()
+                            while IFS='|' read -r table_qualified table_name policy_name policy_command policy_identifier || [ -n "$table_qualified" ]; do
+                                [ -z "$table_qualified" ] && continue
+                                if ! grep -qF "$policy_identifier" "$target_policies_list_file" 2>/dev/null; then
+                                    missing_policy_ids+=("$policy_identifier")
+                                fi
+                            done < "$source_policies_list_file"
+                            
+                            if [ ${#missing_policy_ids[@]} -gt 0 ]; then
+                                # Build array literal for SQL query
+                                policy_ids_sql=""
+                                for pid in "${missing_policy_ids[@]}"; do
+                                    if [ -z "$policy_ids_sql" ]; then
+                                        policy_ids_sql="'$pid'"
+                                    else
+                                        policy_ids_sql="$policy_ids_sql, '$pid'"
+                                    fi
+                                done
+                                
+                                # Generate SQL to recreate missing policies from source
+                                SOURCE_POLICY_DEFS_QUERY="
+                                SELECT 
+                                    format('DROP POLICY IF EXISTS %I ON %s;', pol.polname, format('%I.%I', n.nspname, c.relname)) || E'\\n' ||
+                                    format(
+                                        'CREATE POLICY %1\$I%2\$s ON %3\$s %4\$s %5\$s %6\$s %7\$s;',
+                                        pol.polname,
+                                        CASE WHEN NOT pol.polpermissive THEN ' AS RESTRICTIVE' ELSE '' END,
+                                        format('%I.%I', n.nspname, c.relname),
+                                        CASE pol.polcmd
+                                            WHEN '' THEN ''
+                                            WHEN 'r' THEN 'FOR SELECT'
+                                            WHEN 'a' THEN 'FOR INSERT'
+                                            WHEN 'w' THEN 'FOR UPDATE'
+                                            WHEN 'd' THEN 'FOR DELETE'
+                                            ELSE 'FOR ALL'
+                                        END,
+                                        COALESCE('TO '||roles.role_list, ''),
+                                        CASE WHEN pol.polqual IS NULL THEN '' ELSE 'USING ('||pg_get_expr(pol.polqual, pol.polrelid)||')' END,
+                                        CASE WHEN pol.polwithcheck IS NULL THEN '' ELSE 'WITH CHECK ('||pg_get_expr(pol.polwithcheck, pol.polrelid)||')' END
+                                    ) AS policy_sql
+                                FROM pg_policy pol
+                                JOIN pg_class c ON c.oid = pol.polrelid
+                                JOIN pg_namespace n ON n.oid = c.relnamespace
+                                LEFT JOIN LATERAL (
+                                    SELECT string_agg(quote_ident(r.rolname), ', ') AS role_list
+                                    FROM unnest(pol.polroles) role_oid
+                                    JOIN pg_roles r ON r.oid = role_oid
+                                ) AS roles ON true
+                                WHERE n.nspname IN ('public', 'auth')
+                                  AND c.relrowsecurity = true
+                                  AND pol.polname || '|' || format('%I.%I', n.nspname, c.relname) = ANY(ARRAY[$policy_ids_sql])
+                                ORDER BY format('%I.%I', n.nspname, c.relname), pol.polname;
+                                "
+                                
+                                RETRY_POLICIES_FILE=$(mktemp)
+                                if run_source_sql_to_file "$SOURCE_POLICY_DEFS_QUERY" "$RETRY_POLICIES_FILE"; then
+                                    if [ -s "$RETRY_POLICIES_FILE" ]; then
+                                        {
+                                            echo "-- Retry SQL for missing RLS policies"
+                                            echo "-- Generated: $(date)"
+                                            echo "-- Source: $SOURCE_ENV ($SOURCE_REF)"
+                                            echo "-- Target: $TARGET_ENV ($TARGET_REF)"
+                                            echo "-- Missing policies: ${#missing_policy_ids[@]}"
+                                            echo ""
+                                            cat "$RETRY_POLICIES_FILE"
+                                        } > "$RETRY_POLICIES_SQL"
+                                        
+                                        log_info "   Retry SQL generated: $RETRY_POLICIES_SQL"
+                                        log_info "   Attempting to apply missing policies..."
+                                        
+                                        # Try to apply the retry SQL
+                                        if apply_sql_with_fallback "$RETRY_POLICIES_SQL" "Retry missing RLS policies"; then
+                                            # Verify policies were applied
+                                            TARGET_AFTER_RETRY_QUERY="
+                                            SELECT COUNT(*)
+                                            FROM pg_policy pol
+                                            JOIN pg_class c ON pol.polrelid = c.oid
+                                            JOIN pg_namespace n ON n.oid = c.relnamespace
+                                            WHERE n.nspname IN ('public', 'auth')
+                                              AND c.relrowsecurity = true;
+                                            "
+                                            target_after_retry_count="0"
+                                            endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                                            while IFS='|' read -r host port user label; do
+                                                [ -z "$host" ] && continue
+                                                if target_after_retry_count=$(PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                                                    -h "$host" \
+                                                    -p "$port" \
+                                                    -U "$user" \
+                                                    -d postgres \
+                                                    -t -A \
+                                                    -c "$TARGET_AFTER_RETRY_QUERY" 2>/dev/null | tr -d '[:space:]'); then
+                                                    break
+                                                fi
+                                            done <<< "$endpoints"
+                                            
+                                            if [ "$target_after_retry_count" -ge "$source_policy_count" ]; then
+                                                log_success "✓ Successfully applied missing policies via retry: $target_after_retry_count policy(ies) now in target"
+                                                # Remove from failed tables if successful
+                                                failed_tables=("${failed_tables[@]/RLS policies (missing $missing_count)/}")
+                                            else
+                                                remaining_missing=$((source_policy_count - target_after_retry_count))
+                                                log_warning "⚠ Retry applied some policies but $remaining_missing still missing"
+                                                log_warning "   Review $RETRY_POLICIES_SQL and $LOG_FILE for details"
+                                                failed_tables+=("RLS policies (missing $remaining_missing)")
+                                            fi
+                                        else
+                                            log_warning "⚠ Retry SQL application failed - policies may have dependency issues"
+                                            log_warning "   Review $RETRY_POLICIES_SQL and $LOG_FILE for details"
+                                            log_warning "   You can manually apply: psql -f $RETRY_POLICIES_SQL"
+                                            failed_tables+=("RLS policies (missing $missing_count)")
+                                        fi
+                                        rm -f "$RETRY_POLICIES_FILE"
+                                    else
+                                        log_warning "⚠ Could not generate retry SQL for missing policies"
+                                        failed_tables+=("RLS policies (missing $missing_count)")
+                                    fi
+                                else
+                                    log_warning "⚠ Could not fetch policy definitions from source for retry"
+                                    failed_tables+=("RLS policies (missing $missing_count)")
+                                fi
+                            fi
+                        else
+                            failed_tables+=("RLS policies (missing $missing_count)")
+                        fi
                     fi
                 else
                     log_success "✓ RLS policies applied successfully"
@@ -2109,7 +2241,7 @@ validate_policies_applied() {
     MISSING_PROFILES_QUERY="
     WITH users_with_roles AS (
         SELECT DISTINCT ur.user_id
-        FROM user_roles ur
+        FROM public.user_roles ur
         WHERE ur.user_id IS NOT NULL
     ),
     users_with_profiles AS (
@@ -2152,7 +2284,7 @@ validate_policies_applied() {
             MISSING_USER_IDS_QUERY="
             WITH users_with_roles AS (
                 SELECT DISTINCT ur.user_id
-                FROM user_roles ur
+                FROM public.user_roles ur
                 WHERE ur.user_id IS NOT NULL
             ),
             users_with_profiles AS (
@@ -2233,7 +2365,7 @@ validate_policies_applied() {
                             echo ""
                             echo "WITH users_with_roles AS ("
                             echo "    SELECT DISTINCT ur.user_id"
-                            echo "    FROM user_roles ur"
+                            echo "    FROM public.user_roles ur"
                             echo "    WHERE ur.user_id IS NOT NULL"
                             echo "),"
                             echo "users_with_profiles AS ("
