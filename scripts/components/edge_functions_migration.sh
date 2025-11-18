@@ -15,8 +15,44 @@ source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
 source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
+# Usage function (must be defined before it's called)
+usage() {
+    cat << EOF
+Usage: $0 <source_env> <target_env> [migration_dir|--migration-dir <path>] [options]
+
+Migrates edge functions from source to target using delta comparison
+
+Arguments:
+  source_env     Source environment (prod, test, dev, backup)
+  target_env     Target environment (prod, test, dev, backup)
+  migration_dir  Directory to store migration files (optional, auto-generated if not provided)
+  --migration-dir <path>  Same as positional migration_dir argument
+
+Options:
+  --increment    Prefer incremental/delta operations (skip identical functions)
+  --replace      Replace mode: Delete all target functions and redeploy from source
+  --auto-confirm Automatically proceed without interactive confirmation
+  -h, --help     Show this help message
+
+Examples:
+  $0 prod test                          # Migrate edge functions from prod to test
+  $0 dev test /path/to/backup           # Migrate with custom backup directory
+
+Returns:
+  0 on success, 1 on failure
+
+EOF
+    exit 0
+}
+
+# Handle help flag early
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+    usage
+fi
+
 # Configuration defaults
 INCREMENTAL_MODE="false"
+REPLACE_MODE="false"
 AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
 SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
 MIGRATION_DIR=""
@@ -35,6 +71,9 @@ while [ $# -gt 0 ]; do
         --increment|--incremental)
             INCREMENTAL_MODE="true"
             ;;
+        --replace)
+            REPLACE_MODE="true"
+            ;;
         --auto-confirm|--yes|-y)
             AUTO_CONFIRM_COMPONENT="true"
             ;;
@@ -50,6 +89,9 @@ while [ $# -gt 0 ]; do
         --migration-dir=*)
             MIGRATION_DIR="${1#*=}"
             ;;
+        -h|--help)
+            usage
+            ;;
         -*)
             log_warning "Ignoring unknown option: $1"
             ;;
@@ -63,34 +105,6 @@ while [ $# -gt 0 ]; do
     esac
     shift || true
 done
-
-# Usage
-usage() {
-    cat << EOF
-Usage: $0 <source_env> <target_env> [migration_dir|--migration-dir <path>] [options]
-
-Migrates edge functions from source to target using delta comparison
-
-Arguments:
-  source_env     Source environment (prod, test, dev, backup)
-  target_env     Target environment (prod, test, dev, backup)
-  migration_dir  Directory to store migration files (optional, auto-generated if not provided)
-  --migration-dir <path>  Same as positional migration_dir argument
-
-Options:
-  --increment    Prefer incremental/delta operations (skip identical functions)
-  --auto-confirm Automatically proceed without interactive confirmation
-
-Examples:
-  $0 prod test                          # Migrate edge functions from prod to test
-  $0 dev test /path/to/backup           # Migrate with custom backup directory
-
-Returns:
-  0 on success, 1 on failure
-
-EOF
-    exit 1
-}
 
 component_prompt_proceed() {
     local title=$1
@@ -155,6 +169,9 @@ log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR_ABS"
 log_info "Incremental mode: $INCREMENTAL_MODE (edge functions utility performs delta comparisons by default)"
+if [ "$REPLACE_MODE" = "true" ]; then
+    log_warning "⚠️  REPLACE MODE: All target functions will be deleted and replaced with source functions"
+fi
 echo ""
 
 if [ "$SKIP_COMPONENT_CONFIRM" != "true" ]; then
@@ -221,6 +238,9 @@ log_info ""
 node_args=("$EDGE_FUNCTIONS_UTIL" "$SOURCE_REF" "$TARGET_REF" "$MIGRATION_DIR_ABS")
 if [ "$INCREMENTAL_MODE" = "true" ]; then
     node_args+=("--incremental")
+fi
+if [ "$REPLACE_MODE" = "true" ]; then
+    node_args+=("--replace")
 fi
 
 # Run Node.js utility and capture output

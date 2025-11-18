@@ -117,9 +117,20 @@ if [ -z "$MIGRATION_DIR_INPUT" ]; then
 fi
 
 if [ -z "$MIGRATION_DIR_INPUT" ]; then
-    log_error "Unable to locate an edge functions migration directory for ${SOURCE_ENV} -> ${TARGET_ENV}."
-    log_error "Provide one explicitly via --dir <path>."
-    exit 1
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  No Edge Functions Migration Found"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    log_info "No edge functions migration directory found for ${SOURCE_ENV} -> ${TARGET_ENV}."
+    log_info "This means there's nothing to retry - either:"
+    log_info "  • No edge functions migration has been run yet, or"
+    log_info "  • All edge functions were successfully deployed (no failures to retry)"
+    echo ""
+    log_info "To retry specific functions, you can:"
+    log_info "  1. Run the main migration first: ./scripts/main/supabase_migration.sh ${SOURCE_ENV} ${TARGET_ENV}"
+    log_info "  2. Or provide a migration directory explicitly: $0 ${SOURCE_ENV} ${TARGET_ENV} --dir <path>"
+    echo ""
+    exit 0
 fi
 
 if [ ! -d "$MIGRATION_DIR_INPUT" ]; then
