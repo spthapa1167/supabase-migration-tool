@@ -1245,13 +1245,14 @@ fi
             
             # Verify we're getting all policies from source
             log_info "Verifying policy count from source..."
+            # Count ALL policies in public and auth schemas (matching the generation query)
             SOURCE_POLICY_COUNT_QUERY="
             SELECT COUNT(*)
             FROM pg_policy pol
             JOIN pg_class c ON c.oid = pol.polrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname IN ('public', 'auth')
-              AND c.relrowsecurity = true;
+              AND c.relkind = 'r';
             "
             SOURCE_POLICY_COUNT_FILE=$(mktemp)
             if run_source_sql_to_file "$SOURCE_POLICY_COUNT_QUERY" "$SOURCE_POLICY_COUNT_FILE"; then
@@ -1276,7 +1277,7 @@ fi
                     JOIN pg_class c ON c.oid = pol.polrelid
                     JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname IN ('public', 'auth')
-                      AND c.relrowsecurity = true
+                      AND c.relkind = 'r'
                     ORDER BY format('%I.%I', n.nspname, c.relname), pol.polname;
                     "
                     SOURCE_POLICY_NAMES_FILE=$(mktemp)
@@ -1317,7 +1318,7 @@ fi
             JOIN pg_class c ON pol.polrelid = c.oid
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname IN ('public', 'auth')
-              AND c.relrowsecurity = true;
+              AND c.relkind = 'r';
             "
             TARGET_POLICY_COUNT_BEFORE_FILE=$(mktemp)
             endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
@@ -1349,7 +1350,7 @@ fi
                 JOIN pg_class c ON pol.polrelid = c.oid
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname IN ('public', 'auth')
-                  AND c.relrowsecurity = true;
+                  AND c.relkind = 'r';
                 "
                 TARGET_POLICY_COUNT_FILE=$(mktemp)
                 endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
@@ -1410,7 +1411,7 @@ fi
                             JOIN pg_class c ON c.oid = pol.polrelid
                             JOIN pg_namespace n ON n.oid = c.relnamespace
                             WHERE n.nspname IN ('public', 'auth')
-                              AND c.relrowsecurity = true;
+                              AND c.relkind = 'r';
                             "
                             target_policies_list_file=$(mktemp)
                             endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
@@ -1543,7 +1544,7 @@ fi
                                     JOIN pg_roles r ON r.oid = role_oid
                                 ) AS roles ON true
                                 WHERE n.nspname IN ('public', 'auth')
-                                  AND c.relrowsecurity = true
+                                  AND c.relkind = 'r'
                                   AND pol.polname || '|' || format('%I.%I', n.nspname, c.relname) = ANY(ARRAY[$policy_ids_sql])
                                 ORDER BY format('%I.%I', n.nspname, c.relname), pol.polname;
                                 "
@@ -1573,7 +1574,7 @@ fi
                                             JOIN pg_class c ON pol.polrelid = c.oid
                                             JOIN pg_namespace n ON n.oid = c.relnamespace
                                             WHERE n.nspname IN ('public', 'auth')
-                                              AND c.relrowsecurity = true;
+                                              AND c.relkind = 'r';
                                             "
                                             target_after_retry_count="0"
                                             endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
@@ -1645,7 +1646,7 @@ fi
             JOIN pg_class c ON c.oid = pol.polrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname IN ('public', 'auth')
-              AND c.relrowsecurity = true
+              AND c.relkind = 'r'
             GROUP BY format('%I.%I', n.nspname, c.relname)
             ORDER BY format('%I.%I', n.nspname, c.relname);
             "
@@ -1704,6 +1705,150 @@ fi
                     else
                         log_warning "⚠ Found $tables_with_missing table(s) with missing policies"
                         log_warning "   Review $MISSING_POLICIES_DETAILED_FILE for detailed list"
+                        
+                        # Final attempt: Generate and apply ALL missing policies
+                        log_info "   Performing final comprehensive policy sync..."
+                        
+                        # First, get target policy identifiers
+                        TARGET_POLICY_IDENTIFIERS_QUERY="
+                        SELECT 
+                            pol.polname || '|' || format('%I.%I', n.nspname, c.relname) AS policy_identifier
+                        FROM pg_policy pol
+                        JOIN pg_class c ON c.oid = pol.polrelid
+                        JOIN pg_namespace n ON n.oid = c.relnamespace
+                        WHERE n.nspname IN ('public', 'auth')
+                          AND c.relkind = 'r';
+                        "
+                        TARGET_POLICY_IDENTIFIERS_FILE=$(mktemp)
+                        endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                        while IFS='|' read -r host port user label; do
+                            [ -z "$host" ] && continue
+                            if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                                -h "$host" \
+                                -p "$port" \
+                                -U "$user" \
+                                -d postgres \
+                                -t -A \
+                                -c "$TARGET_POLICY_IDENTIFIERS_QUERY" >"$TARGET_POLICY_IDENTIFIERS_FILE" 2>/dev/null; then
+                                break
+                            fi
+                        done <<< "$endpoints"
+                        
+                        # Now get source policies and filter out those that exist in target
+                        # Use the same generation logic as generate_rls_sql but filter by missing policies
+                        FINAL_SYNC_SQL="$MIGRATION_DIR/final_policy_sync.sql"
+                        
+                        # Generate all source policies using the same logic as generate_rls_sql
+                        ALL_SOURCE_POLICIES_SQL="$MIGRATION_DIR/all_source_policies_temp.sql"
+                        if generate_rls_sql "$ALL_SOURCE_POLICIES_SQL"; then
+                            # Extract only CREATE POLICY statements (skip DROP and ALTER TABLE)
+                            # Filter out policies that already exist in target
+                            {
+                                echo "-- Final comprehensive policy sync"
+                                echo "-- Generated: $(date)"
+                                echo "-- Source: $SOURCE_ENV ($SOURCE_REF)"
+                                echo "-- Target: $TARGET_ENV ($TARGET_REF)"
+                                echo "-- This file contains ALL policies missing in target"
+                                echo ""
+                                
+                                # Extract policy names from CREATE POLICY statements
+                                while IFS= read -r line || [ -n "$line" ]; do
+                                    [ -z "$line" ] && continue
+                                    [[ "$line" =~ ^-- ]] && continue
+                                    
+                                    # If it's a CREATE POLICY statement, extract the policy name and table
+                                    # Pattern: CREATE POLICY "name" ON "schema"."table" ...
+                                    # Use sed for more reliable extraction (handles schema-qualified names)
+                                    if echo "$line" | grep -qE "^CREATE[[:space:]]+POLICY"; then
+                                        # Extract policy name (first quoted identifier after POLICY)
+                                        policy_name=$(echo "$line" | sed -E 's/.*CREATE[[:space:]]+POLICY[[:space:]]+"([^"]+)".*/\1/' | head -1)
+                                        # Extract table name (first quoted identifier after ON, may be schema.table)
+                                        table_name=$(echo "$line" | sed -E 's/.*ON[[:space:]]+([^[:space:]]+[[:space:]]*[^[:space:]]*).*/\1/' | sed 's/[[:space:]].*$//' | head -1)
+                                        
+                                        if [ -n "$policy_name" ] && [ -n "$table_name" ]; then
+                                            # Build identifier matching TARGET format: "policy"|"schema"."table"
+                                            policy_identifier="\"${policy_name}\"|${table_name}"
+                                            
+                                            # Check if this policy exists in target
+                                            if ! grep -qF "$policy_identifier" "$TARGET_POLICY_IDENTIFIERS_FILE" 2>/dev/null; then
+                                                echo "$line"
+                                            fi
+                                        else
+                                            # If extraction failed, include it to be safe
+                                            echo "$line"
+                                        fi
+                                    elif [[ "$line" =~ ^DROP[[:space:]]+POLICY ]]; then
+                                        # Include DROP statements for policies we're about to create
+                                        # Extract policy name and table
+                                        policy_name=$(echo "$line" | sed -E 's/.*DROP[[:space:]]+POLICY[[:space:]]+IF[[:space:]]+EXISTS[[:space:]]+"([^"]+)".*/\1/' | head -1)
+                                        table_name=$(echo "$line" | sed -E 's/.*ON[[:space:]]+([^[:space:]]+[[:space:]]*[^[:space:]]*).*/\1/' | sed 's/[[:space:]].*$//' | head -1)
+                                        
+                                        if [ -n "$policy_name" ] && [ -n "$table_name" ]; then
+                                            policy_identifier="\"${policy_name}\"|${table_name}"
+                                            
+                                            # Only include DROP if we're creating this policy
+                                            if ! grep -qF "$policy_identifier" "$TARGET_POLICY_IDENTIFIERS_FILE" 2>/dev/null; then
+                                                echo "$line"
+                                            fi
+                                        else
+                                            # If extraction failed, include it to be safe
+                                            echo "$line"
+                                        fi
+                                    elif [[ "$line" =~ ^ALTER[[:space:]]+TABLE ]]; then
+                                        # Always include ALTER TABLE statements (RLS enabling)
+                                        echo "$line"
+                                    fi
+                                done < "$ALL_SOURCE_POLICIES_SQL"
+                            } > "$FINAL_SYNC_SQL"
+                            
+                            rm -f "$ALL_SOURCE_POLICIES_SQL"
+                            
+                            if [ -s "$FINAL_SYNC_SQL" ]; then
+                                final_sync_count=$(grep -c "^CREATE POLICY" "$FINAL_SYNC_SQL" 2>/dev/null || echo "0")
+                                if [ "$final_sync_count" -gt 0 ]; then
+                                    log_info "   Found $final_sync_count additional missing policy(ies) - applying..."
+                                    log_to_file "$LOG_FILE" "Final policy sync: Found $final_sync_count missing policies"
+                                    
+                                    # Apply using individual policy application for better error handling
+                                    if apply_policies_individually "$FINAL_SYNC_SQL" "Final comprehensive policy sync"; then
+                                        # Verify final count
+                                        final_target_count="0"
+                                        endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                                        while IFS='|' read -r host port user label; do
+                                            [ -z "$host" ] && continue
+                                            if final_target_count=$(PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                                                -h "$host" \
+                                                -p "$port" \
+                                                -U "$user" \
+                                                -d postgres \
+                                                -t -A \
+                                                -c "$TARGET_POLICY_COUNT_QUERY" 2>/dev/null | tr -d '[:space:]'); then
+                                                break
+                                            fi
+                                        done <<< "$endpoints"
+                                        
+                                        if [ -n "$source_policy_count" ] && [ "$source_policy_count" != "0" ]; then
+                                            if [ "$final_target_count" -ge "$source_policy_count" ]; then
+                                                log_success "✓ Final sync successful: $final_target_count policy(ies) now match source ($source_policy_count)"
+                                                log_to_file "$LOG_FILE" "Final policy sync: SUCCESS - $final_target_count policies in target"
+                                            else
+                                                remaining=$((source_policy_count - final_target_count))
+                                                log_warning "⚠ Final sync applied some policies but $remaining still missing"
+                                                log_warning "   Source: $source_policy_count, Target: $final_target_count"
+                                                log_warning "   Review $FINAL_SYNC_SQL and $LOG_FILE for details"
+                                                log_to_file "$LOG_FILE" "Final policy sync: PARTIAL - $remaining policies still missing"
+                                            fi
+                                        fi
+                                    else
+                                        log_warning "⚠ Final sync application had issues - check $FINAL_SYNC_SQL and $LOG_FILE"
+                                        log_to_file "$LOG_FILE" "Final policy sync: FAILED or PARTIAL"
+                                    fi
+                                else
+                                    log_info "   No additional missing policies found in final sync"
+                                fi
+                            fi
+                            rm -f "$SOURCE_ALL_POLICIES_FILE" "$TARGET_POLICY_IDENTIFIERS_FILE"
+                        fi
                     fi
                 fi
                 rm -f "$SOURCE_POLICIES_BY_TABLE_FILE" "$TARGET_POLICIES_BY_TABLE_FILE"
