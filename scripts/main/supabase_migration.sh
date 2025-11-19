@@ -34,6 +34,7 @@ INCLUDE_USERS=false  # Default: false  - don't migrate auth.users / identities u
 INCLUDE_SECRETS=false # Default: false - don't migrate secrets unless --secret is specified
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
 INCREMENTAL_MODE=false     # Default: false - full sync for data unless --increment is provided
+SKIP_EDGE_FUNCTIONS=false  # Default: false - migrate edge functions unless --skipEdge is specified
 
 # Colors
 RED='\033[0;31m'
@@ -69,6 +70,7 @@ Options:
   --users                 Include authentication users/identities migration (default: disabled; auth users are NOT copied unless this is set)
   --files                 Include storage bucket files migration (default: disabled)
   --secret                Include secrets migration (default: disabled; secrets are NOT migrated unless this is set)
+  --skipEdge              Skip edge functions migration (default: edge functions are migrated)
   --env-file <file>       Environment file (default: .env.local)
   --dry-run               Preview migration without executing
   --backup                Create backup before migration
@@ -95,7 +97,7 @@ Default Behavior:
   Use --data --replace-data for a full data REPLACE (target table data is truncated/replaced by source).
   Use --files to include storage bucket file migration.
   Use --users to copy auth users/identities so login state matches source.
-  Use --secret to migrate secrets (adds new secret keys incrementally; existing values are never overwritten).
+  Use --secret to migrate secrets (adds new secret keys incrementally; existing secrets in target are never modified or removed).
   Use --full for an all-in-one migration (schema + data + users + files).
 
 Examples:
@@ -187,6 +189,10 @@ parse_args() {
                 ;;
             --secret|--secrets)
                 INCLUDE_SECRETS=true
+                shift
+                ;;
+            --skipEdge|--skip-edge|--skip-edge-functions)
+                SKIP_EDGE_FUNCTIONS=true
                 shift
                 ;;
             --env-file)
@@ -1269,8 +1275,9 @@ perform_migration() {
         echo "  Include Users: $INCLUDE_USERS"
         echo "  Include Files: $INCLUDE_FILES"
         echo "  Include Secrets: $INCLUDE_SECRETS"
+        echo "  Skip Edge Functions: $SKIP_EDGE_FUNCTIONS"
         echo "  Backup: ${BACKUP_TARGET:-false}"
-        echo "  Components: All (database, storage, edge functions, policies/RLS$([ "$INCLUDE_SECRETS" = "true" ] && echo ", secrets" || echo ""))"
+        echo "  Components: All (database, storage$([ "$SKIP_EDGE_FUNCTIONS" != "true" ] && echo ", edge functions" || echo ""), policies/RLS$([ "$INCLUDE_SECRETS" = "true" ] && echo ", secrets" || echo ""))"
         echo ""
         echo "Migration directory: $migration_dir"
         echo ""
@@ -1337,11 +1344,15 @@ perform_migration() {
     log_info "Performing pre-flight validation..."
     local missing_scripts=()
     local required_scripts=(
-        "scripts/components/database_migration.sh"
-        "scripts/components/storage_buckets_migration.sh"
-        "scripts/components/edge_functions_migration.sh"
-        "scripts/components/policies_migration.sh"
+        "scripts/main/database_and_policy_migration.sh"
+        "scripts/main/storage_buckets_migration.sh"
+        "scripts/main/edge_functions_migration.sh"
     )
+    
+    # database_migration.sh is only needed if data migration is requested
+    if [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
+        required_scripts+=("scripts/components/database_migration.sh")
+    fi
     
     for script in "${required_scripts[@]}"; do
         if [ ! -f "$PROJECT_ROOT/$script" ]; then
@@ -1361,76 +1372,108 @@ perform_migration() {
     
     log_success "Pre-flight validation passed - all required scripts are available"
     log_to_file "$LOG_FILE" "Pre-flight validation: PASSED"
-    # Step 1: Migrate database (schema + optionally data)
-    # Check if data migration is requested (either via --data flag or --mode full)
+    
+    # Step 1: Migrate database schema and policies together
+    # Using database_and_policy_migration.sh which handles schema + policies in one step
+    log_info "Migrating database schema and policies..."
+    local db_policy_migration_args=("$source" "$target" "$migration_dir")
+    
+    if [ "$AUTO_CONFIRM" = "true" ]; then
+        db_policy_migration_args+=("--auto-confirm")
+    fi
+
+    if ! prompt_proceed "Database Schema & Policies Migration" "Proceed with database schema and policies migration from $source to $target? (CRITICAL for proper access control)"; then
+        log_warning "⚠️  Database schema and policies migration skipped by user."
+        log_warning "   WARNING: Target system may have incorrect schema and RLS policies!"
+        SKIPPED_COMPONENTS+=("database schema & policies")
+        log_to_file "$LOG_FILE" "Database schema & policies migration: SKIPPED (user cancelled) - WARNING: This may cause issues!"
+    else
+        log_to_file "$LOG_FILE" "Database schema & policies migration: STARTING (CRITICAL COMPONENT)"
+        set +e  # Temporarily disable exit on error for component execution
+        if "$PROJECT_ROOT/scripts/main/database_and_policy_migration.sh" "${db_policy_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            set -e
+            log_success "Database schema and policies migration completed successfully"
+            SUCCEEDED_COMPONENTS+=("database schema & policies")
+            log_to_file "$LOG_FILE" "Database schema & policies migration: SUCCESS"
+        else
+            set -e
+            local db_policy_exit_code=${PIPESTATUS[0]}
+            log_error "⚠️  Database schema and policies migration encountered errors (exit code: $db_policy_exit_code)"
+            log_error "   This is CRITICAL - target system may have incorrect schema and access control!"
+            log_error "   Review $LOG_FILE and consider re-running migration"
+            FAILED_COMPONENTS+=("database schema & policies")
+            exit_code=1
+            log_to_file "$LOG_FILE" "Database schema & policies migration: FAILED (exit code: $db_policy_exit_code) - CRITICAL ISSUE"
+        fi
+    fi
+    
+    # Step 1b: Migrate database data (if requested)
+    # This is separate from schema migration and only runs if --data flag is set
     local migrate_data=false
     if [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
         migrate_data=true
     fi
     
-    # Build command arguments for database migration
-    local db_migration_args=("$source" "$target" "$migration_dir")
-    if [ "$INCREMENTAL_MODE" = "true" ]; then
-        db_migration_args+=("--increment")
-    fi
-    if [ "$INCLUDE_USERS" = "true" ]; then
-        db_migration_args+=("--users")
-    fi
-    if [ "$BACKUP_TARGET" = "true" ]; then
-        db_migration_args+=("--backup")
-    fi
     if [ "$migrate_data" = "true" ]; then
-        db_migration_args+=("--data")
+        log_info "Migrating database data..."
+        local db_migration_args=("$source" "$target" "$migration_dir" "--data")
+        
+        if [ "$INCREMENTAL_MODE" = "true" ]; then
+            db_migration_args+=("--increment")
+        fi
+        if [ "$INCLUDE_USERS" = "true" ]; then
+            db_migration_args+=("--users")
+        fi
+        if [ "$BACKUP_TARGET" = "true" ]; then
+            db_migration_args+=("--backup")
+        fi
         if [ "$REPLACE_TARGET_DATA" = "true" ]; then
             db_migration_args+=("--replace-data")
         fi
-    fi
-    
-    if [ "$MODE" = "full" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
-        log_warning "Full mode selected without --replace-data: running data sync in delta mode to preserve target rows."
-    fi
-
-    if [ "$migrate_data" = "true" ] && [ "$REPLACE_TARGET_DATA" = "true" ]; then
-        log_warning "Data migration will REPLACE target data. Ensure you have backups and have confirmed this is intended."
-    elif [ "$migrate_data" = "true" ]; then
-        log_info "Data migration set to delta mode: existing target rows will be preserved. Only new data will be attempted."
-    fi
-
-    if [ "$migrate_data" = "true" ]; then
-        log_info "Migrating database (schema + data)..."
-    else
-        log_info "Migrating database (schema only - no data)..."
-    fi
-
-    if [ "$INCLUDE_USERS" = "true" ]; then
-        log_info "Auth users migration will run within the database migration step."
-    fi
-
-    if [ "$AUTO_CONFIRM" = "true" ]; then
-        db_migration_args+=("--auto-confirm")
-    fi
-
-    if ! prompt_proceed "Database Migration" "Proceed with database migration from $source to $target?"; then
-        log_warning "Database migration skipped by user."
-        SKIPPED_COMPONENTS+=("database")
-        log_to_file "$LOG_FILE" "Database migration: SKIPPED (user cancelled)"
-    else
-        log_to_file "$LOG_FILE" "Database migration: STARTING"
-        set +e  # Temporarily disable exit on error for component execution
-        if "$PROJECT_ROOT/scripts/components/database_migration.sh" "${db_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-            set -e
-            log_success "Database migration completed successfully"
-            SUCCEEDED_COMPONENTS+=("database")
-            log_to_file "$LOG_FILE" "Database migration: SUCCESS"
-        else
-            set -e
-            local db_exit_code=${PIPESTATUS[0]}
-            log_error "Database migration encountered errors (exit code: $db_exit_code)"
-            log_error "Continuing with remaining components..."
-            FAILED_COMPONENTS+=("database")
-            exit_code=1
-            log_to_file "$LOG_FILE" "Database migration: FAILED (exit code: $db_exit_code)"
+        
+        if [ "$MODE" = "full" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
+            log_warning "Full mode selected without --replace-data: running data sync in delta mode to preserve target rows."
         fi
+
+        if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+            log_warning "Data migration will REPLACE target data. Ensure you have backups and have confirmed this is intended."
+        else
+            log_info "Data migration set to delta mode: existing target rows will be preserved. Only new data will be attempted."
+        fi
+
+        if [ "$INCLUDE_USERS" = "true" ]; then
+            log_info "Auth users migration will run within the data migration step."
+        fi
+
+        if [ "$AUTO_CONFIRM" = "true" ]; then
+            db_migration_args+=("--auto-confirm")
+        fi
+
+        if ! prompt_proceed "Database Data Migration" "Proceed with database data migration from $source to $target?"; then
+            log_warning "Database data migration skipped by user."
+            SKIPPED_COMPONENTS+=("database data")
+            log_to_file "$LOG_FILE" "Database data migration: SKIPPED (user cancelled)"
+        else
+            log_to_file "$LOG_FILE" "Database data migration: STARTING"
+            set +e  # Temporarily disable exit on error for component execution
+            if "$PROJECT_ROOT/scripts/components/database_migration.sh" "${db_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                set -e
+                log_success "Database data migration completed successfully"
+                SUCCEEDED_COMPONENTS+=("database data")
+                log_to_file "$LOG_FILE" "Database data migration: SUCCESS"
+            else
+                set -e
+                local db_data_exit_code=${PIPESTATUS[0]}
+                log_error "Database data migration encountered errors (exit code: $db_data_exit_code)"
+                log_error "Continuing with remaining components..."
+                FAILED_COMPONENTS+=("database data")
+                exit_code=1
+                log_to_file "$LOG_FILE" "Database data migration: FAILED (exit code: $db_data_exit_code)"
+            fi
+        fi
+    else
+        log_info "Database data migration skipped (use --data to migrate data)"
+        SKIPPED_COMPONENTS+=("database data")
     fi
 
     # Step 2: Migrate storage buckets (configuration + optionally files)
@@ -1458,7 +1501,7 @@ perform_migration() {
     else
         log_to_file "$LOG_FILE" "Storage migration: STARTING"
         set +e
-        if "$PROJECT_ROOT/scripts/components/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+        if "$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
             set -e
             if [ "$INCLUDE_FILES" = "true" ]; then
                 log_success "Storage buckets migrated successfully (with files)"
@@ -1477,35 +1520,41 @@ perform_migration() {
         fi
     fi
     
-    # Step 3: Migrate edge functions
-    log_info "Migrating edge functions..."
-    # Call edge_functions_migration.sh component script
-    local edge_migration_cmd=("$PROJECT_ROOT/scripts/components/edge_functions_migration.sh" "$source" "$target" "$migration_dir")
-    if [ "$INCREMENTAL_MODE" = "true" ]; then
-        edge_migration_cmd+=("--increment")
-    fi
-    if [ "$AUTO_CONFIRM" = "true" ]; then
-        edge_migration_cmd+=("--auto-confirm")
-    fi
-    if ! prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $source to $target?"; then
-        log_warning "Edge functions migration skipped by user."
+    # Step 3: Migrate edge functions (unless --skipEdge is specified)
+    if [ "$SKIP_EDGE_FUNCTIONS" = "true" ]; then
+        log_info "Skipping edge functions migration (--skipEdge flag set)"
         SKIPPED_COMPONENTS+=("edge functions")
-        log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (user cancelled)"
+        log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (--skipEdge flag)"
     else
-        log_to_file "$LOG_FILE" "Edge functions migration: STARTING"
-        set +e
-        if "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-            set -e
-            log_success "Edge functions migrated successfully"
-            SUCCEEDED_COMPONENTS+=("edge functions")
-            log_to_file "$LOG_FILE" "Edge functions migration: SUCCESS"
+        log_info "Migrating edge functions..."
+        # Call edge_functions_migration.sh component script
+        local edge_migration_cmd=("$PROJECT_ROOT/scripts/main/edge_functions_migration.sh" "$source" "$target" "$migration_dir")
+        if [ "$INCREMENTAL_MODE" = "true" ]; then
+            edge_migration_cmd+=("--increment")
+        fi
+        if [ "$AUTO_CONFIRM" = "true" ]; then
+            edge_migration_cmd+=("--auto-confirm")
+        fi
+        if ! prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $source to $target?"; then
+            log_warning "Edge functions migration skipped by user."
+            SKIPPED_COMPONENTS+=("edge functions")
+            log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (user cancelled)"
         else
-            set -e
-            local edge_exit_code=${PIPESTATUS[0]}
-            log_warning "Edge functions migration had errors (exit code: $edge_exit_code), continuing..."
-            FAILED_COMPONENTS+=("edge functions")
-            exit_code=1
-            log_to_file "$LOG_FILE" "Edge functions migration: FAILED (exit code: $edge_exit_code)"
+            log_to_file "$LOG_FILE" "Edge functions migration: STARTING"
+            set +e
+            if "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                set -e
+                log_success "Edge functions migrated successfully"
+                SUCCEEDED_COMPONENTS+=("edge functions")
+                log_to_file "$LOG_FILE" "Edge functions migration: SUCCESS"
+            else
+                set -e
+                local edge_exit_code=${PIPESTATUS[0]}
+                log_warning "Edge functions migration had errors (exit code: $edge_exit_code), continuing..."
+                FAILED_COMPONENTS+=("edge functions")
+                exit_code=1
+                log_to_file "$LOG_FILE" "Edge functions migration: FAILED (exit code: $edge_exit_code)"
+            fi
         fi
     fi
     
@@ -1513,7 +1562,7 @@ perform_migration() {
     if [ "$INCLUDE_SECRETS" = "true" ]; then
         log_info "Migrating secrets..."
         # Call secrets_migration.sh component script
-        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target" "$migration_dir")
+        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/main/secrets_migration.sh" "$source" "$target" "$migration_dir")
         if [ "$INCREMENTAL_MODE" = "true" ]; then
             secrets_migration_cmd+=("--increment")
         fi
@@ -1546,50 +1595,8 @@ perform_migration() {
         SKIPPED_COMPONENTS+=("secrets")
     fi
 
-    # Step 5: Migrate policies / roles / RLS (profiles, user_roles, etc.)
-    # This ensures that tables like public.profiles have the same RLS policies
-    # and role mappings in the target as in the source.
-    local policies_script="$PROJECT_ROOT/scripts/components/policies_migration.sh"
-    if [ -x "$policies_script" ]; then
-        log_info "Synchronising policies, roles, and policy-related tables..."
-        local policies_args=("$source" "$target" "$migration_dir")
-        # If we're doing a full replace of data, default to a destructive policies sync
-        if [ "$REPLACE_TARGET_DATA" = "true" ]; then
-            policies_args+=("--replace")
-        fi
-        if [ "$AUTO_CONFIRM" = "true" ]; then
-            policies_args+=("--auto-confirm")
-        fi
-
-        # Policies migration is CRITICAL - always attempt it (but allow user to skip)
-        if ! prompt_proceed "Policies & RLS Migration" "Proceed with policies/roles/RLS migration from $source to $target? (CRITICAL for proper access control)"; then
-            log_warning "⚠️  Policies/roles migration skipped by user."
-            log_warning "   WARNING: Target system may have incorrect RLS policies and access control!"
-            SKIPPED_COMPONENTS+=("policies/roles/RLS")
-            log_to_file "$LOG_FILE" "Policies/RLS migration: SKIPPED (user cancelled) - WARNING: This may cause access control issues!"
-        else
-            log_to_file "$LOG_FILE" "Policies/RLS migration: STARTING (CRITICAL COMPONENT)"
-            set +e
-            if "$policies_script" "${policies_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-                set -e
-                log_success "Policies/roles/RLS migration completed successfully"
-                SUCCEEDED_COMPONENTS+=("policies/roles/RLS")
-                log_to_file "$LOG_FILE" "Policies/RLS migration: SUCCESS"
-            else
-                set -e
-                local policies_exit_code=${PIPESTATUS[0]}
-                log_error "⚠️  Policies/roles/RLS migration had errors (exit code: $policies_exit_code)"
-                log_error "   This is CRITICAL - target system may have incorrect access control!"
-                log_error "   Review $LOG_FILE and consider re-running policies migration"
-                FAILED_COMPONENTS+=("policies/roles/RLS")
-                exit_code=1
-                log_to_file "$LOG_FILE" "Policies/RLS migration: FAILED (exit code: $policies_exit_code) - CRITICAL ISSUE"
-            fi
-        fi
-    else
-        log_warning "Policies migration script not found at $policies_script; skipping policies/roles/RLS sync."
-        SKIPPED_COMPONENTS+=("policies/roles/RLS")
-    fi
+    # Note: Policies migration is now handled in Step 1 together with database schema
+    # via database_and_policy_migration.sh, so no separate policies migration step is needed
     
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "  COMPONENT SUMMARY"

@@ -131,7 +131,7 @@ else
     echo "[WARNING] auth_system_tables_migration.sh not found or not executable; skipping auth system table sync."
 fi
 
-POLICIES_SCRIPT="$PROJECT_ROOT/scripts/components/policies_migration.sh"
+POLICIES_SCRIPT="$PROJECT_ROOT/scripts/main/policies_migration_new.sh"
 if [ -x "$POLICIES_SCRIPT" ]; then
     echo "[INFO] Syncing policy/role tables..."
     if ! "$POLICIES_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-confirm; then
@@ -139,7 +139,7 @@ if [ -x "$POLICIES_SCRIPT" ]; then
         exit 1
     fi
 else
-    echo "[WARNING] policies_migration.sh not found or not executable; skipping policies sync."
+    echo "[WARNING] policies_migration_new.sh not found or not executable; skipping policies sync."
 fi
 
 RETRY_SCRIPT="$PROJECT_ROOT/scripts/components/retry_edge_functions.sh"

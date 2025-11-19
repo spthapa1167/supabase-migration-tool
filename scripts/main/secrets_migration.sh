@@ -62,9 +62,11 @@ Usage: $0 <source_env> <target_env> [migration_dir] [--values]
 Migrates Supabase secrets from source to target using delta comparison
 
 Default Behavior:
-  By default, only migrates SECRET KEYS with blank/placeholder values.
+  By default, only migrates NEW SECRET KEYS with blank/placeholder values.
   Secret values are NOT migrated for security reasons (values are secret).
-  Use --values flag to attempt migrating values (may require manual input or CLI access).
+  IMPORTANT: Only adds new secret keys from source. NEVER modifies or removes existing secrets in target.
+  Existing secret keys and values in target are preserved unchanged.
+  Use --values flag to attempt migrating values for new keys only (may require manual input or CLI access).
   Use --increment to explicitly request incremental/delta operations (default behaviour).
 
 Arguments:
@@ -360,66 +362,20 @@ for secret_name in $source_secret_names; do
     echo ""
 done
 
-# Step 4: Remove secrets from target that no longer exist in source
+# Step 4: Skip cleanup - never remove or modify existing secrets in target
+# Policy: Only add new secret keys from source, never alter existing secrets (keys or values)
 log_info ""
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log_info "  Removing Secrets Not in Source (Cleanup)"
+log_info "  Secrets Cleanup (Skipped)"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
+log_info "  ✓ Skipping cleanup: Existing secrets in target are preserved"
+log_info "  ✓ Only new secret keys from source are added"
+log_info "  ✓ Existing secret keys and values in target are never modified"
+echo ""
 
 removed_count=0
 removed_failed_count=0
-
-# Find secrets in target that don't exist in source
-for target_secret_name in $target_secret_names; do
-    target_secret_name=$(echo "$target_secret_name" | xargs)
-    [ -z "$target_secret_name" ] && continue
-
-    if [[ "$target_secret_name" == SUPABASE_* ]]; then
-        log_warning "  ⚠ Skipping removal of Supabase-managed secret: $target_secret_name"
-        continue
-    fi
-    
-    # Check if this secret exists in source
-    exists_in_source=false
-    if [ -n "$source_secret_names" ]; then
-        if echo "$source_secret_names" | grep -q "^${target_secret_name}$" 2>/dev/null; then
-            exists_in_source=true
-        fi
-    fi
-    
-    if [ "$exists_in_source" = "false" ]; then
-        # Secret exists in target but not in source - remove it
-        log_info "  Secret: $target_secret_name"
-        log_info "    Removing from target (not in source)..."
-        
-        # Use supabase secrets unset to remove the secret
-        # Use PIPESTATUS to properly capture exit code when using pipes
-        set +o pipefail  # Temporarily disable pipefail to check exit code manually
-        if supabase secrets unset "$target_secret_name" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
-            SECRET_EXIT_CODE=${PIPESTATUS[0]}
-            if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
-                log_success "    ✓ Removed: $target_secret_name"
-                removed_count=$((removed_count + 1))
-            else
-                log_error "    ✗ Failed to remove: $target_secret_name (exit code: $SECRET_EXIT_CODE)"
-                removed_failed_count=$((removed_failed_count + 1))
-            fi
-        else
-            SECRET_EXIT_CODE=${PIPESTATUS[0]}
-            log_error "    ✗ Failed to remove: $target_secret_name (exit code: $SECRET_EXIT_CODE)"
-            removed_failed_count=$((removed_failed_count + 1))
-        fi
-        set -o pipefail  # Re-enable pipefail
-        
-        echo ""
-    fi
-done
-
-if [ $removed_count -eq 0 ] && [ $removed_failed_count -eq 0 ]; then
-    log_info "  ✓ No secrets to remove (target is in sync with source)"
-    echo ""
-fi
 
 # Cleanup
 supabase unlink --yes 2>/dev/null || true
@@ -434,12 +390,16 @@ cat > "$summary_file" << EOF
 **Date**: $(date)
 **Mode**: $([ "$INCLUDE_VALUES" = "true" ] && echo "Keys + Values (attempted)" || echo "Keys Only (blank values)")
 
+## Migration Policy
+
+**IMPORTANT**: This migration only ADDS new secret keys from source. It NEVER modifies or removes existing secrets in target.
+
 ## Migration Results
 
-- **Migrated**: $migrated_count secret(s)
-- **Skipped**: $skipped_count secret(s) (already exist in target)
+- **Migrated**: $migrated_count secret(s) (new keys added)
+- **Skipped**: $skipped_count secret(s) (already exist in target - preserved unchanged)
 - **Failed**: $failed_count secret(s)
-- **Removed**: $removed_count secret(s) (removed from target - not in source)
+- **Removed**: $removed_count secret(s) (cleanup disabled - existing secrets preserved)
 - **Removal Failed**: $removed_failed_count secret(s)
 
 EOF

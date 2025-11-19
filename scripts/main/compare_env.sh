@@ -261,7 +261,7 @@ if ! "${PATCH_CMD[@]}"; then
     exit 3
 fi
 
-POLICIES_SCRIPT="$PROJECT_ROOT/scripts/components/policies_migration.sh"
+POLICIES_SCRIPT="$PROJECT_ROOT/scripts/main/policies_migration_new.sh"
 if [ -x "$POLICIES_SCRIPT" ]; then
     echo "[INFO] Syncing custom role/profile tables..."
     "$POLICIES_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-confirm || true
