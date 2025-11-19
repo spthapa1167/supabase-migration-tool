@@ -29,7 +29,7 @@ The `supabase_clone.sh` script is designed to create an **exact clone** of a sou
    - `migrate_all_table_data.sh` → Extra guarantee for public schema data replacement
    - `authUsers_migration.sh --replace` → Extra guarantee for auth users replacement
    - `auth_system_tables_migration.sh` → Syncs auth system tables (audit logs, sessions, tokens, MFA)
-   - `policies_migration.sh` → Extra guarantee for policies/roles (redundant but safe)
+   - `policies_migration_new.sh` → Extra guarantee for policies/roles (redundant but safe)
    - `retry_edge_functions.sh` → Retries any failed edge function deployments
    - `compare_env.sh` → Verifies environment parity
 
@@ -38,7 +38,7 @@ The `supabase_clone.sh` script is designed to create an **exact clone** of a sou
 ### ✅ Database Schema & Data
 - [x] Tables, indexes, constraints, functions, sequences → **Covered by main migration**
 - [x] All table rows → **Covered by `--replace-data` + `migrate_all_table_data.sh`**
-- [x] RLS policies → **Covered by main migration (policies_migration.sh step)**
+- [x] RLS policies → **Covered by main migration (policies_migration_new.sh step)**
 - [x] Database functions → **Covered by main migration**
 
 ### ✅ Authentication & Authorization
@@ -47,8 +47,8 @@ The `supabase_clone.sh` script is designed to create an **exact clone** of a sou
 - [x] Auth sessions (`auth.sessions`) → **Covered by `--users`**
 - [x] Auth refresh tokens → **Covered by `--users`**
 - [x] Auth system tables (audit logs, MFA) → **Covered by `auth_system_tables_migration.sh`**
-- [x] Roles (`auth.roles`) → **Covered by `policies_migration.sh`**
-- [x] User roles (`auth.user_roles`, `public.user_roles`) → **Covered by `policies_migration.sh`**
+- [x] Roles (`auth.roles`) → **Covered by `policies_migration_new.sh`**
+- [x] User roles (`auth.user_roles`, `public.user_roles`) → **Covered by `policies_migration_new.sh`**
 
 ### ✅ Storage
 - [x] Bucket configurations → **Covered by main migration**
@@ -73,7 +73,7 @@ The `supabase_clone.sh` script is designed to create an **exact clone** of a sou
 ### 1. Redundancy (Safe but Could Be Optimized)
 
 **Current**: Some steps are redundant:
-- `policies_migration.sh` is called twice (once in main migration, once in clone script)
+- `policies_migration_new.sh` is called twice (once in main migration, once in clone script)
 - `authUsers_migration.sh --replace` is redundant if `--users --replace-data` already handles it
 - `migrate_all_table_data.sh` might be redundant if `--replace-data` already does this
 

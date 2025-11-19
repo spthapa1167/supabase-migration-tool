@@ -356,9 +356,9 @@ app.get('/api/info', (req, res) => {
             main: 'scripts/main/supabase_migration.sh',
             plan: 'scripts/main/migration_plan.sh',
             database: 'scripts/components/database_migration.sh',
-            storage: 'scripts/components/storage_buckets_migration.sh',
-            edgeFunctions: 'scripts/components/edge_functions_migration.sh',
-            secrets: 'scripts/components/secrets_migration.sh'
+            storage: 'scripts/main/storage_buckets_migration.sh',
+            edgeFunctions: 'scripts/main/edge_functions_migration.sh',
+            secrets: 'scripts/main/secrets_migration.sh'
         }
     });
 });
@@ -1028,7 +1028,7 @@ app.post('/api/migration/storage', async (req, res) => {
         const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/components/storage_buckets_migration.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/storage_buckets_migration.sh');
             await fs.access(fullPath, fs.constants.F_OK);
             
             const allArgs = args.filter(arg => arg !== null && arg !== undefined);
@@ -1094,7 +1094,7 @@ app.post('/api/migration/storage', async (req, res) => {
     } else {
         // Non-streaming mode
         try {
-            const result = await executeScript('scripts/components/storage_buckets_migration.sh', args);
+            const result = await executeScript('scripts/main/storage_buckets_migration.sh', args);
             res.json(result);
         } catch (error) {
             res.status(500).json(error);
@@ -1123,7 +1123,7 @@ app.post('/api/migration/edge-functions', async (req, res) => {
         const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/components/edge_functions_migration.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/edge_functions_migration.sh');
             await fs.access(fullPath, fs.constants.F_OK);
             
             const allArgs = args.filter(arg => arg !== null && arg !== undefined);
@@ -1188,7 +1188,7 @@ app.post('/api/migration/edge-functions', async (req, res) => {
     } else {
         // Non-streaming mode
         try {
-            const result = await executeScript('scripts/components/edge_functions_migration.sh', args);
+            const result = await executeScript('scripts/main/edge_functions_migration.sh', args);
             res.json(result);
         } catch (error) {
             res.status(500).json(error);
@@ -1218,7 +1218,7 @@ app.post('/api/migration/secrets', async (req, res) => {
         const processId = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         
         try {
-            const fullPath = path.join(PROJECT_ROOT, 'scripts/components/secrets_migration.sh');
+            const fullPath = path.join(PROJECT_ROOT, 'scripts/main/secrets_migration.sh');
             await fs.access(fullPath, fs.constants.F_OK);
             
             const allArgs = args.filter(arg => arg !== null && arg !== undefined);
@@ -1284,7 +1284,7 @@ app.post('/api/migration/secrets', async (req, res) => {
     } else {
         // Non-streaming mode
         try {
-            const result = await executeScript('scripts/components/secrets_migration.sh', args);
+            const result = await executeScript('scripts/main/secrets_migration.sh', args);
             res.json(result);
         } catch (error) {
             res.status(500).json(error);

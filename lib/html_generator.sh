@@ -626,8 +626,8 @@ generate_result_html() {
     target_table_count=${target_tables:-0}
     
     # Debug: Log all counts to verify they're set
-    log_info "Count variables set - Source: tables=$source_tables, views=$source_views, functions=$source_functions, edge_functions=$source_edge_functions, buckets=$source_buckets, secrets=$source_secrets, auth_users=$source_auth_users"
-    log_info "Count variables set - Target: tables=$target_tables, views=$target_views, functions=$target_functions, edge_functions=$target_edge_functions, buckets=$target_buckets, secrets=$target_secrets, auth_users=$target_auth_users"
+    log_info "Count variables set - Source: tables=$source_tables, views=$source_views, functions=$source_functions, policies=$source_policies, edge_functions=$source_edge_functions, buckets=$source_buckets, secrets=$source_secrets, auth_users=$source_auth_users"
+    log_info "Count variables set - Target: tables=$target_tables, views=$target_views, functions=$target_functions, policies=$target_policies, edge_functions=$target_edge_functions, buckets=$target_buckets, secrets=$target_secrets, auth_users=$target_auth_users"
     
     # Extract object names for comparison
     local source_table_names=""

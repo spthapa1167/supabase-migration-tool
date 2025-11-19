@@ -678,7 +678,7 @@
                 <span class="badge component">COMPONENT</span>
                 <span class="badge success">STORAGE</span>
                 
-                <p class="script-path">scripts/components/storage_buckets_migration.sh</p>
+                <p class="script-path">scripts/main/storage_buckets_migration.sh</p>
 
                 <h3>Purpose</h3>
                 <p>Migrates storage bucket configurations and optionally bucket files from source to target. Uses smart delta comparison to only migrate what's needed.</p>
@@ -706,7 +706,7 @@
                 <h3>Usage</h3>
                 <div class="usage-example">
                     <h4>Basic Syntax</h4>
-                    <pre><code>./scripts/components/storage_buckets_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir] [OPTIONS]</code></pre>
+                    <pre><code>./scripts/main/storage_buckets_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir] [OPTIONS]</code></pre>
                 </div>
 
                 <h4>Flags</h4>
@@ -735,16 +735,16 @@
 
                 <h4>Examples</h4>
                 <pre><code># Bucket configuration only (default)
-./scripts/components/storage_buckets_migration.sh dev test
+./scripts/main/storage_buckets_migration.sh dev test
 
 # Buckets + files migration
-./scripts/components/storage_buckets_migration.sh dev test --file
+./scripts/main/storage_buckets_migration.sh dev test --file
 
 # Same as above
-./scripts/components/storage_buckets_migration.sh dev test --files
+./scripts/main/storage_buckets_migration.sh dev test --files
 
 # Custom migration directory
-./scripts/components/storage_buckets_migration.sh dev test /path/to/backup --file</code></pre>
+./scripts/main/storage_buckets_migration.sh dev test /path/to/backup --file</code></pre>
 
                 <h3>Smart Migration Behavior</h3>
                 <ul>
@@ -783,7 +783,7 @@
                 <span class="badge component">COMPONENT</span>
                 <span class="badge success">EDGE FUNCTIONS</span>
                 
-                <p class="script-path">scripts/components/edge_functions_migration.sh</p>
+                <p class="script-path">scripts/main/edge_functions_migration.sh</p>
 
                 <h3>Purpose</h3>
                 <p>Migrates edge functions from source to target. Downloads functions from source and deploys them to target. Uses smart delta comparison.</p>
@@ -811,7 +811,7 @@
                 <h3>Usage</h3>
                 <div class="usage-example">
                     <h4>Basic Syntax</h4>
-                    <pre><code>./scripts/components/edge_functions_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir]</code></pre>
+                    <pre><code>./scripts/main/edge_functions_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir]</code></pre>
                 </div>
 
                 <h4>Arguments</h4>
@@ -840,10 +840,10 @@
 
                 <h4>Examples</h4>
                 <pre><code># Migrate edge functions
-./scripts/components/edge_functions_migration.sh dev test
+./scripts/main/edge_functions_migration.sh dev test
 
 # Custom migration directory
-./scripts/components/edge_functions_migration.sh dev test /path/to/backup</code></pre>
+./scripts/main/edge_functions_migration.sh dev test /path/to/backup</code></pre>
 
                 <h3>Smart Migration Behavior</h3>
                 <ul>
@@ -887,7 +887,7 @@
                 <span class="badge component">COMPONENT</span>
                 <span class="badge success">SECRETS</span>
                 
-                <p class="script-path">scripts/components/secrets_migration.sh</p>
+                <p class="script-path">scripts/main/secrets_migration.sh</p>
 
                 <h3>Purpose</h3>
                 <p>Migrates secrets (environment variables) from source to target. Creates secret keys in target with blank values (values must be updated manually for security reasons).</p>
@@ -917,7 +917,7 @@
                 <h3>Usage</h3>
                 <div class="usage-example">
                     <h4>Basic Syntax</h4>
-                    <pre><code>./scripts/components/secrets_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir] [OPTIONS]</code></pre>
+                    <pre><code>./scripts/main/secrets_migration.sh &lt;source_env&gt; &lt;target_env&gt; [migration_dir] [OPTIONS]</code></pre>
                 </div>
 
                 <h4>Flags</h4>
@@ -936,13 +936,13 @@
 
                 <h4>Examples</h4>
                 <pre><code># Migrate secret keys (default - blank values)
-./scripts/components/secrets_migration.sh dev test
+./scripts/main/secrets_migration.sh dev test
 
 # Attempt to migrate values (may not work due to security)
-./scripts/components/secrets_migration.sh dev test --values
+./scripts/main/secrets_migration.sh dev test --values
 
 # Custom migration directory
-./scripts/components/secrets_migration.sh dev test /path/to/backup</code></pre>
+./scripts/main/secrets_migration.sh dev test /path/to/backup</code></pre>
 
                 <h3>Important Notes</h3>
                 <div class="info-box">
@@ -1111,7 +1111,7 @@
             <p>Always use <code>--backup</code> when migrating from production.</p>
 
             <h4>Scenario 4: Targeted Migration (Storage Only)</h4>
-            <pre><code>./scripts/components/storage_buckets_migration.sh dev test --file</code></pre>
+            <pre><code>./scripts/main/storage_buckets_migration.sh dev test --file</code></pre>
             <p>Use component scripts for targeted migrations.</p>
         </section>
 
