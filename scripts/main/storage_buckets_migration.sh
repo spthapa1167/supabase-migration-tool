@@ -27,9 +27,12 @@ Usage: $0 <source_env> <target_env> [migration_dir] [--include-files|--exclude-f
 Migrates storage buckets (configuration + files) from source to target using delta comparison
 
 Default Behavior:
-  By default, migrates BUCKET CONFIGURATION ONLY (no files).
-  Use --file or --files flag to include file migration.
-  Use --increment to explicitly request incremental/delta mode (default behaviour).
+  By default, migrates ONLY NEW BUCKET NAMES (buckets that exist in source but not in target).
+  This is incremental mode - only newly added buckets are created in the target.
+  No files are migrated by default.
+
+With --files flag:
+  Migrates ALL buckets with their files. Creates missing buckets and transfers all files.
 
 Arguments:
   source_env     Source environment (prod, test, dev, backup)
@@ -41,11 +44,11 @@ Arguments:
   --increment      Prefer incremental/delta operations (default: enabled)
 
 Examples:
-  $0 dev test                          # Migrate buckets only (default - no files)
-  $0 dev test --file                   # Migrate buckets + files
-  $0 dev test --files                  # Migrate buckets + files (same as --file)
-  $0 prod test /path/to/backup         # Migrate buckets only with custom backup directory
-  $0 prod test /path/to/backup --file  # Custom directory, buckets + files
+  $0 dev test                          # Migrate only NEW bucket names (incremental - no files)
+  $0 dev test --file                   # Migrate ALL buckets with files
+  $0 dev test --files                  # Migrate ALL buckets with files (same as --file)
+  $0 prod test /path/to/backup         # Migrate only new bucket names with custom backup directory
+  $0 prod test /path/to/backup --file  # Custom directory, ALL buckets with files
 
 Returns:
   0 on success, 1 on failure
@@ -205,12 +208,13 @@ if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
 fi
 
 # Migrate buckets with delta comparison and file migration using Node.js utility
-# Default behavior: bucket configuration only (no files)
+# Default behavior: Only migrate NEW bucket names (incremental - buckets that exist in source but not in target)
+# With --files: Migrate ALL buckets with files
 if [ "$INCLUDE_FILES" = "true" ]; then
-    log_info "Migrating storage buckets (delta migration: buckets + files)..."
+    log_info "Migrating storage buckets (ALL buckets + files)..."
     INCLUDE_FILES_FLAG="--include-files"
 else
-    log_info "Migrating storage buckets (delta migration: bucket config only, no files)..."
+    log_info "Migrating storage buckets (incremental mode: only NEW bucket names, no files)..."
     INCLUDE_FILES_FLAG="--exclude-files"
 fi
 
