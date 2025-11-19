@@ -573,6 +573,8 @@ async function migrateStorage() {
     let skippedCount = 0;
     
     // Step 3: Smart migration - compare buckets and files
+    // Default behavior: Only migrate buckets that are new (exist in source but not in target)
+    // With --files: Migrate all buckets with files
     for (let i = 0; i < sourceBuckets.length; i++) {
         const sourceBucket = sourceBuckets[i];
         const bucketName = sourceBucket.name;
@@ -592,6 +594,7 @@ async function migrateStorage() {
         const existingBucket = targetBucketMap.get(bucketName);
         let bucketNeedsCreation = false;
         let bucketConfigMatches = false;
+        let isNewBucket = false;
         
         if (existingBucket) {
             logInfo(`  Target Configuration:`);
@@ -614,14 +617,22 @@ async function migrateStorage() {
             );
             
             if (bucketConfigMatches) {
-                logSuccess(`  ✓ Bucket configuration matches - no update needed`);
+                logSuccess(`  ✓ Bucket exists in target with matching configuration`);
             } else {
-                logWarning(`  ⚠ Bucket configuration differs - note: bucket updates via API are not supported`);
+                logWarning(`  ⚠ Bucket exists in target but configuration differs - note: bucket updates via API are not supported`);
                 logInfo(`    Continuing with file migration only...`);
+            }
+            
+            // If files are not included, skip this bucket (it already exists)
+            if (!INCLUDE_FILES) {
+                logInfo(`  ⏭️  Skipping bucket (already exists in target, and file migration not requested)`);
+                console.log('');
+                continue;
             }
         } else {
             bucketNeedsCreation = true;
-            logInfo(`  Bucket does not exist in target - will create`);
+            isNewBucket = true;
+            logInfo(`  ✓ Bucket does not exist in target - will create (new bucket)`);
         }
         
         // Step 4: Migrate files if requested
@@ -786,9 +797,10 @@ async function migrateStorage() {
             }
             console.log('');
         } else {
-            // Files not included - only create bucket if needed
-            if (bucketNeedsCreation) {
-                logInfo(`  Creating bucket in target...`);
+            // Files not included - only create NEW buckets (incremental mode)
+            // This is the default behavior: only migrate bucket names that are newly added to source
+            if (bucketNeedsCreation && isNewBucket) {
+                logInfo(`  Creating new bucket in target (incremental mode: only new buckets)...`);
                 const bucketConfig = {
                     name: bucketName,
                     public: sourceBucket.public || false,
@@ -807,9 +819,10 @@ async function migrateStorage() {
                 }
                 
                 migratedCount++;
-                logSuccess(`  ✓ Bucket created successfully`);
-            } else if (bucketConfigMatches) {
-                logSuccess(`  ✓ Bucket configuration matches - no action needed`);
+                logSuccess(`  ✓ New bucket created successfully (bucket name only, no files)`);
+            } else {
+                // Bucket already exists - skip in default mode (no files)
+                logInfo(`  ⏭️  Bucket already exists in target - skipping (use --files to migrate files)`);
             }
             console.log('');
         }

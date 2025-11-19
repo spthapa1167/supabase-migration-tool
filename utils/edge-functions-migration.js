@@ -724,9 +724,13 @@ function deleteEdgeFunction(functionName, targetRef, dbPassword) {
 }
 
 // Deploy edge function using Supabase CLI
-function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
+async function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, retryCount = 0, maxRetries = 2) {
     try {
-        logInfo(`    Deploying function: ${functionName}...`);
+        if (retryCount === 0) {
+            logInfo(`    Deploying function: ${functionName}...`);
+        } else {
+            logWarning(`    Retrying deployment (attempt ${retryCount + 1}/${maxRetries + 1}): ${functionName}...`);
+        }
         
         // Check if function directory exists
         if (!fs.existsSync(functionDir)) {
@@ -769,17 +773,52 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
         }
         fs.cpSync(functionDir, tempFunctionPath, { recursive: true });
 
-        const globalSharedDir = path.join(functionsParentDir, '_shared');
-        const localSharedDir = path.join(functionDir, '_shared');
+        // Find and copy shared files from multiple possible locations
         const sharedDestDir = path.join(supabaseDir, '_shared');
         if (fs.existsSync(sharedDestDir)) {
             fs.rmSync(sharedDestDir, { recursive: true, force: true });
         }
-        if (fs.existsSync(globalSharedDir)) {
-            mergeDirectories(globalSharedDir, sharedDestDir);
+        
+        // Check multiple locations for shared files:
+        // 1. Global shared directory at functions root (most common)
+        const globalSharedDir = path.join(functionsParentDir, '_shared');
+        // 2. Local shared directory in function folder
+        const localSharedDir = path.join(functionDir, '_shared');
+        // 3. Shared directory in nested functions structure (from download)
+        const nestedSharedDir = path.join(functionDir, 'functions', '_shared');
+        // 4. Shared directory in supabase/functions structure (if already normalized)
+        const normalizedSharedDir = path.join(functionsParentDir, 'supabase', 'functions', '_shared');
+        
+        // Merge shared files from all found locations
+        const sharedDirs = [globalSharedDir, localSharedDir, nestedSharedDir, normalizedSharedDir];
+        let sharedFilesFound = false;
+        
+        for (const sharedSourceDir of sharedDirs) {
+            if (fs.existsSync(sharedSourceDir) && fs.lstatSync(sharedSourceDir).isDirectory()) {
+                mergeDirectories(sharedSourceDir, sharedDestDir);
+                sharedFilesFound = true;
+                if (retryCount === 0) {
+                    logInfo(`    Found shared files at: ${path.relative(functionsParentDir, sharedSourceDir)}`);
+                }
+            }
         }
-        if (fs.existsSync(localSharedDir)) {
-            mergeDirectories(localSharedDir, sharedDestDir);
+        
+        // If no shared files found, check if function references shared files and warn
+        if (!sharedFilesFound) {
+            // Check if function code references _shared
+            const functionIndexPath = path.join(tempFunctionPath, 'index.ts');
+            const functionIndexJsPath = path.join(tempFunctionPath, 'index.js');
+            let functionCode = '';
+            if (fs.existsSync(functionIndexPath)) {
+                functionCode = fs.readFileSync(functionIndexPath, 'utf8');
+            } else if (fs.existsSync(functionIndexJsPath)) {
+                functionCode = fs.readFileSync(functionIndexJsPath, 'utf8');
+            }
+            
+            if (functionCode.includes('_shared') || functionCode.includes('../_shared') || functionCode.includes('./_shared')) {
+                logWarning(`    ⚠ Function references _shared files but none found - deployment may fail`);
+                logWarning(`    Searched in: ${sharedDirs.map(d => path.relative(functionsParentDir, d)).join(', ')}`);
+            }
         }
         
         // Change to supabase directory and link
@@ -787,7 +826,9 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
         
         try {
             // Link to target project (in supabase directory)
-            logInfo(`    Linking to target project...`);
+            if (retryCount === 0) {
+                logInfo(`    Linking to target project...`);
+            }
             if (!linkProject(targetRef, dbPassword)) {
                 throw new Error('Failed to link to target project');
             }
@@ -803,7 +844,11 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
             // Cleanup temp structure
             fs.rmSync(supabaseConfigDir, { recursive: true, force: true });
             
-            logSuccess(`    ✓ Deployed function: ${functionName}`);
+            if (retryCount > 0) {
+                logSuccess(`    ✓ Deployed function after retry: ${functionName}`);
+            } else {
+                logSuccess(`    ✓ Deployed function: ${functionName}`);
+            }
             return true;
         } catch (e) {
             process.chdir(originalCwd);
@@ -814,8 +859,23 @@ function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
             throw e;
         }
     } catch (error) {
-        logError(`    ✗ Failed to deploy function ${functionName}: ${error.message}`);
-        return false;
+        // If we haven't exceeded max retries, retry the deployment
+        if (retryCount < maxRetries) {
+            const waitTime = (retryCount + 1) * 2; // Exponential backoff: 2s, 4s
+            logWarning(`    ⚠ Deployment failed (attempt ${retryCount + 1}/${maxRetries + 1}): ${error.message}`);
+            logInfo(`    Waiting ${waitTime} seconds before retry...`);
+            
+            // Wait before retrying
+            const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+            await sleep(waitTime * 1000);
+            
+            // Retry deployment
+            return deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, retryCount + 1, maxRetries);
+        } else {
+            // Max retries exceeded
+            logError(`    ✗ Failed to deploy function ${functionName} after ${maxRetries + 1} attempts: ${error.message}`);
+            return false;
+        }
     }
 }
 
@@ -1063,6 +1123,10 @@ async function migrateEdgeFunctions() {
                 continue;
             }
             
+            // Ensure shared files are normalized to functionsDir/_shared after download
+            // This is important for deployment to find shared files
+            normalizeFunctionLayout(functionDir, functionsDir);
+            
             logSuccess(`  ✓ Downloaded function: ${functionName}`);
             
             // For existing functions, compare with target before deploying (skip comparison in replace mode)
@@ -1110,15 +1174,16 @@ async function migrateEdgeFunctions() {
                 }
             }
             
-            // Deploy function to target
-            const deploySuccess = deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword);
+            // Deploy function to target (with automatic retry logic - max 2 retries)
+            const deploySuccess = await deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword);
             
             if (deploySuccess) {
                 migratedFunctions.push(functionName);
                 logSuccess(`  ✓ Function ${isNew ? 'created' : 'updated'} successfully`);
             } else {
                 failedFunctions.push(functionName);
-                logError(`  ✗ Function migration failed`);
+                logError(`  ✗ Function migration failed after retries`);
+                logInfo(`  This function will be added to the retry list for manual retry via retry_edge_functions.sh`);
             }
             
             console.log('');
