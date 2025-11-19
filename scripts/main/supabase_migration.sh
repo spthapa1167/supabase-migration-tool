@@ -1390,14 +1390,15 @@ perform_migration() {
     else
         log_to_file "$LOG_FILE" "Database schema & policies migration: STARTING (CRITICAL COMPONENT)"
         set +e  # Temporarily disable exit on error for component execution
-        if "$PROJECT_ROOT/scripts/main/database_and_policy_migration.sh" "${db_policy_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-            set -e
+        "$PROJECT_ROOT/scripts/main/database_and_policy_migration.sh" "${db_policy_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+        local db_policy_exit_code=${PIPESTATUS[0]}
+        set -e
+        
+        if [ "$db_policy_exit_code" -eq 0 ]; then
             log_success "Database schema and policies migration completed successfully"
             SUCCEEDED_COMPONENTS+=("database schema & policies")
             log_to_file "$LOG_FILE" "Database schema & policies migration: SUCCESS"
         else
-            set -e
-            local db_policy_exit_code=${PIPESTATUS[0]}
             log_error "⚠️  Database schema and policies migration encountered errors (exit code: $db_policy_exit_code)"
             log_error "   This is CRITICAL - target system may have incorrect schema and access control!"
             log_error "   Review $LOG_FILE and consider re-running migration"

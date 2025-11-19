@@ -832,13 +832,15 @@ if [ "$sql_applied" != "true" ]; then
             wc -l | tr -d '[:space:]' || echo "0")
         
         if [ "$non_system_errors" -eq 0 ]; then
-            log_info "All errors were system errors (expected) - considering migration successful"
+            log_success "All errors were system errors (expected) - migration successful"
             log_to_file "$LOG_FILE" "INFO: All errors were system errors - migration successful"
             sql_applied=true
+            # Continue execution - don't exit here
         else
             log_error "Failed to apply schema to target via any connection method"
             log_error "Found $non_system_errors critical error(s) in logs"
             log_to_file "$LOG_FILE" "ERROR: Failed to apply schema to target ($non_system_errors critical errors)"
+            log_to_file "$LOG_FILE" "ERROR: Migration failed - exiting with error code 1"
             exit 1
         fi
     else
@@ -994,3 +996,6 @@ log_info "  diff $SCHEMA_DUMP_FILE $TARGET_SCHEMA_AFTER"
 log_info ""
 
 echo "$MIGRATION_DIR_ABS"
+
+# Explicitly exit with success code
+exit 0
