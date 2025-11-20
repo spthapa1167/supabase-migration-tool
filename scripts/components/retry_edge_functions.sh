@@ -167,6 +167,42 @@ RETRY_DIR_RELATIVE=$(create_backup_dir "edge_functions_retry" "$SOURCE_ENV" "$TA
 RETRY_DIR_ABS="$(cd "$RETRY_DIR_RELATIVE" && pwd)"
 log_info "Retry attempt directory: $RETRY_DIR_ABS"
 
+# Copy shared files from original migration directory to retry directory
+# This ensures shared dependencies are available for retry deployments
+ORIG_EDGE_FUNCTIONS_DIR="$MIGRATION_DIR_ABS/edge_functions"
+RETRY_EDGE_FUNCTIONS_DIR="$RETRY_DIR_ABS/edge_functions"
+ORIG_SHARED_DIR="$ORIG_EDGE_FUNCTIONS_DIR/_shared"
+RETRY_SHARED_DIR="$RETRY_EDGE_FUNCTIONS_DIR/_shared"
+
+if [ -d "$ORIG_SHARED_DIR" ]; then
+    log_info "Copying shared files from original migration to retry directory..."
+    mkdir -p "$RETRY_EDGE_FUNCTIONS_DIR"
+    if [ -d "$RETRY_SHARED_DIR" ]; then
+        rm -rf "$RETRY_SHARED_DIR"
+    fi
+    cp -r "$ORIG_SHARED_DIR" "$RETRY_SHARED_DIR"
+    SHARED_FILES=$(ls -1 "$RETRY_SHARED_DIR" 2>/dev/null | wc -l | tr -d '[:space:]' || echo "0")
+    if [ "$SHARED_FILES" -gt 0 ]; then
+        log_success "Copied $SHARED_FILES shared file(s) to retry directory"
+    fi
+fi
+
+# Also check for shared files in project root
+PROJECT_SHARED_DIR="$PROJECT_ROOT/supabase/functions/_shared"
+if [ -d "$PROJECT_SHARED_DIR" ]; then
+    log_info "Merging shared files from project root..."
+    mkdir -p "$RETRY_SHARED_DIR"
+    # Copy files from project root, but don't overwrite existing ones
+    for file in "$PROJECT_SHARED_DIR"/*; do
+        if [ -f "$file" ]; then
+            filename=$(basename "$file")
+            if [ ! -f "$RETRY_SHARED_DIR/$filename" ]; then
+                cp "$file" "$RETRY_SHARED_DIR/"
+            fi
+        fi
+    done
+fi
+
 EDGE_FUNCTIONS_UTIL="$PROJECT_ROOT/utils/edge-functions-migration.js"
 if [ ! -f "$EDGE_FUNCTIONS_UTIL" ]; then
     log_error "Edge functions utility not found at $EDGE_FUNCTIONS_UTIL"

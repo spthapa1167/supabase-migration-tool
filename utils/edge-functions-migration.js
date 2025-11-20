@@ -536,6 +536,21 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             fs.rmSync(finalFunctionPath, { recursive: true, force: true });
             fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
             fs.cpSync(downloadedFunctionPath, finalFunctionPath, { recursive: true });
+            
+            // IMPORTANT FIX: Copy shared files from temp download directory to migration directory
+            // When supabase functions download runs, shared files are in supabase/functions/_shared/
+            const tempSharedDir = path.join(tempDir, 'supabase', 'functions', '_shared');
+            const migrationSharedDir = path.join(downloadDir, '_shared');
+            if (fs.existsSync(tempSharedDir) && fs.lstatSync(tempSharedDir).isDirectory()) {
+                if (!fs.existsSync(migrationSharedDir)) {
+                    fs.mkdirSync(migrationSharedDir, { recursive: true });
+                }
+                mergeDirectories(tempSharedDir, migrationSharedDir);
+                if (!quiet) {
+                    logInfo(`    Found and copied shared files from download`);
+                }
+            }
+            
             normalizeFunctionLayout(finalFunctionPath, downloadDir);
 
             if (!quiet) {
@@ -555,6 +570,20 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             fs.rmSync(finalFunctionPath, { recursive: true, force: true });
             fs.mkdirSync(path.dirname(finalFunctionPath), { recursive: true });
             fs.cpSync(fallbackDir, finalFunctionPath, { recursive: true });
+            
+            // Also copy shared files from local repository if they exist
+            const localSharedDir = path.join(PROJECT_ROOT, 'supabase', 'functions', '_shared');
+            const migrationSharedDir = path.join(downloadDir, '_shared');
+            if (fs.existsSync(localSharedDir) && fs.lstatSync(localSharedDir).isDirectory()) {
+                if (!fs.existsSync(migrationSharedDir)) {
+                    fs.mkdirSync(migrationSharedDir, { recursive: true });
+                }
+                mergeDirectories(localSharedDir, migrationSharedDir);
+                if (!quiet) {
+                    logInfo(`    Found and copied shared files from local repository`);
+                }
+            }
+            
             normalizeFunctionLayout(finalFunctionPath, downloadDir);
             if (!quiet) {
                 logSuccess(`    ✓ Copied local function source for ${functionName}`);
@@ -724,13 +753,10 @@ function deleteEdgeFunction(functionName, targetRef, dbPassword) {
 }
 
 // Deploy edge function using Supabase CLI
-async function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, retryCount = 0, maxRetries = 2) {
+// Note: No retry logic - failures are added to retry list for manual retry
+async function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword) {
     try {
-        if (retryCount === 0) {
-            logInfo(`    Deploying function: ${functionName}...`);
-        } else {
-            logWarning(`    Retrying deployment (attempt ${retryCount + 1}/${maxRetries + 1}): ${functionName}...`);
-        }
+        logInfo(`    Deploying function: ${functionName}...`);
         
         // Check if function directory exists
         if (!fs.existsSync(functionDir)) {
@@ -774,13 +800,16 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
         fs.cpSync(functionDir, tempFunctionPath, { recursive: true });
 
         // Find and copy shared files from multiple possible locations
+        // CRITICAL: Shared files must be in supabase/functions/_shared/ for deployment to work
         const sharedDestDir = path.join(supabaseDir, '_shared');
-        if (fs.existsSync(sharedDestDir)) {
-            fs.rmSync(sharedDestDir, { recursive: true, force: true });
+        
+        // Ensure destination directory exists
+        if (!fs.existsSync(sharedDestDir)) {
+            fs.mkdirSync(sharedDestDir, { recursive: true });
         }
         
         // Check multiple locations for shared files:
-        // 1. Global shared directory at functions root (most common)
+        // 1. Global shared directory at functions root (most common) - this is where we copy them during download
         const globalSharedDir = path.join(functionsParentDir, '_shared');
         // 2. Local shared directory in function folder
         const localSharedDir = path.join(functionDir, '_shared');
@@ -788,23 +817,119 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
         const nestedSharedDir = path.join(functionDir, 'functions', '_shared');
         // 4. Shared directory in supabase/functions structure (if already normalized)
         const normalizedSharedDir = path.join(functionsParentDir, 'supabase', 'functions', '_shared');
+        // 5. Shared directory from migration root (if functions are in a subdirectory)
+        const migrationRootSharedDir = path.join(path.dirname(functionsParentDir), '_shared');
+        // 6. Shared directory from project root (local repository)
+        const projectRootSharedDir = path.join(PROJECT_ROOT, 'supabase', 'functions', '_shared');
         
         // Merge shared files from all found locations
-        const sharedDirs = [globalSharedDir, localSharedDir, nestedSharedDir, normalizedSharedDir];
+        const sharedDirs = [globalSharedDir, localSharedDir, nestedSharedDir, normalizedSharedDir, migrationRootSharedDir, projectRootSharedDir];
         let sharedFilesFound = false;
+        const foundLocations = [];
         
         for (const sharedSourceDir of sharedDirs) {
             if (fs.existsSync(sharedSourceDir) && fs.lstatSync(sharedSourceDir).isDirectory()) {
-                mergeDirectories(sharedSourceDir, sharedDestDir);
-                sharedFilesFound = true;
-                if (retryCount === 0) {
-                    logInfo(`    Found shared files at: ${path.relative(functionsParentDir, sharedSourceDir)}`);
+                const sourceFiles = fs.readdirSync(sharedSourceDir);
+                if (sourceFiles.length > 0) {
+                    logInfo(`    Found shared files at: ${path.relative(functionsParentDir, sharedSourceDir)} (${sourceFiles.length} file(s))`);
+                    foundLocations.push(sharedSourceDir);
+                    sharedFilesFound = true;
                 }
             }
         }
         
-        // If no shared files found, check if function references shared files and warn
+        // If still no shared files found, check the migration directory structure more thoroughly
         if (!sharedFilesFound) {
+            // Try to find _shared in any parent directory up to the migration root
+            let currentDir = functionsParentDir;
+            const maxDepth = 5; // Prevent infinite loops
+            let depth = 0;
+            while (currentDir && depth < maxDepth) {
+                const candidateSharedDir = path.join(currentDir, '_shared');
+                if (fs.existsSync(candidateSharedDir) && fs.lstatSync(candidateSharedDir).isDirectory()) {
+                    const candidateFiles = fs.readdirSync(candidateSharedDir);
+                    if (candidateFiles.length > 0) {
+                    foundLocations.push(candidateSharedDir);
+                    sharedFilesFound = true;
+                    logInfo(`    Found shared files at: ${path.relative(functionsParentDir, candidateSharedDir)}`);
+                        break;
+                    }
+                }
+                const parentDir = path.dirname(currentDir);
+                if (parentDir === currentDir) break; // Reached filesystem root
+                currentDir = parentDir;
+                depth++;
+            }
+        }
+        
+        // CRITICAL: ALWAYS explicitly copy files one by one to ensure they're actually there
+        // Don't rely on mergeDirectories alone - it may not work correctly in all cases
+        if (foundLocations.length > 0) {
+            logInfo(`    Copying ${foundLocations.length} shared file location(s) to deployment directory...`);
+            logInfo(`    Destination: ${path.relative(functionsParentDir, sharedDestDir)}`);
+            let totalCopied = 0;
+            for (const sharedSourceDir of foundLocations) {
+                try {
+                    logInfo(`    Source: ${path.relative(functionsParentDir, sharedSourceDir)}`);
+                    const sourceFiles = fs.readdirSync(sharedSourceDir);
+                    for (const file of sourceFiles) {
+                        const srcPath = path.join(sharedSourceDir, file);
+                        const destPath = path.join(sharedDestDir, file);
+                        try {
+                            const stat = fs.statSync(srcPath);
+                            if (stat.isFile()) {
+                                // Ensure destination directory exists
+                                fs.mkdirSync(path.dirname(destPath), { recursive: true });
+                                fs.copyFileSync(srcPath, destPath);
+                                totalCopied++;
+                                logInfo(`      ✓ Copied: ${file}`);
+                            } else if (stat.isDirectory()) {
+                                // Recursively copy directories
+                                const destSubDir = destPath;
+                                if (!fs.existsSync(destSubDir)) {
+                                    fs.mkdirSync(destSubDir, { recursive: true });
+                                }
+                                const subFiles = fs.readdirSync(srcPath);
+                                for (const subFile of subFiles) {
+                                    const subSrcPath = path.join(srcPath, subFile);
+                                    const subDestPath = path.join(destSubDir, subFile);
+                                    if (fs.statSync(subSrcPath).isFile()) {
+                                        fs.copyFileSync(subSrcPath, subDestPath);
+                                        totalCopied++;
+                                        logInfo(`      ✓ Copied: ${file}/${subFile}`);
+                                    }
+                                }
+                            }
+                        } catch (err) {
+                            logError(`      ✗ Failed to copy ${file}: ${err.message}`);
+                        }
+                    }
+                } catch (err) {
+                    logError(`    ✗ Failed to read shared directory ${sharedSourceDir}: ${err.message}`);
+                }
+            }
+            if (totalCopied > 0) {
+                logInfo(`    ✓ Successfully copied ${totalCopied} shared file(s) total`);
+            }
+        } else if (sharedFilesFound) {
+            // This shouldn't happen, but log it if it does
+            logWarning(`    ⚠ Shared files were found but foundLocations is empty - this is unexpected`);
+        }
+        
+        // Verify shared files are actually in the destination after copying
+        let sharedFiles = [];
+        if (fs.existsSync(sharedDestDir)) {
+            sharedFiles = fs.readdirSync(sharedDestDir).filter(f => {
+                const filePath = path.join(sharedDestDir, f);
+                try {
+                    return fs.statSync(filePath).isFile();
+                } catch {
+                    return false;
+                }
+            });
+        }
+        
+        if (!sharedFilesFound || sharedFiles.length === 0) {
             // Check if function code references _shared
             const functionIndexPath = path.join(tempFunctionPath, 'index.ts');
             const functionIndexJsPath = path.join(tempFunctionPath, 'index.js');
@@ -818,7 +943,102 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
             if (functionCode.includes('_shared') || functionCode.includes('../_shared') || functionCode.includes('./_shared')) {
                 logWarning(`    ⚠ Function references _shared files but none found - deployment may fail`);
                 logWarning(`    Searched in: ${sharedDirs.map(d => path.relative(functionsParentDir, d)).join(', ')}`);
+                logWarning(`    Shared files must be in: ${path.relative(functionsParentDir, sharedDestDir)}`);
+                
+                // Last resort: try to copy from globalSharedDir if it exists
+                if (fs.existsSync(globalSharedDir) && fs.lstatSync(globalSharedDir).isDirectory()) {
+                    const globalFiles = fs.readdirSync(globalSharedDir);
+                    if (globalFiles.length > 0) {
+                        logInfo(`    Attempting to copy shared files from global directory as last resort...`);
+                        for (const file of globalFiles) {
+                            const srcPath = path.join(globalSharedDir, file);
+                            const destPath = path.join(sharedDestDir, file);
+                            if (fs.statSync(srcPath).isFile()) {
+                                fs.copyFileSync(srcPath, destPath);
+                                logInfo(`      Copied: ${file}`);
+                            }
+                        }
+                        sharedFiles = fs.existsSync(sharedDestDir) ? fs.readdirSync(sharedDestDir).filter(f => {
+                            const filePath = path.join(sharedDestDir, f);
+                            return fs.statSync(filePath).isFile();
+                        }) : [];
+                        if (sharedFiles.length > 0) {
+                            logInfo(`    ✓ Successfully copied ${sharedFiles.length} shared file(s): ${sharedFiles.join(', ')}`);
+                            sharedFilesFound = true;
+                        }
+                    }
+                }
             }
+        } else {
+            // Verify shared files are actually in the destination
+            if (sharedFiles.length > 0) {
+                logInfo(`    ✓ Shared files ready for deployment: ${sharedFiles.join(', ')}`);
+            }
+        }
+        
+        // Final verification before deployment: ensure files actually exist
+        if (sharedFilesFound) {
+            const finalCheck = fs.existsSync(sharedDestDir) ? fs.readdirSync(sharedDestDir).filter(f => {
+                const filePath = path.join(sharedDestDir, f);
+                return fs.statSync(filePath).isFile();
+            }) : [];
+            if (finalCheck.length === 0) {
+                logError(`    ✗ CRITICAL: Shared files directory exists but is empty! Deployment will fail.`);
+            } else {
+                logInfo(`    ✓ Final verification: ${finalCheck.length} shared file(s) confirmed in ${path.relative(functionsParentDir, sharedDestDir)}`);
+            }
+        }
+        
+        // FINAL VERIFICATION: Ensure shared files exist before deployment
+        // This is critical - if files aren't here, deployment will fail
+        const finalSharedCheck = fs.existsSync(sharedDestDir) ? fs.readdirSync(sharedDestDir).filter(f => {
+            const filePath = path.join(sharedDestDir, f);
+            try {
+                return fs.statSync(filePath).isFile();
+            } catch {
+                return false;
+            }
+        }) : [];
+        
+        if (finalSharedCheck.length === 0 && sharedFilesFound) {
+            // Files were found but not copied - do aggressive copy now
+            logError(`    ✗ CRITICAL: Shared files not in deployment directory! Attempting emergency copy...`);
+            for (const sharedSourceDir of foundLocations) {
+                if (fs.existsSync(sharedSourceDir)) {
+                    const sourceFiles = fs.readdirSync(sharedSourceDir);
+                    logInfo(`    Emergency copy from: ${path.relative(functionsParentDir, sharedSourceDir)}`);
+                    for (const file of sourceFiles) {
+                        const srcPath = path.join(sharedSourceDir, file);
+                        const destPath = path.join(sharedDestDir, file);
+                        try {
+                            if (fs.statSync(srcPath).isFile()) {
+                                fs.mkdirSync(path.dirname(destPath), { recursive: true });
+                                fs.copyFileSync(srcPath, destPath);
+                                logInfo(`      ✓ Emergency copied: ${file}`);
+                            }
+                        } catch (err) {
+                            logError(`      ✗ Emergency copy failed for ${file}: ${err.message}`);
+                        }
+                    }
+                }
+            }
+            // Verify again
+            const emergencyCheck = fs.existsSync(sharedDestDir) ? fs.readdirSync(sharedDestDir).filter(f => {
+                const filePath = path.join(sharedDestDir, f);
+                try {
+                    return fs.statSync(filePath).isFile();
+                } catch {
+                    return false;
+                }
+            }) : [];
+            if (emergencyCheck.length > 0) {
+                logInfo(`    ✓ Emergency copy successful: ${emergencyCheck.length} file(s) now in deployment directory`);
+            } else {
+                logError(`    ✗ Emergency copy FAILED - shared files still missing!`);
+                logError(`    Deployment will likely fail. Shared files must be at: ${sharedDestDir}`);
+            }
+        } else if (finalSharedCheck.length > 0) {
+            logInfo(`    ✓ Final verification: ${finalSharedCheck.length} shared file(s) confirmed ready: ${finalSharedCheck.join(', ')}`);
         }
         
         // Change to supabase directory and link
@@ -826,11 +1046,66 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
         
         try {
             // Link to target project (in supabase directory)
-            if (retryCount === 0) {
-                logInfo(`    Linking to target project...`);
-            }
+            logInfo(`    Linking to target project...`);
             if (!linkProject(targetRef, dbPassword)) {
                 throw new Error('Failed to link to target project');
+            }
+            
+            // Final check: verify shared files exist at the exact path deployment will use
+            // The deployment command runs from supabaseConfigDir, so it looks for functions/_shared/
+            const deploymentSharedPath = path.join(supabaseConfigDir, 'functions', '_shared');
+            if (fs.existsSync(deploymentSharedPath)) {
+                const deploymentFiles = fs.readdirSync(deploymentSharedPath).filter(f => {
+                    const filePath = path.join(deploymentSharedPath, f);
+                    try {
+                        return fs.statSync(filePath).isFile();
+                    } catch {
+                        return false;
+                    }
+                });
+                if (deploymentFiles.length > 0) {
+                    logInfo(`    ✓ Deployment shared files verified: ${deploymentFiles.length} file(s) at functions/_shared/`);
+                } else if (deploymentFiles.length === 0 && sharedFilesFound) {
+                    logError(`    ✗ CRITICAL: Shared files missing at deployment path!`);
+                    logError(`    Expected: ${deploymentSharedPath}`);
+                    logError(`    Copying from ${sharedDestDir} to ${deploymentSharedPath}...`);
+                    // Copy from sharedDestDir to deployment path
+                    if (fs.existsSync(sharedDestDir)) {
+                        const sourceFiles = fs.readdirSync(sharedDestDir);
+                        for (const file of sourceFiles) {
+                            const srcPath = path.join(sharedDestDir, file);
+                            const destPath = path.join(deploymentSharedPath, file);
+                            try {
+                                if (fs.statSync(srcPath).isFile()) {
+                                    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+                                    fs.copyFileSync(srcPath, destPath);
+                                    logInfo(`      ✓ Copied to deployment path: ${file}`);
+                                }
+                            } catch (err) {
+                                logError(`      ✗ Failed to copy ${file}: ${err.message}`);
+                            }
+                        }
+                    }
+                }
+            } else if (sharedFilesFound) {
+                // Deployment path doesn't exist but we have shared files - create it
+                logInfo(`    Creating deployment shared directory and copying files...`);
+                fs.mkdirSync(deploymentSharedPath, { recursive: true });
+                if (fs.existsSync(sharedDestDir)) {
+                    const sourceFiles = fs.readdirSync(sharedDestDir);
+                    for (const file of sourceFiles) {
+                        const srcPath = path.join(sharedDestDir, file);
+                        const destPath = path.join(deploymentSharedPath, file);
+                        try {
+                            if (fs.statSync(srcPath).isFile()) {
+                                fs.copyFileSync(srcPath, destPath);
+                                logInfo(`      ✓ Copied to deployment path: ${file}`);
+                            }
+                        } catch (err) {
+                            logError(`      ✗ Failed to copy ${file}: ${err.message}`);
+                        }
+                    }
+                }
             }
             
             // Deploy (project is now linked)
@@ -844,11 +1119,7 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
             // Cleanup temp structure
             fs.rmSync(supabaseConfigDir, { recursive: true, force: true });
             
-            if (retryCount > 0) {
-                logSuccess(`    ✓ Deployed function after retry: ${functionName}`);
-            } else {
-                logSuccess(`    ✓ Deployed function: ${functionName}`);
-            }
+            logSuccess(`    ✓ Deployed function: ${functionName}`);
             return true;
         } catch (e) {
             process.chdir(originalCwd);
@@ -859,24 +1130,27 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
             throw e;
         }
     } catch (error) {
-        // If we haven't exceeded max retries, retry the deployment
-        if (retryCount < maxRetries) {
-            const waitTime = (retryCount + 1) * 2; // Exponential backoff: 2s, 4s
-            logWarning(`    ⚠ Deployment failed (attempt ${retryCount + 1}/${maxRetries + 1}): ${error.message}`);
-            logInfo(`    Waiting ${waitTime} seconds before retry...`);
-            
-            // Wait before retrying
-            const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-            await sleep(waitTime * 1000);
-            
-            // Retry deployment
-            return deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, retryCount + 1, maxRetries);
-        } else {
-            // Max retries exceeded
-            logError(`    ✗ Failed to deploy function ${functionName} after ${maxRetries + 1} attempts: ${error.message}`);
-            return false;
+        // No retry - just return false and add to retry list
+        logError(`    ✗ Failed to deploy function ${functionName}: ${error.message}`);
+        logInfo(`    This function will be added to the retry list for manual retry`);
+        return false;
+    }
+}
+
+// Helper function to get environment name from project ref (for retry script command)
+function getEnvNameFromRef(projectRef) {
+    // Try to match project ref to known environments
+    const envVars = ['SUPABASE_PROD_PROJECT_REF', 'SUPABASE_TEST_PROJECT_REF', 'SUPABASE_DEV_PROJECT_REF', 'SUPABASE_BACKUP_PROJECT_REF'];
+    for (const envVar of envVars) {
+        if (process.env[envVar] === projectRef) {
+            if (envVar.includes('PROD')) return 'prod';
+            if (envVar.includes('TEST')) return 'test';
+            if (envVar.includes('DEV')) return 'dev';
+            if (envVar.includes('BACKUP')) return 'backup';
         }
     }
+    // Fallback: return the ref itself (user can correct it)
+    return projectRef;
 }
 
 // Main migration function
@@ -1080,6 +1354,49 @@ async function migrateEdgeFunctions() {
         logInfo(`  - Existing functions (will update): ${functionsToMigrate.filter(f => !f.isNew).length}`);
         console.log('');
         
+        // Pre-deployment: Collect all shared files from all functions before deploying
+        // This ensures shared dependencies are available for all functions
+        logInfo('Collecting shared files from all functions...');
+        const globalSharedDir = path.join(functionsDir, '_shared');
+        if (!fs.existsSync(globalSharedDir)) {
+            fs.mkdirSync(globalSharedDir, { recursive: true });
+        }
+        
+        // Check each function directory for shared files and merge them
+        for (const { function: sourceFunction } of functionsToMigrate) {
+            const functionName = sourceFunction.name;
+            if (!functionName) continue;
+            
+            const functionDir = path.join(functionsDir, functionName);
+            if (!fs.existsSync(functionDir)) continue;
+            
+            // Check for local shared files in function directory
+            const localSharedDir = path.join(functionDir, '_shared');
+            if (fs.existsSync(localSharedDir) && fs.lstatSync(localSharedDir).isDirectory()) {
+                mergeDirectories(localSharedDir, globalSharedDir);
+            }
+            
+            // Check for nested shared files
+            const nestedSharedDir = path.join(functionDir, 'functions', '_shared');
+            if (fs.existsSync(nestedSharedDir) && fs.lstatSync(nestedSharedDir).isDirectory()) {
+                mergeDirectories(nestedSharedDir, globalSharedDir);
+            }
+        }
+        
+        // Also check project root for shared files
+        const projectRootSharedDir = path.join(PROJECT_ROOT, 'supabase', 'functions', '_shared');
+        if (fs.existsSync(projectRootSharedDir) && fs.lstatSync(projectRootSharedDir).isDirectory()) {
+            mergeDirectories(projectRootSharedDir, globalSharedDir);
+        }
+        
+        const sharedFiles = fs.existsSync(globalSharedDir) ? fs.readdirSync(globalSharedDir) : [];
+        if (sharedFiles.length > 0) {
+            logInfo(`  ✓ Collected ${sharedFiles.length} shared file(s): ${sharedFiles.join(', ')}`);
+        } else {
+            logInfo(`  ℹ No shared files found (functions may not have shared dependencies)`);
+        }
+        console.log('');
+        
         // Process each function
         for (let i = 0; i < functionsToMigrate.length; i++) {
             const { function: sourceFunction, isNew, existing, versionMatches, updatedMatches } = functionsToMigrate[i];
@@ -1174,7 +1491,7 @@ async function migrateEdgeFunctions() {
                 }
             }
             
-            // Deploy function to target (with automatic retry logic - max 2 retries)
+            // Deploy function to target (no retry - failures go to retry list)
             const deploySuccess = await deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword);
             
             if (deploySuccess) {
@@ -1182,7 +1499,7 @@ async function migrateEdgeFunctions() {
                 logSuccess(`  ✓ Function ${isNew ? 'created' : 'updated'} successfully`);
             } else {
                 failedFunctions.push(functionName);
-                logError(`  ✗ Function migration failed after retries`);
+                logError(`  ✗ Function deployment failed`);
                 logInfo(`  This function will be added to the retry list for manual retry via retry_edge_functions.sh`);
             }
             
@@ -1277,8 +1594,39 @@ ${sourceFunctions.map(f => `- ${f.name} (id: ${f.id || 'N/A'})`).join('\n')}
     logInfo(`Functions skipped: ${skippedCount}`);
     if (failedCount > 0) {
         logError(`Functions failed: ${failedCount}`);
+        console.log('');
+        logSeparator();
+        logWarning(`${colors.bright}Failed Edge Functions${colors.reset}`);
+        logSeparator();
+        logWarning(`The following ${failedCount} edge function(s) failed to deploy:`);
+        console.log('');
+        uniqueFailedFunctions.forEach((funcName, index) => {
+            logError(`  ${index + 1}. ${funcName}`);
+        });
+        console.log('');
+        logSeparator();
+        logInfo(`${colors.bright}Next Steps${colors.reset}`);
+        logSeparator();
+        logInfo(`These functions have been added to the retry list: ${failedFilePath}`);
+        logInfo(`You can retry them using one of the following methods:`);
+        console.log('');
+        logInfo(`${colors.cyan}Option 1: Use the retry script (recommended)${colors.reset}`);
+        logInfo(`  ./scripts/components/retry_edge_functions.sh ${getEnvNameFromRef(SOURCE_REF)} ${getEnvNameFromRef(TARGET_REF)}`);
+        console.log('');
+        logInfo(`${colors.cyan}Option 2: Manual deployment${colors.reset}`);
+        logInfo(`  For each failed function, navigate to its directory and deploy manually:`);
+        uniqueFailedFunctions.forEach(funcName => {
+            logInfo(`    cd ${path.relative(process.cwd(), path.join(functionsDir, funcName))}`);
+            logInfo(`    supabase functions deploy ${funcName} --project-ref ${TARGET_REF}`);
+        });
+        console.log('');
+        logWarning(`⚠ Note: Functions with shared dependencies may require shared files to be available.`);
+        logWarning(`   The retry script will handle shared files automatically.`);
+        logSeparator();
+    } else {
+        logSuccess('No edge function failures - all functions deployed successfully!');
     }
-    logSeparator();
+    console.log('');
     
     return { success: true, migrated: migratedCount, skipped: skippedCount, failed: failedCount };
 }
