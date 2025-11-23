@@ -11,7 +11,7 @@ const https = require('https');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execSync } = require('child_process');
+const { execSync, spawn } = require('child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 
 // ANSI color codes for console output
@@ -1109,10 +1109,120 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
             }
             
             // Deploy (project is now linked)
-            execSync(`supabase functions deploy ${functionName}`, {
-                stdio: 'pipe',
-                timeout: 120000
-            });
+            // Use spawn to better capture both stdout and stderr
+            let deployOutput = '';
+            let deployStderr = '';
+            try {
+                const deployProcess = spawn('supabase', ['functions', 'deploy', functionName], {
+                    cwd: supabaseConfigDir,
+                    stdio: ['pipe', 'pipe', 'pipe'],
+                    shell: true
+                });
+                
+                let stdout = '';
+                let stderr = '';
+                
+                deployProcess.stdout.on('data', (data) => {
+                    stdout += data.toString();
+                });
+                
+                deployProcess.stderr.on('data', (data) => {
+                    stderr += data.toString();
+                });
+                
+                // Wait for process to complete with timeout (synchronous using execSync-like approach)
+                // For better error handling, we'll use a Promise-based approach
+                const deployPromise = new Promise((resolve, reject) => {
+                    const timeout = setTimeout(() => {
+                        deployProcess.kill();
+                        reject(new Error('Deployment timeout after 120 seconds'));
+                    }, 120000);
+                    
+                    deployProcess.on('close', (code) => {
+                        clearTimeout(timeout);
+                        if (code === 0) {
+                            resolve({ stdout, stderr });
+                        } else {
+                            const error = new Error(`Deployment failed with exit code ${code}`);
+                            error.stdout = stdout;
+                            error.stderr = stderr;
+                            error.code = code;
+                            reject(error);
+                        }
+                    });
+                    
+                    deployProcess.on('error', (err) => {
+                        clearTimeout(timeout);
+                        reject(err);
+                    });
+                });
+                
+                // Wait for deployment (this function is called from async context)
+                const result = await deployPromise;
+                deployOutput = result.stdout;
+                deployStderr = result.stderr;
+                
+                // Log successful deployment output
+                if (deployOutput) {
+                    logInfo(`    Deployment output: ${deployOutput.trim().substring(0, 200)}`);
+                }
+                if (deployStderr && !deployStderr.toLowerCase().includes('warning')) {
+                    logWarning(`    Deployment warnings: ${deployStderr.trim().substring(0, 200)}`);
+                }
+            } catch (deployErr) {
+                // Capture error details
+                let deployError = '';
+                if (deployErr.stderr) {
+                    deployStderr = deployErr.stderr.toString();
+                    deployError = deployStderr;
+                } else if (deployErr.stdout) {
+                    deployOutput = deployErr.stdout.toString();
+                    deployError = deployOutput;
+                } else {
+                    deployError = deployErr.message || String(deployErr);
+                }
+                
+                // Also capture stderr separately if available
+                if (deployErr.stderr) {
+                    deployStderr = deployErr.stderr.toString();
+                }
+                if (deployErr.stdout) {
+                    deployOutput = deployErr.stdout.toString();
+                }
+                
+                // Log detailed error
+                logError(`    Deployment failed for ${functionName}:`);
+                if (deployError) {
+                    logError(`    Error: ${deployError.substring(0, 500)}`);
+                }
+                if (deployStderr && deployStderr !== deployError) {
+                    logError(`    Stderr: ${deployStderr.substring(0, 500)}`);
+                }
+                
+                // Check for common issues and provide guidance
+                const fullError = (deployError + ' ' + (deployStderr || '')).toLowerCase();
+                if (fullError.includes('timeout') || fullError.includes('etimedout')) {
+                    logError(`    ⚠ Timeout during deployment - function may be too large or network issue`);
+                    logError(`    Suggestion: Check network connection or reduce function size`);
+                } else if (fullError.includes('enoent') || fullError.includes('not found')) {
+                    logError(`    ⚠ File or directory not found - check function structure`);
+                    logError(`    Suggestion: Verify function files exist in ${tempFunctionPath}`);
+                } else if (fullError.includes('permission') || fullError.includes('unauthorized') || fullError.includes('401') || fullError.includes('403')) {
+                    logError(`    ⚠ Permission issue - verify Supabase CLI authentication`);
+                    logError(`    Suggestion: Run 'supabase login' and verify access token`);
+                } else if (fullError.includes('shared') || fullError.includes('_shared')) {
+                    logError(`    ⚠ Shared files issue - verify _shared directory structure`);
+                    logError(`    Suggestion: Check that shared files are in functions/_shared/`);
+                } else if (fullError.includes('docker') || fullError.includes('container')) {
+                    logError(`    ⚠ Docker issue - verify Docker is running`);
+                    logError(`    Suggestion: Start Docker Desktop or Docker daemon`);
+                } else if (fullError.includes('syntax') || fullError.includes('parse')) {
+                    logError(`    ⚠ Syntax error in function code`);
+                    logError(`    Suggestion: Check function code for syntax errors`);
+                }
+                
+                throw deployErr;
+            }
             
             process.chdir(originalCwd);
             
