@@ -10,6 +10,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Global error handling
+error_handler() {
+    local exit_code=$?
+    local line_number=$1
+    local command="${2:-unknown}"
+    
+    # Log error details
+    if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] Script error at line $line_number: command '$command' failed with exit code $exit_code" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+    
+    # Cleanup: unlink from Supabase project
+    supabase unlink --yes 2>/dev/null || true
+    
+    exit $exit_code
+}
+
+# Set up error trap
+trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
+trap 'supabase unlink --yes 2>/dev/null || true; exit' EXIT INT TERM
+
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
@@ -293,11 +314,48 @@ TARGET_POOLER_REGION=$(get_pooler_region_for_env "$TARGET_ENV")
 SOURCE_POOLER_PORT=$(get_pooler_port_for_env "$SOURCE_ENV")
 TARGET_POOLER_PORT=$(get_pooler_port_for_env "$TARGET_ENV")
 
-# Check for Supabase CLI
+# Validate project references and passwords
+if [ -z "$SOURCE_REF" ]; then
+    log_error "Source project reference not found for environment: $SOURCE_ENV"
+    log_error "Please set SUPABASE_$(echo "$SOURCE_ENV" | tr '[:lower:]' '[:upper:]')_PROJECT_REF in .env.local"
+    exit 1
+fi
+
+if [ -z "$TARGET_REF" ]; then
+    log_error "Target project reference not found for environment: $TARGET_ENV"
+    log_error "Please set SUPABASE_$(echo "$TARGET_ENV" | tr '[:lower:]' '[:upper:]')_PROJECT_REF in .env.local"
+    exit 1
+fi
+
+if [ -z "$SOURCE_PASSWORD" ]; then
+    log_error "Source database password not found for environment: $SOURCE_ENV"
+    log_error "Please set SUPABASE_$(echo "$SOURCE_ENV" | tr '[:lower:]' '[:upper:]')_DB_PASSWORD in .env.local"
+    exit 1
+fi
+
+if [ -z "$TARGET_PASSWORD" ]; then
+    log_error "Target database password not found for environment: $TARGET_ENV"
+    log_error "Please set SUPABASE_$(echo "$TARGET_ENV" | tr '[:lower:]' '[:upper:]')_DB_PASSWORD in .env.local"
+    exit 1
+fi
+
+# Check for required tools
 if ! command -v supabase >/dev/null 2>&1; then
     log_error "Supabase CLI not found - required for this migration method"
     log_error "Please install: npm install -g @supabase/cli"
     log_error "Then login: supabase login"
+    exit 1
+fi
+
+if ! command -v pg_dump >/dev/null 2>&1; then
+    log_error "pg_dump not found - required for schema export"
+    log_error "Please install PostgreSQL client tools"
+    exit 1
+fi
+
+if ! command -v psql >/dev/null 2>&1; then
+    log_error "psql not found - required for schema application"
+    log_error "Please install PostgreSQL client tools"
     exit 1
 fi
 
@@ -749,13 +807,28 @@ while IFS='|' read -r host port user label; do
     # Apply schema with error handling - continue on non-critical errors
     # Use ON_ERROR_STOP=off to continue even if some statements fail
     psql_output_file="$MIGRATION_DIR_ABS/psql_output_${label//[^a-zA-Z0-9]/_}.log"
+    set +e  # Don't exit on psql errors - we'll check the output file
     PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
         -h "$host" \
         -p "$port" \
         -U "$user" \
         -d postgres \
         -v ON_ERROR_STOP=off \
-        -f "$SCHEMA_DUMP_FILE" > "$psql_output_file" 2>&1 || true
+        -f "$SCHEMA_DUMP_FILE" > "$psql_output_file" 2>&1
+    local psql_exit_code=$?
+    set -e
+    
+    # Check if connection was successful (even if SQL had errors)
+    if [ ! -f "$psql_output_file" ]; then
+        log_warning "psql output file not created - connection may have failed"
+        continue
+    fi
+    
+    # Check for connection errors
+    if grep -qE "FATAL|could not connect|connection refused|timeout" "$psql_output_file" 2>/dev/null; then
+        log_warning "Connection failed via ${label}, trying next endpoint..."
+        continue
+    fi
     
     # Log the output
     cat "$psql_output_file" | tee -a "$LOG_FILE"

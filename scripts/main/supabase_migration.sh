@@ -9,6 +9,59 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# Global error handling and cleanup
+MIGRATION_DIR=""
+CLEANUP_FUNCTIONS=()
+
+# Cleanup function registry
+register_cleanup() {
+    CLEANUP_FUNCTIONS+=("$1")
+}
+
+# Execute all registered cleanup functions
+execute_cleanup() {
+    local exit_code=${1:-0}
+    # Always unlink from Supabase project on cleanup
+    supabase unlink --yes 2>/dev/null || true
+    
+    # Execute registered cleanup functions
+    for cleanup_func in "${CLEANUP_FUNCTIONS[@]}"; do
+        set +e  # Don't fail on cleanup errors
+        if [ -n "$cleanup_func" ] && type "$cleanup_func" >/dev/null 2>&1; then
+            "$cleanup_func" "$exit_code" 2>/dev/null || true
+        fi
+        set -e
+    done
+}
+
+# Error handler
+error_handler() {
+    local exit_code=$?
+    local line_number=$1
+    local command="${2:-unknown}"
+    
+    # Don't handle errors if we're already in cleanup
+    if [ "${IN_CLEANUP:-false}" = "true" ]; then
+        exit $exit_code
+    fi
+    
+    # Log error details
+    if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] Script error at line $line_number: command '$command' failed with exit code $exit_code" >> "$LOG_FILE" 2>/dev/null || true
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] Stack trace: ${BASH_COMMAND:-unknown}" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+    
+    # Execute cleanup
+    IN_CLEANUP=true
+    execute_cleanup $exit_code
+    
+    exit $exit_code
+}
+
+# Set up error trap
+trap 'error_handler $LINENO "$BASH_COMMAND"' ERR
+trap 'IN_CLEANUP=true; execute_cleanup $?; exit $?' EXIT INT TERM
+
 # Source utilities
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
 source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
@@ -418,9 +471,11 @@ step_diff_comparison() {
     if [ -z "$source_pooler" ]; then
         source_pooler="aws-1-us-east-2.pooler.supabase.com"
     fi
+    
+    local source_dump_success=false
     set +e
-    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-    PGPASSWORD="$source_password" pg_dump \
+    # Try pooler connection first
+    if PGPASSWORD="$source_password" PGSSLMODE=require pg_dump \
         -h "$source_pooler" \
         -p 6543 \
         -U "postgres.${source_ref}" \
@@ -429,9 +484,12 @@ step_diff_comparison() {
         --no-owner \
         --no-acl \
         -f "$source_schema" \
-        2>&1 | grep -v "WARNING" || {
+        2>&1 | grep -v "WARNING" >/dev/null 2>&1; then
+        source_dump_success=true
+    else
         log_warning "Pooler connection failed for source, trying direct connection..."
-        PGPASSWORD="$source_password" pg_dump \
+        # Try direct connection
+        if PGPASSWORD="$source_password" PGSSLMODE=require pg_dump \
             -h "db.${source_ref}.supabase.co" \
             -p 5432 \
             -U "postgres.${source_ref}" \
@@ -440,9 +498,16 @@ step_diff_comparison() {
             --no-owner \
             --no-acl \
             -f "$source_schema" \
-            2>&1 | grep -v "WARNING" || true
-    }
+            2>&1 | grep -v "WARNING" >/dev/null 2>&1; then
+            source_dump_success=true
+        fi
+    fi
     set -e
+    
+    if [ "$source_dump_success" != "true" ] || [ ! -f "$source_schema" ] || [ ! -s "$source_schema" ]; then
+        log_warning "Could not export source schema via any connection method"
+        # Continue anyway - migration can proceed without comparison
+    fi
     
     # Copy source schema to migration directory if provided
     if [ -n "$migration_source_schema" ] && [ -f "$source_schema" ] && [ -s "$source_schema" ]; then
@@ -456,9 +521,11 @@ step_diff_comparison() {
     if [ -z "$target_pooler" ]; then
         target_pooler="aws-1-us-east-2.pooler.supabase.com"
     fi
+    
+    local target_dump_success=false
     set +e
-    # Connection format: postgresql://postgres.{PROJECT_REF}:[PASSWORD]@{POOLER_HOST}:6543/postgres?pgbouncer=true
-    PGPASSWORD="$target_password" pg_dump \
+    # Try pooler connection first
+    if PGPASSWORD="$target_password" PGSSLMODE=require pg_dump \
         -h "$target_pooler" \
         -p 6543 \
         -U "postgres.${target_ref}" \
@@ -467,9 +534,12 @@ step_diff_comparison() {
         --no-owner \
         --no-acl \
         -f "$target_schema" \
-        2>&1 | grep -v "WARNING" || {
+        2>&1 | grep -v "WARNING" >/dev/null 2>&1; then
+        target_dump_success=true
+    else
         log_warning "Pooler connection failed for target, trying direct connection..."
-        PGPASSWORD="$target_password" pg_dump \
+        # Try direct connection
+        if PGPASSWORD="$target_password" PGSSLMODE=require pg_dump \
             -h "db.${target_ref}.supabase.co" \
             -p 5432 \
             -U "postgres.${target_ref}" \
@@ -478,9 +548,16 @@ step_diff_comparison() {
             --no-owner \
             --no-acl \
             -f "$target_schema" \
-            2>&1 | grep -v "WARNING" || true
-    }
+            2>&1 | grep -v "WARNING" >/dev/null 2>&1; then
+            target_dump_success=true
+        fi
+    fi
     set -e
+    
+    if [ "$target_dump_success" != "true" ] || [ ! -f "$target_schema" ] || [ ! -s "$target_schema" ]; then
+        log_warning "Could not export target schema via any connection method"
+        # Continue anyway - migration can proceed without comparison
+    fi
     
     # Copy target schema to migration directory if provided
     if [ -n "$migration_target_schema" ] && [ -f "$target_schema" ] && [ -s "$target_schema" ]; then
@@ -1184,6 +1261,20 @@ EOF
     fi
 }
 
+# Cleanup function for migration (defined as a function that can be registered)
+cleanup_migration() {
+    local cleanup_exit_code=${1:-0}
+    # Unlink from any Supabase project
+    supabase unlink --yes 2>/dev/null || true
+    # Log cleanup
+    if [ -n "${LOG_FILE:-}" ] && [ -f "$LOG_FILE" ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Cleanup completed (exit code: $cleanup_exit_code)" >> "$LOG_FILE" 2>/dev/null || true
+    fi
+}
+
+# Export cleanup function so it can be called from error handler
+export -f cleanup_migration
+
 # Create migration directory with descriptive name
 create_migration_dir() {
     local source_env=${1:-$SOURCE_ENV}
@@ -1311,10 +1402,14 @@ perform_migration() {
     # Perform migration using modular scripts
     # Set LOG_FILE so all component scripts can append to the same log
     export LOG_FILE="$migration_dir/migration.log"
+    MIGRATION_DIR="$migration_dir"  # Store for cleanup
     
     # Create migration directory if it doesn't exist
     mkdir -p "$migration_dir"
     touch "$LOG_FILE"
+    
+    # Register cleanup function for this migration
+    register_cleanup "cleanup_migration"
     
     log_to_file "$LOG_FILE" "=========================================="
     log_to_file "$LOG_FILE" "MIGRATION STARTED"
@@ -1390,8 +1485,10 @@ perform_migration() {
     else
         log_to_file "$LOG_FILE" "Database schema & policies migration: STARTING (CRITICAL COMPONENT)"
         set +e  # Temporarily disable exit on error for component execution
+        set +o pipefail  # Disable pipefail to capture exit code properly
         "$PROJECT_ROOT/scripts/main/database_and_policy_migration.sh" "${db_policy_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"
         local db_policy_exit_code=${PIPESTATUS[0]}
+        set -o pipefail  # Re-enable pipefail
         set -e
         
         if [ "$db_policy_exit_code" -eq 0 ]; then
@@ -1457,14 +1554,17 @@ perform_migration() {
         else
             log_to_file "$LOG_FILE" "Database data migration: STARTING"
             set +e  # Temporarily disable exit on error for component execution
-            if "$PROJECT_ROOT/scripts/components/database_migration.sh" "${db_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-                set -e
+            set +o pipefail  # Disable pipefail to capture exit code properly
+            "$PROJECT_ROOT/scripts/components/database_migration.sh" "${db_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+            local db_data_exit_code=${PIPESTATUS[0]}
+            set -o pipefail  # Re-enable pipefail
+            set -e
+            
+            if [ "$db_data_exit_code" -eq 0 ]; then
                 log_success "Database data migration completed successfully"
                 SUCCEEDED_COMPONENTS+=("database data")
                 log_to_file "$LOG_FILE" "Database data migration: SUCCESS"
             else
-                set -e
-                local db_data_exit_code=${PIPESTATUS[0]}
                 log_error "Database data migration encountered errors (exit code: $db_data_exit_code)"
                 log_error "Continuing with remaining components..."
                 FAILED_COMPONENTS+=("database data")
@@ -1502,8 +1602,13 @@ perform_migration() {
     else
         log_to_file "$LOG_FILE" "Storage migration: STARTING"
         set +e
-        if "$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-            set -e
+        set +o pipefail  # Disable pipefail to capture exit code properly
+        "$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+        local storage_exit_code=${PIPESTATUS[0]}
+        set -o pipefail  # Re-enable pipefail
+        set -e
+        
+        if [ "$storage_exit_code" -eq 0 ]; then
             if [ "$INCLUDE_FILES" = "true" ]; then
                 log_success "Storage buckets migrated successfully (with files)"
             else
@@ -1512,8 +1617,6 @@ perform_migration() {
             SUCCEEDED_COMPONENTS+=("storage")
             log_to_file "$LOG_FILE" "Storage migration: SUCCESS"
         else
-            set -e
-            local storage_exit_code=${PIPESTATUS[0]}
             log_warning "Storage buckets migration had errors (exit code: $storage_exit_code), continuing..."
             FAILED_COMPONENTS+=("storage")
             exit_code=1
@@ -1543,14 +1646,17 @@ perform_migration() {
         else
             log_to_file "$LOG_FILE" "Edge functions migration: STARTING"
             set +e
-            if "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-                set -e
+            set +o pipefail  # Disable pipefail to capture exit code properly
+            "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
+            local edge_exit_code=${PIPESTATUS[0]}
+            set -o pipefail  # Re-enable pipefail
+            set -e
+            
+            if [ "$edge_exit_code" -eq 0 ]; then
                 log_success "Edge functions migrated successfully"
                 SUCCEEDED_COMPONENTS+=("edge functions")
                 log_to_file "$LOG_FILE" "Edge functions migration: SUCCESS"
             else
-                set -e
-                local edge_exit_code=${PIPESTATUS[0]}
                 log_warning "Edge functions migration had errors (exit code: $edge_exit_code), continuing..."
                 FAILED_COMPONENTS+=("edge functions")
                 exit_code=1
@@ -1577,14 +1683,17 @@ perform_migration() {
         else
             log_to_file "$LOG_FILE" "Secrets migration: STARTING"
             set +e
-            if "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"; then
-                set -e
+            set +o pipefail  # Disable pipefail to capture exit code properly
+            "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
+            local secrets_exit_code=${PIPESTATUS[0]}
+            set -o pipefail  # Re-enable pipefail
+            set -e
+            
+            if [ "$secrets_exit_code" -eq 0 ]; then
                 log_success "Secrets migrated successfully (structure created - values need manual update)"
                 SUCCEEDED_COMPONENTS+=("secrets")
                 log_to_file "$LOG_FILE" "Secrets migration: SUCCESS"
             else
-                set -e
-                local secrets_exit_code=${PIPESTATUS[0]}
                 log_warning "Secrets migration had errors (exit code: $secrets_exit_code), continuing..."
                 FAILED_COMPONENTS+=("secrets")
                 exit_code=1
@@ -1607,6 +1716,12 @@ perform_migration() {
     log_to_file "$LOG_FILE" "MIGRATION COMPONENT SUMMARY"
     log_to_file "$LOG_FILE" "=========================================="
     
+    # Extract error details from log for reporting
+    local error_summary=""
+    if [ -f "$LOG_FILE" ]; then
+        error_summary=$(grep -iE "(ERROR|FATAL|failed|error:)" "$LOG_FILE" 2>/dev/null | tail -50 || echo "")
+    fi
+    
     if [ ${#SUCCEEDED_COMPONENTS[@]} -gt 0 ]; then
         local joined_success
         joined_success=$(printf '%s, ' "${SUCCEEDED_COMPONENTS[@]}")
@@ -1625,6 +1740,14 @@ perform_migration() {
         log_error "❌ Components with errors: ${joined_failed}"
         log_to_file "$LOG_FILE" "FAILED: ${joined_failed}"
         
+        # Log error details
+        if [ -n "$error_summary" ]; then
+            log_to_file "$LOG_FILE" "ERROR DETAILS:"
+            echo "$error_summary" | while IFS= read -r error_line; do
+                log_to_file "$LOG_FILE" "  $error_line"
+            done
+        fi
+        
         # Check if critical components failed
         local critical_failed=false
         for component in "${FAILED_COMPONENTS[@]}"; do
@@ -1637,6 +1760,7 @@ perform_migration() {
         if [ "$critical_failed" = "true" ]; then
             log_error "⚠️  CRITICAL: Database or Policies migration failed - target system may be incomplete!"
             log_to_file "$LOG_FILE" "CRITICAL: Database or Policies migration failed"
+            log_to_file "$LOG_FILE" "CRITICAL ERROR: Target system may be in an inconsistent state!"
         fi
     else
         log_success "✅ No component errors reported."
@@ -1651,10 +1775,28 @@ perform_migration() {
         log_to_file "$LOG_FILE" "SKIPPED: ${joined_skipped}"
     fi
     
+    # Log connection information for troubleshooting
+    log_to_file "$LOG_FILE" "=========================================="
+    log_to_file "$LOG_FILE" "CONNECTION INFORMATION"
+    log_to_file "$LOG_FILE" "Source: $source ($(get_project_ref "$source"))"
+    log_to_file "$LOG_FILE" "Target: $target ($(get_project_ref "$target"))"
     log_to_file "$LOG_FILE" "=========================================="
     log_to_file "$LOG_FILE" "Migration completed at: $(date '+%Y-%m-%d %H:%M:%S')"
     log_to_file "$LOG_FILE" "Final exit code: $exit_code"
     log_to_file "$LOG_FILE" "=========================================="
+    
+    # If there were errors, provide troubleshooting guidance
+    if [ ${#FAILED_COMPONENTS[@]} -gt 0 ]; then
+        log_to_file "$LOG_FILE" ""
+        log_to_file "$LOG_FILE" "TROUBLESHOOTING GUIDANCE:"
+        log_to_file "$LOG_FILE" "1. Check connection settings in .env.local"
+        log_to_file "$LOG_FILE" "2. Verify project references and passwords are correct"
+        log_to_file "$LOG_FILE" "3. Ensure Supabase CLI is authenticated: supabase login"
+        log_to_file "$LOG_FILE" "4. Check network connectivity to Supabase servers"
+        log_to_file "$LOG_FILE" "5. Review full error details in this log file"
+        log_to_file "$LOG_FILE" "6. For connection issues, try using direct connection instead of pooler"
+        log_to_file "$LOG_FILE" ""
+    fi
     
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info ""
@@ -1765,7 +1907,14 @@ perform_migration() {
         # Generate result files - ensure they're created even if function fails partially
         # This queries target counts AFTER migration completes for accuracy
         log_info "Querying target database/API for post-migration counts..."
-        if generate_result_md "$actual_migration_dir" "✅ Completed" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log"; then
+        set +e  # Don't fail on result generation
+        set +o pipefail  # Disable pipefail for result generation
+        generate_result_md "$actual_migration_dir" "✅ Completed" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log"
+        local result_gen_exit_code=${PIPESTATUS[0]}
+        set -o pipefail
+        set -e
+        
+        if [ "$result_gen_exit_code" -eq 0 ]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] result.md and result.html generated successfully with post-migration counts" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         else
             result_gen_success=false
@@ -1805,7 +1954,14 @@ perform_migration() {
     else
         # Generate result files for failure case - but don't let result generation failure mask actual migration failure
         log_warning "Migration components reported errors - generating result files with failure status..."
-        if generate_result_md "$actual_migration_dir" "❌ Failed (check migration.log)" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log"; then
+        set +e  # Don't fail on result generation
+        set +o pipefail  # Disable pipefail for result generation
+        generate_result_md "$actual_migration_dir" "❌ Failed (check migration.log)" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log"
+        local result_gen_exit_code=${PIPESTATUS[0]}
+        set -o pipefail
+        set -e
+        
+        if [ "$result_gen_exit_code" -eq 0 ]; then
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] result.md and result.html generated with failure status" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         else
             log_warning "Result file generation had issues (check migration.log for actual migration errors)"
