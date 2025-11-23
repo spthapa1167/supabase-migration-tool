@@ -487,6 +487,8 @@ while IFS='|' read -r host port user label; do
     log_to_file "$LOG_FILE" "Attempting schema dump via ${label}"
     
     # Use pg_dump directly with schema-only flag
+    # Note: We use --no-owner but NOT --no-privileges to ensure policies are included
+    # Policies are part of the schema and should be migrated
     if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require pg_dump \
         -h "$host" \
         -p "$port" \
@@ -494,7 +496,6 @@ while IFS='|' read -r host port user label; do
         -d postgres \
         --schema-only \
         --no-owner \
-        --no-privileges \
         -f "$SCHEMA_DUMP_FILE" 2>&1 | tee -a "$LOG_FILE"; then
         dump_success=true
         break
@@ -510,18 +511,211 @@ if [ "$dump_success" = "true" ]; then
         log_info "Raw schema dump: $schema_size lines"
         log_to_file "$LOG_FILE" "Raw schema dump: $schema_size lines"
         
+        # CRITICAL: Extract policies from ORIGINAL dump BEFORE filtering
+        # This ensures we don't lose any policies during filtering
+        POLICIES_FILE="$MIGRATION_DIR_ABS/policies_only.sql"
+        log_info "Extracting all non-storage policies from original dump (before filtering)..."
+        
+        # Use awk for multi-line policies (more robust - handles policies that span multiple lines)
+        # This is the PRIMARY extraction method - it handles all cases including single-line and multi-line policies
+        awk '
+        BEGIN {
+            in_policy = 0
+            policy_lines = ""
+            skip_this_policy = 0
+        }
+        /^CREATE POLICY/ {
+            in_policy = 1
+            policy_lines = $0
+            skip_this_policy = 0
+            # Check if this is a storage policy
+            if ($0 ~ /ON storage\./) {
+                skip_this_policy = 1
+            }
+            next
+        }
+        in_policy {
+            policy_lines = policy_lines "\n" $0
+            # Check if any line in the policy references storage (but allow "storage" in other contexts)
+            if ($0 ~ /ON storage\./) {
+                skip_this_policy = 1
+            }
+            # Check if policy statement ends (semicolon on its own or at end of line)
+            if ($0 ~ /;[[:space:]]*$/) {
+                if (!skip_this_policy) {
+                    print policy_lines
+                }
+                policy_lines = ""
+                in_policy = 0
+                skip_this_policy = 0
+            }
+            next
+        }
+        /^ALTER TABLE.*ENABLE ROW LEVEL SECURITY/ && !/storage\./ {
+            print
+        }
+        ' "$SCHEMA_DUMP_FILE" > "$POLICIES_FILE" 2>/dev/null || touch "$POLICIES_FILE"
+        
+        # Also extract ALTER TABLE ... ENABLE ROW LEVEL SECURITY statements (if not already captured)
+        grep "^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$SCHEMA_DUMP_FILE" | grep -v "storage\." >> "$POLICIES_FILE" 2>/dev/null || true
+        
+        # Remove duplicates while preserving order
+        awk '!seen[$0]++' "$POLICIES_FILE" > "$POLICIES_FILE.tmp" 2>/dev/null && mv "$POLICIES_FILE.tmp" "$POLICIES_FILE" || true
+        
+        # Verify extraction by counting policies
+        policies_in_extracted=$(grep -c "^CREATE POLICY" "$POLICIES_FILE" 2>/dev/null || echo "0")
+        policies_in_source=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+        storage_policies_in_source=$(grep -c "^CREATE POLICY.*ON storage\." "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+        expected_non_storage=$(($policies_in_source - $storage_policies_in_source))
+        
+        if [ "$policies_in_extracted" -lt "$expected_non_storage" ]; then
+            log_warning "  ⚠ Policy extraction may be incomplete: extracted $policies_in_extracted, expected ~$expected_non_storage"
+            log_warning "  Attempting fallback extraction method..."
+            # Fallback: Use grep as backup (handles single-line policies)
+            grep "^CREATE POLICY" "$SCHEMA_DUMP_FILE" | grep -v "ON storage\." > "$POLICIES_FILE.fallback" 2>/dev/null || true
+            grep "^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$SCHEMA_DUMP_FILE" | grep -v "storage\." >> "$POLICIES_FILE.fallback" 2>/dev/null || true
+            fallback_count=$(grep -c "^CREATE POLICY" "$POLICIES_FILE.fallback" 2>/dev/null || echo "0")
+            if [ "$fallback_count" -gt "$policies_in_extracted" ]; then
+                mv "$POLICIES_FILE.fallback" "$POLICIES_FILE"
+                log_info "  Used fallback extraction (found $fallback_count policies)"
+            else
+                rm -f "$POLICIES_FILE.fallback"
+            fi
+        fi
+        
+        policies_extracted=$(wc -l < "$POLICIES_FILE" | tr -d '[:space:]' || echo "0")
+        if [ "$policies_extracted" -gt 0 ]; then
+            log_success "  ✓ Extracted $policies_extracted policy-related statement(s) to: $POLICIES_FILE"
+            log_to_file "$LOG_FILE" "Extracted $policies_extracted policy statements to $POLICIES_FILE (before filtering)"
+            
+            # Convert policies to incremental format (DROP IF EXISTS + CREATE)
+            log_info "  Converting policies to incremental format (DROP IF EXISTS + CREATE)..."
+            POLICIES_INCREMENTAL="$POLICIES_FILE.incremental"
+            awk '
+            BEGIN {
+                in_policy = 0
+                policy_lines = ""
+                policy_name = ""
+                table_name = ""
+                schema_name = "public"
+            }
+            /^CREATE POLICY/ {
+                if (in_policy) {
+                    # Finish previous policy (shouldn't happen but handle it)
+                    if (policy_name != "" && table_name != "") {
+                        print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
+                    }
+                    print policy_lines
+                    policy_lines = ""
+                }
+                in_policy = 1
+                policy_lines = $0
+                # Extract policy name (first quoted string after CREATE POLICY)
+                if (match($0, /CREATE POLICY "([^"]+)"/, arr)) {
+                    policy_name = arr[1]
+                }
+                # Extract table name (after ON schema.table or ON table)
+                # Pattern: ON public.table_name or ON table_name
+                if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\.([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+                    schema_name = arr[1]
+                    table_name = arr[2]
+                } else if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+                    # No schema specified, default to public
+                    schema_name = "public"
+                    table_name = arr[1]
+                }
+                # Check if this is a single-line policy (ends with semicolon)
+                if ($0 ~ /;[[:space:]]*$/) {
+                    if (policy_name != "" && table_name != "") {
+                        print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
+                    }
+                    print policy_lines
+                    policy_lines = ""
+                    in_policy = 0
+                    policy_name = ""
+                    table_name = ""
+                    schema_name = "public"
+                }
+                next
+            }
+            in_policy {
+                policy_lines = policy_lines "\n" $0
+                # Extract schema.table if not found yet (might be on continuation line)
+                if (table_name == "") {
+                    if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\.([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+                        schema_name = arr[1]
+                        table_name = arr[2]
+                    } else if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+                        schema_name = "public"
+                        table_name = arr[1]
+                    }
+                }
+                # Check if policy statement ends (semicolon)
+                if ($0 ~ /;[[:space:]]*$/) {
+                    if (policy_name != "" && table_name != "") {
+                        print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
+                    }
+                    print policy_lines
+                    policy_lines = ""
+                    in_policy = 0
+                    policy_name = ""
+                    table_name = ""
+                    schema_name = "public"
+                }
+                next
+            }
+            /^ALTER TABLE.*ENABLE ROW LEVEL SECURITY/ {
+                print
+                next
+            }
+            ' "$POLICIES_FILE" > "$POLICIES_INCREMENTAL" 2>/dev/null || cp "$POLICIES_FILE" "$POLICIES_INCREMENTAL"
+            
+            # Verify conversion worked
+            if [ -f "$POLICIES_INCREMENTAL" ] && [ -s "$POLICIES_INCREMENTAL" ]; then
+                incremental_count=$(grep -c "^DROP POLICY IF EXISTS" "$POLICIES_INCREMENTAL" 2>/dev/null || echo "0")
+                create_count=$(grep -c "^CREATE POLICY" "$POLICIES_INCREMENTAL" 2>/dev/null || echo "0")
+                if [ "$incremental_count" -gt 0 ] && [ "$incremental_count" -eq "$create_count" ]; then
+                    mv "$POLICIES_INCREMENTAL" "$POLICIES_FILE"
+                    log_info "  Converted $incremental_count policies to incremental format (DROP IF EXISTS + CREATE)"
+                else
+                    log_warning "  Policy conversion may have issues (DROP: $incremental_count, CREATE: $create_count), using original"
+                    rm -f "$POLICIES_INCREMENTAL"
+                fi
+            else
+                log_warning "  Policy conversion failed, using original file"
+                rm -f "$POLICIES_INCREMENTAL"
+            fi
+        else
+            log_warning "  ⚠ No policies extracted - this may indicate an issue with the dump"
+        fi
+        
+        # Save original unfiltered dump for comparison
+        cp "$SCHEMA_DUMP_FILE" "$SCHEMA_DUMP_FILE.unfiltered" 2>/dev/null || true
+        
         # Filter out system objects and statements that require superuser privileges
         log_info "Filtering schema dump to exclude system objects..."
         SCHEMA_DUMP_FILTERED="$SCHEMA_DUMP_FILE.filtered"
         
+        # Policies have already been extracted above before filtering - no need to extract again
+        # POLICIES_FILE is already set and contains all non-storage policies
+        
         # Filter the schema dump to exclude system objects and statements requiring superuser privileges
         # Use a state machine to filter complete statement blocks, not just individual lines
-        awk '
+        # Track skipped schemas for warning messages
+        SCHEMAS_SKIPPED_FILE="$MIGRATION_DIR_ABS/skipped_schemas.txt"
+        touch "$SCHEMAS_SKIPPED_FILE"
+        
+        awk -v skipped_schemas_file="$SCHEMAS_SKIPPED_FILE" '
         BEGIN {
             skip_block = 0
             in_event_trigger = 0
             in_publication = 0
             in_storage_policy = 0
+            in_policy = 0
+            skipped_auth = 0
+            skipped_extensions = 0
+            skipped_realtime = 0
+            skipped_storage = 0
         }
         # Skip complete event trigger blocks
         /^CREATE EVENT TRIGGER/ {
@@ -560,35 +754,47 @@ if [ "$dump_success" = "true" ]; then
             skip_block = 1
             next
         }
-        # Skip auth schema ALTER statements (require superuser)
-        /^ALTER (TABLE|FUNCTION) auth\./ {
+        # Skip auth schema ALTER statements (require superuser/exclusive ownership)
+        /^ALTER (TABLE|FUNCTION|SCHEMA) auth\./ {
+            if (!skipped_auth) {
+                print "auth" >> skipped_schemas_file
+                skipped_auth = 1
+            }
             skip_block = 1
             next
         }
-        # Skip extensions schema ALTER statements (require superuser)
-        /^ALTER (TABLE|FUNCTION) extensions\./ {
+        # Skip extensions schema ALTER statements (require superuser/exclusive ownership)
+        /^ALTER (TABLE|FUNCTION|SCHEMA) extensions\./ {
+            if (!skipped_extensions) {
+                print "extensions" >> skipped_schemas_file
+                skipped_extensions = 1
+            }
             skip_block = 1
             next
         }
-        # Skip storage schema policies (complete blocks)
-        # Match CREATE/ALTER/DROP POLICY statements that reference storage schema
-        /^CREATE POLICY.*ON storage\./ {
-            in_storage_policy = 1
+        # Skip realtime schema ALTER statements (require superuser/exclusive ownership)
+        /^ALTER (TABLE|FUNCTION|SCHEMA) realtime\./ {
+            if (!skipped_realtime) {
+                print "realtime" >> skipped_schemas_file
+                skipped_realtime = 1
+            }
             skip_block = 1
             next
         }
+        # Skip ALL CREATE POLICY statements (policies are applied separately from POLICIES_FILE with incremental format)
+        # This prevents "already exists" errors when policies are in both the schema dump and policies file
+        /^CREATE POLICY/ {
+            in_policy = 1
+            skip_block = 1
+            next
+        }
+        # Skip storage schema policies (complete blocks) - these are already excluded but keep for safety
         /^ALTER POLICY.*ON storage\./ {
             in_storage_policy = 1
             skip_block = 1
             next
         }
         /^DROP POLICY.*ON storage\./ {
-            in_storage_policy = 1
-            skip_block = 1
-            next
-        }
-        # Also catch storage policies that might be formatted differently
-        /^CREATE POLICY/ && /storage\./ {
             in_storage_policy = 1
             skip_block = 1
             next
@@ -621,8 +827,18 @@ if [ "$dump_success" = "true" ]; then
             skip_block = 0
             next
         }
+        # End of policy block (all CREATE POLICY statements are skipped)
+        in_policy && /^[[:space:]]*;/ {
+            in_policy = 0
+            skip_block = 0
+            next
+        }
+        # Handle policy blocks (already started above)
+        in_policy {
+            next
+        }
         # Skip ALTER statements on auth/extensions schemas (multi-line)
-        skip_block && /^[[:space:]]+.*auth\.|^[[:space:]]+.*extensions\./ {
+        skip_block && /^[[:space:]]+.*auth\.|^[[:space:]]+.*extensions\.|^[[:space:]]+.*realtime\./ {
             # Check if this is the end of the ALTER statement
             if (/^[[:space:]]*;/) {
                 skip_block = 0
@@ -651,14 +867,99 @@ if [ "$dump_success" = "true" ]; then
             log_to_file "$LOG_FILE" "Filtered schema dump: $filtered_size lines"
         fi
         
-        # Use filtered dump for application
+        
+        # Use filtered dump for application (policies will be applied separately from POLICIES_FILE)
         SCHEMA_DUMP_FILE="$SCHEMA_DUMP_FILTERED"
+        
+        # Display warnings for skipped schemas (single warning per schema)
+        if [ -f "$SCHEMAS_SKIPPED_FILE" ] && [ -s "$SCHEMAS_SKIPPED_FILE" ]; then
+            skipped_schemas=$(sort -u "$SCHEMAS_SKIPPED_FILE" | tr '\n' ' ' | sed 's/ $//')
+            if [ -n "$skipped_schemas" ]; then
+                log_warning "  ⚠ Skipped schema(s) requiring exclusive ownership: $skipped_schemas"
+                log_warning "     These schemas are managed by Supabase and cannot be migrated"
+                log_to_file "$LOG_FILE" "WARNING: Skipped schemas requiring exclusive ownership: $skipped_schemas"
+            fi
+        fi
         
         log_success "✓ Schema exported and filtered successfully"
         
-        # Count policies in the filtered dump
-        policy_count=$(grep -c "^CREATE POLICY\|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
-        log_info "  Found $policy_count policy-related statement(s) in schema dump"
+        # Count policies in the filtered dump (for reference - actual policies come from POLICIES_FILE)
+        policy_count_in_filtered=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+        rls_enable_count=$(grep -c "^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+        
+        # Count policies in original unfiltered dump and extracted file
+        if [ -f "$SCHEMA_DUMP_FILE.unfiltered" ]; then
+            unfiltered_policy_count=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE.unfiltered" 2>/dev/null || echo "0")
+            storage_policy_count=$(grep -c "^CREATE POLICY.*ON storage\." "$SCHEMA_DUMP_FILE.unfiltered" 2>/dev/null || echo "0")
+            non_storage_expected=$((unfiltered_policy_count - storage_policy_count))
+            
+            log_info "  Policy counts:"
+            log_info "    Original dump total: $unfiltered_policy_count"
+            log_info "    Storage policies (excluded): $storage_policy_count"
+            log_info "    Non-storage policies (should migrate): $non_storage_expected"
+            log_info "    Extracted to policies file: $policies_extracted"
+            log_info "    In filtered dump: $policy_count_in_filtered"
+            
+            if [ "$policies_extracted" -lt "$non_storage_expected" ]; then
+                log_warning "  ⚠ Extracted file has fewer policies than expected!"
+                log_warning "  Expected: $non_storage_expected, Extracted: $policies_extracted"
+                log_warning "  Attempting to re-extract from original dump using improved method..."
+                # Re-extract from original using awk (handles multi-line policies better)
+                awk '
+                BEGIN {
+                    in_policy = 0
+                    policy_lines = ""
+                    skip_this_policy = 0
+                }
+                /^CREATE POLICY/ {
+                    in_policy = 1
+                    policy_lines = $0
+                    skip_this_policy = 0
+                    if ($0 ~ /ON storage\./) {
+                        skip_this_policy = 1
+                    }
+                    next
+                }
+                in_policy {
+                    policy_lines = policy_lines "\n" $0
+                    if ($0 ~ /ON storage\./) {
+                        skip_this_policy = 1
+                    }
+                    if ($0 ~ /;[[:space:]]*$/) {
+                        if (!skip_this_policy) {
+                            print policy_lines
+                        }
+                        policy_lines = ""
+                        in_policy = 0
+                        skip_this_policy = 0
+                    }
+                    next
+                }
+                /^ALTER TABLE.*ENABLE ROW LEVEL SECURITY/ && !/storage\./ {
+                    print
+                }
+                ' "$SCHEMA_DUMP_FILE.unfiltered" > "$POLICIES_FILE.re_extract" 2>/dev/null || true
+                # Also add ALTER TABLE statements
+                grep "^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$SCHEMA_DUMP_FILE.unfiltered" | grep -v "storage\." >> "$POLICIES_FILE.re_extract" 2>/dev/null || true
+                # Remove duplicates
+                awk '!seen[$0]++' "$POLICIES_FILE.re_extract" > "$POLICIES_FILE" 2>/dev/null || mv "$POLICIES_FILE.re_extract" "$POLICIES_FILE"
+                rm -f "$POLICIES_FILE.re_extract"
+                policies_extracted=$(grep -c "^CREATE POLICY" "$POLICIES_FILE" 2>/dev/null || echo "0")
+                log_info "  Re-extracted $policies_extracted policies from original dump"
+            fi
+            
+            if [ "$policies_extracted" -ge "$non_storage_expected" ]; then
+                log_success "  ✓ All non-storage policies extracted successfully ($policies_extracted statements)"
+            fi
+        fi
+        
+        # Also count by schema to verify we're getting all policies
+        if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
+            public_policies=$(grep -c "^CREATE POLICY.*ON public\." "$POLICIES_FILE" 2>/dev/null || echo "0")
+            if [ "$public_policies" -gt 0 ]; then
+                log_info "  Public schema policies in extracted file: $public_policies"
+            fi
+        fi
     else
         log_warning "⚠ Schema dump file is empty"
         log_to_file "$LOG_FILE" "WARNING: Schema dump file is empty"
@@ -698,7 +999,6 @@ if [ "$VERIFY_ONLY" = "true" ]; then
             -d postgres \
             --schema-only \
             --no-owner \
-            --no-privileges \
             -f "$TARGET_SCHEMA_FILE" 2>&1 | tee -a "$LOG_FILE"; then
             target_dump_success=true
             break
@@ -716,16 +1016,27 @@ if [ "$VERIFY_ONLY" = "true" ]; then
             log_info "  Source policies: $source_policy_count"
             log_info "  Target policies: $target_policy_count"
             
-            if [ "$source_policy_count" -eq "$target_policy_count" ]; then
-                log_success "✓ Policy counts match between source and target"
+        # Compare using non-storage policies from source
+        if [ -f "$SCHEMA_DUMP_FILE.unfiltered" ]; then
+            source_total=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE.unfiltered" 2>/dev/null || echo "0")
+            source_storage=$(grep -c "^CREATE POLICY.*ON storage\." "$SCHEMA_DUMP_FILE.unfiltered" 2>/dev/null || echo "0")
+            source_non_storage=$((source_total - source_storage))
+        else
+            source_non_storage=$source_policy_count
+        fi
+        
+        if [ "$source_non_storage" -eq "$target_policy_count" ]; then
+            log_success "✓ Policy counts match between source and target"
+        else
+            diff=$((source_non_storage - target_policy_count))
+            if [ "$diff" -gt 0 ]; then
+                log_warning "⚠ Target has $diff fewer policy(ies) than source (expected $source_non_storage, got $target_policy_count)"
+                log_warning "  This indicates some policies failed to migrate"
+                log_to_file "$LOG_FILE" "WARNING: Policy count mismatch - $diff policies missing"
             else
-                diff=$((source_policy_count - target_policy_count))
-                if [ "$diff" -gt 0 ]; then
-                    log_warning "⚠ Target has $diff fewer policy(ies) than source"
-                else
-                    log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
-                fi
+                log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
             fi
+        fi
             
             # Compare schemas using diff command
             log_info "Running detailed diff check..."
@@ -806,8 +1117,11 @@ while IFS='|' read -r host port user label; do
     log_to_file "$LOG_FILE" "Attempting schema application via ${label}"
     # Apply schema with error handling - continue on non-critical errors
     # Use ON_ERROR_STOP=off to continue even if some statements fail
+    # This is important for policies - we want to apply all policies even if some fail
     psql_output_file="$MIGRATION_DIR_ABS/psql_output_${label//[^a-zA-Z0-9]/_}.log"
     set +e  # Don't exit on psql errors - we'll check the output file
+    
+    # First apply the main schema (without policies)
     PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
         -h "$host" \
         -p "$port" \
@@ -815,7 +1129,44 @@ while IFS='|' read -r host port user label; do
         -d postgres \
         -v ON_ERROR_STOP=off \
         -f "$SCHEMA_DUMP_FILE" > "$psql_output_file" 2>&1
-    local psql_exit_code=$?
+    psql_exit_code=$?
+    
+    # Then apply policies separately with better error handling
+    if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
+        log_info "  Applying policies separately for better error tracking..."
+        policies_output_file="$MIGRATION_DIR_ABS/policies_output_${label//[^a-zA-Z0-9]/_}.log"
+        PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -v ON_ERROR_STOP=off \
+            -f "$POLICIES_FILE" > "$policies_output_file" 2>&1
+        policies_exit_code=$?
+        
+        # Append policies output to main output file
+        cat "$policies_output_file" >> "$psql_output_file"
+        
+        # Count policy application results
+        policies_in_file=$(grep -c "^CREATE POLICY\|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$POLICIES_FILE" 2>/dev/null || echo "0")
+        policies_errors=$(grep -cE "ERROR.*[Pp]olicy|ERROR.*POLICY" "$policies_output_file" 2>/dev/null || echo "0")
+        if [ "$policies_in_file" -gt 0 ]; then
+            log_info "  Applied $policies_in_file policy statement(s) separately"
+            if [ "$policies_errors" -gt 0 ]; then
+                log_warning "  $policies_errors policy statement(s) had errors"
+                # Extract and log policy errors
+                policy_error_details=$(grep -E "ERROR.*[Pp]olicy|ERROR.*POLICY" "$policies_output_file" 2>/dev/null | head -10 || echo "")
+                if [ -n "$policy_error_details" ]; then
+                    log_to_file "$LOG_FILE" "Policy application errors via ${label}:"
+                    echo "$policy_error_details" | while IFS= read -r error_line; do
+                        log_to_file "$LOG_FILE" "  $error_line"
+                    done
+                fi
+            fi
+        fi
+        rm -f "$policies_output_file"
+    fi
+    
     set -e
     
     # Check if connection was successful (even if SQL had errors)
@@ -828,6 +1179,34 @@ while IFS='|' read -r host port user label; do
     if grep -qE "FATAL|could not connect|connection refused|timeout" "$psql_output_file" 2>/dev/null; then
         log_warning "Connection failed via ${label}, trying next endpoint..."
         continue
+    fi
+    
+    # Count policy application results
+    policies_applied=0
+    policies_failed=0
+    policy_errors=""
+    if grep -q "CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null; then
+        # Count policies in the dump file
+        policies_applied=$(grep -c "CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+        # Count policy-related errors (more comprehensive pattern matching)
+        policies_failed=$(grep -cE "ERROR.*[Pp]olicy|ERROR.*POLICY|ERROR.*policy.*already exists|ERROR.*duplicate" "$psql_output_file" 2>/dev/null || echo "0")
+        # Extract policy error details
+        policy_errors=$(grep -E "ERROR.*[Pp]olicy|ERROR.*POLICY" "$psql_output_file" 2>/dev/null | head -10 || echo "")
+        
+        if [ "$policies_applied" -gt 0 ]; then
+            log_info "  Attempted to apply $policies_applied policy(ies) via ${label}"
+            if [ "$policies_failed" -gt 0 ]; then
+                log_warning "  $policies_failed policy(ies) had errors (may already exist or require different permissions)"
+                if [ -n "$policy_errors" ]; then
+                    log_to_file "$LOG_FILE" "Policy errors encountered via ${label}:"
+                    echo "$policy_errors" | while IFS= read -r error_line; do
+                        log_to_file "$LOG_FILE" "  $error_line"
+                    done
+                fi
+            else
+                log_info "  No policy errors detected in output"
+            fi
+        fi
     fi
     
     # Log the output
@@ -843,14 +1222,16 @@ while IFS='|' read -r host port user label; do
         if [ -n "$all_errors" ]; then
             # Filter out system errors - these are expected and should be ignored
             # Use a single grep with extended regex to match any system error pattern
+            # Include auth schema permission errors as they're expected in Supabase
+            # Also ignore "policy already exists" errors since we use DROP IF EXISTS (but some may still fail)
             critical_errors=$(echo "$all_errors" | \
-                grep -vE "must be owner|already exists|Non-superuser owned event trigger|syntax error" | \
+                grep -vE "must be owner|already exists|Non-superuser owned event trigger|syntax error|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication" | \
                 wc -l | tr -d '[:space:]' || echo "0")
             
             # Count total and system errors
             total_errors=$(echo "$all_errors" | wc -l | tr -d '[:space:]' || echo "0")
             system_errors=$(echo "$all_errors" | \
-                grep -E "must be owner|already exists|Non-superuser owned event trigger|syntax error" | \
+                grep -E "must be owner|already exists|Non-superuser owned event trigger|syntax error|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication" | \
                 wc -l | tr -d '[:space:]' || echo "0")
         else
             critical_errors=0
@@ -969,7 +1350,6 @@ while IFS='|' read -r host port user label; do
         -d postgres \
         --schema-only \
         --no-owner \
-        --no-privileges \
         -f "$TARGET_SCHEMA_AFTER" 2>&1 | tee -a "$LOG_FILE"; then
         target_after_dump_success=true
         break
@@ -978,24 +1358,248 @@ done <<< "$endpoints"
 
 if [ "$target_after_dump_success" = "true" ]; then
     if [ -s "$TARGET_SCHEMA_AFTER" ]; then
-        # Count policies
+        # Count policies from the ORIGINAL unfiltered dump (to compare with actual database)
+        source_unfiltered_dump="$SCHEMA_DUMP_FILE.unfiltered"
+        if [ -f "$source_unfiltered_dump" ]; then
+            source_total_policies=$(grep -c "^CREATE POLICY" "$source_unfiltered_dump" 2>/dev/null || echo "0")
+            source_storage_policies=$(grep -c "^CREATE POLICY.*ON storage\." "$source_unfiltered_dump" 2>/dev/null || echo "0")
+            source_non_storage_policies=$((source_total_policies - source_storage_policies))
+        else
+            # Fallback to filtered dump if original not available
+            source_total_policies=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+            source_storage_policies=0
+            source_non_storage_policies=$source_total_policies
+        fi
+        
+        # Count policies in filtered dump (what we tried to apply)
         source_policy_count=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+        
+        # Count policies in target (from all schemas)
         target_policy_count=$(grep -c "^CREATE POLICY" "$TARGET_SCHEMA_AFTER" 2>/dev/null || echo "0")
         
-        log_info "  Source policies: $source_policy_count"
-        log_info "  Target policies (after migration): $target_policy_count"
+        log_info "  Source total policies (all schemas): $source_total_policies"
+        log_info "  Source storage policies (excluded from migration): $source_storage_policies"
+        log_info "  Source non-storage policies (should be migrated): $source_non_storage_policies"
+        log_info "  Source policies in filtered dump: $source_policy_count"
+        log_info "  Target policies after migration: $target_policy_count"
         
-        if [ "$source_policy_count" -eq "$target_policy_count" ]; then
-            log_success "✓ Policy counts match! Migration successful"
-            log_to_file "$LOG_FILE" "SUCCESS: Policy counts match ($source_policy_count policies)"
+        # Calculate missing policies
+        if [ "$source_non_storage_policies" -gt 0 ]; then
+            missing_policies=$((source_non_storage_policies - target_policy_count))
+            if [ "$missing_policies" -gt 0 ]; then
+                log_error "❌ Policy migration incomplete: Target has $missing_policies fewer policy(ies) than source"
+                log_error "  Expected: $source_non_storage_policies, Got: $target_policy_count"
+                log_to_file "$LOG_FILE" "ERROR: Policy migration incomplete - $missing_policies policies missing"
+                log_to_file "$LOG_FILE" "  Source non-storage policies: $source_non_storage_policies"
+                log_to_file "$LOG_FILE" "  Target policies: $target_policy_count"
+                
+                # Try to identify which policies are missing by extracting policy names
+                log_info "  Attempting to identify missing policies..."
+                if [ -f "$source_unfiltered_dump" ] && [ -f "$TARGET_SCHEMA_AFTER" ]; then
+                    # Extract policy names from source (non-storage)
+                    source_policy_names=$(grep "^CREATE POLICY" "$source_unfiltered_dump" | \
+                        grep -v "ON storage\." | \
+                        sed -E 's/^CREATE POLICY[[:space:]]+([^[:space:]]+).*/\1/' | sort)
+                    target_policy_names=$(grep "^CREATE POLICY" "$TARGET_SCHEMA_AFTER" | \
+                        sed -E 's/^CREATE POLICY[[:space:]]+([^[:space:]]+).*/\1/' | sort)
+                    
+                    missing_policy_names=$(comm -23 <(echo "$source_policy_names") <(echo "$target_policy_names") 2>/dev/null | head -20 || echo "")
+                    if [ -n "$missing_policy_names" ]; then
+                        log_warning "  Sample missing policy names (from dump comparison):"
+                        echo "$missing_policy_names" | while IFS= read -r policy_name; do
+                            [ -n "$policy_name" ] && log_warning "    - $policy_name"
+                            [ -n "$policy_name" ] && log_to_file "$LOG_FILE" "  Missing policy (from dump): $policy_name"
+                        done
+                        missing_count=$(echo "$missing_policy_names" | wc -l | tr -d '[:space:]')
+                        if [ "$missing_count" -gt 20 ]; then
+                            log_warning "    ... and more (check log file for complete list)"
+                        fi
+                    fi
+                fi
+                
+                # Enhanced: Direct database query to identify missing policies with full identifiers
+                log_info "  Querying databases directly to identify missing policies (more accurate)..."
+                source_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
+                target_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
+                
+                # Query source policies
+                source_policies_list_file="$MIGRATION_DIR_ABS/source_policies_list.txt"
+                endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}")
+                source_policies_success=false
+                
+                while IFS='|' read -r host port user label; do
+                    [ -z "$host" ] && continue
+                    if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require psql \
+                        -h "$host" \
+                        -p "$port" \
+                        -U "$user" \
+                        -d postgres \
+                        -t -A \
+                        -c "$source_policies_query" > "$source_policies_list_file" 2>/dev/null; then
+                        source_policies_success=true
+                        log_info "    Source policies queried via $label"
+                        break
+                    fi
+                done <<< "$endpoints"
+                
+                # Query target policies
+                target_policies_list_file="$MIGRATION_DIR_ABS/target_policies_list.txt"
+                endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
+                target_policies_success=false
+                
+                while IFS='|' read -r host port user label; do
+                    [ -z "$host" ] && continue
+                    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                        -h "$host" \
+                        -p "$port" \
+                        -U "$user" \
+                        -d postgres \
+                        -t -A \
+                        -c "$target_policies_query" > "$target_policies_list_file" 2>/dev/null; then
+                        target_policies_success=true
+                        log_info "    Target policies queried via $label"
+                        break
+                    fi
+                done <<< "$endpoints"
+                
+                # Compare and identify missing policies
+                if [ "$source_policies_success" = "true" ] && [ "$target_policies_success" = "true" ]; then
+                    source_policies_db_count=$(wc -l < "$source_policies_list_file" | tr -d '[:space:]' || echo "0")
+                    target_policies_db_count=$(wc -l < "$target_policies_list_file" | tr -d '[:space:]' || echo "0")
+                    
+                    log_info "  Direct database query results:"
+                    log_info "    Source policies (from DB): $source_policies_db_count"
+                    log_info "    Target policies (from DB): $target_policies_db_count"
+                    log_to_file "$LOG_FILE" "Direct DB query - Source: $source_policies_db_count, Target: $target_policies_db_count"
+                    
+                    if [ "$source_policies_db_count" -gt "$target_policies_db_count" ]; then
+                        missing_db_count=$((source_policies_db_count - target_policies_db_count))
+                        log_error "  ❌ Missing $missing_db_count policy(ies) identified via direct database query"
+                        log_to_file "$LOG_FILE" "ERROR: Missing $missing_db_count policies (direct DB query)"
+                        
+                        # Find missing policies using comm
+                        missing_policies_file="$MIGRATION_DIR_ABS/missing_policies.txt"
+                        comm -23 <(sort "$source_policies_list_file") <(sort "$target_policies_list_file") > "$missing_policies_file" 2>/dev/null || true
+                        
+                        if [ -s "$missing_policies_file" ]; then
+                            missing_list=$(cat "$missing_policies_file")
+                            log_error "  Missing policies (full identifier: schema.table.policy):"
+                            echo "$missing_list" | while IFS= read -r policy_id; do
+                                [ -n "$policy_id" ] && log_error "    - $policy_id"
+                                [ -n "$policy_id" ] && log_to_file "$LOG_FILE" "  Missing policy: $policy_id"
+                            done
+                            log_info "  Full list of missing policies saved to: $missing_policies_file"
+                            log_to_file "$LOG_FILE" "Missing policies list saved to: $missing_policies_file"
+                        else
+                            log_warning "  Could not generate missing policies list (comm command failed)"
+                        fi
+                    elif [ "$target_policies_db_count" -ge "$source_policies_db_count" ]; then
+                        log_success "  ✓ All policies migrated successfully (direct database query confirms)"
+                        log_to_file "$LOG_FILE" "SUCCESS: Direct DB query confirms all policies migrated"
+                    fi
+                else
+                    if [ "$source_policies_success" = "false" ]; then
+                        log_warning "  Could not query source policies directly from database"
+                        log_to_file "$LOG_FILE" "WARNING: Failed to query source policies from DB"
+                    fi
+                    if [ "$target_policies_success" = "false" ]; then
+                        log_warning "  Could not query target policies directly from database"
+                        log_to_file "$LOG_FILE" "WARNING: Failed to query target policies from DB"
+                    fi
+                fi
+            elif [ "$target_policy_count" -ge "$source_non_storage_policies" ]; then
+                log_success "✓ Policy migration successful: All non-storage policies migrated ($target_policy_count policies)"
+                log_to_file "$LOG_FILE" "SUCCESS: Policy migration complete ($target_policy_count policies)"
+            fi
         else
-            diff=$((source_policy_count - target_policy_count))
-            if [ "$diff" -gt 0 ]; then
-                log_warning "⚠ Target has $diff fewer policy(ies) than source"
-                log_to_file "$LOG_FILE" "WARNING: Target has $diff fewer policies than source"
+            # Fallback comparison if we don't have unfiltered dump
+            if [ "$source_policy_count" -eq "$target_policy_count" ]; then
+                log_success "✓ Policy counts match! Migration successful"
+                log_to_file "$LOG_FILE" "SUCCESS: Policy counts match ($source_policy_count policies)"
             else
-                log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
-                log_to_file "$LOG_FILE" "WARNING: Target has $((diff * -1)) more policies than source"
+                diff=$((source_policy_count - target_policy_count))
+                if [ "$diff" -gt 0 ]; then
+                    log_warning "⚠ Target has $diff fewer policy(ies) than source"
+                    log_to_file "$LOG_FILE" "WARNING: Target has $diff fewer policies than source"
+                    
+                    # Enhanced: Direct database query to identify missing policies
+                    log_info "  Querying databases directly to identify missing policies..."
+                    source_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
+                    target_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
+                    
+                    # Query source policies
+                    source_policies_list_file="$MIGRATION_DIR_ABS/source_policies_list.txt"
+                    endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}")
+                    source_policies_success=false
+                    
+                    while IFS='|' read -r host port user label; do
+                        [ -z "$host" ] && continue
+                        if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require psql \
+                            -h "$host" \
+                            -p "$port" \
+                            -U "$user" \
+                            -d postgres \
+                            -t -A \
+                            -c "$source_policies_query" > "$source_policies_list_file" 2>/dev/null; then
+                            source_policies_success=true
+                            break
+                        fi
+                    done <<< "$endpoints"
+                    
+                    # Query target policies
+                    target_policies_list_file="$MIGRATION_DIR_ABS/target_policies_list.txt"
+                    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
+                    target_policies_success=false
+                    
+                    while IFS='|' read -r host port user label; do
+                        [ -z "$host" ] && continue
+                        if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                            -h "$host" \
+                            -p "$port" \
+                            -U "$user" \
+                            -d postgres \
+                            -t -A \
+                            -c "$target_policies_query" > "$target_policies_list_file" 2>/dev/null; then
+                            target_policies_success=true
+                            break
+                        fi
+                    done <<< "$endpoints"
+                    
+                    # Compare and identify missing policies
+                    if [ "$source_policies_success" = "true" ] && [ "$target_policies_success" = "true" ]; then
+                        source_policies_db_count=$(wc -l < "$source_policies_list_file" | tr -d '[:space:]' || echo "0")
+                        target_policies_db_count=$(wc -l < "$target_policies_list_file" | tr -d '[:space:]' || echo "0")
+                        
+                        log_info "  Direct database query results:"
+                        log_info "    Source policies (from DB): $source_policies_db_count"
+                        log_info "    Target policies (from DB): $target_policies_db_count"
+                        log_to_file "$LOG_FILE" "Direct DB query - Source: $source_policies_db_count, Target: $target_policies_db_count"
+                        
+                        if [ "$source_policies_db_count" -gt "$target_policies_db_count" ]; then
+                            missing_db_count=$((source_policies_db_count - target_policies_db_count))
+                            log_error "  ❌ Missing $missing_db_count policy(ies) identified via direct database query"
+                            log_to_file "$LOG_FILE" "ERROR: Missing $missing_db_count policies (direct DB query)"
+                            
+                            # Find missing policies using comm
+                            missing_policies_file="$MIGRATION_DIR_ABS/missing_policies.txt"
+                            comm -23 <(sort "$source_policies_list_file") <(sort "$target_policies_list_file") > "$missing_policies_file" 2>/dev/null || true
+                            
+                            if [ -s "$missing_policies_file" ]; then
+                                missing_list=$(cat "$missing_policies_file")
+                                log_error "  Missing policies (full identifier: schema.table.policy):"
+                                echo "$missing_list" | while IFS= read -r policy_id; do
+                                    [ -n "$policy_id" ] && log_error "    - $policy_id"
+                                    [ -n "$policy_id" ] && log_to_file "$LOG_FILE" "  Missing policy: $policy_id"
+                                done
+                                log_info "  Full list of missing policies saved to: $missing_policies_file"
+                                log_to_file "$LOG_FILE" "Missing policies list saved to: $missing_policies_file"
+                            fi
+                        fi
+                    fi
+                else
+                    log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
+                    log_to_file "$LOG_FILE" "WARNING: Target has $((diff * -1)) more policies than source"
+                fi
             fi
         fi
         
