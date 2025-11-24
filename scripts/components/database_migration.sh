@@ -983,7 +983,13 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
                 TABLE_FILTER_ARGS+=(--table="$t")
             done
         fi
-        if pg_restore --data-only --no-owner --no-privileges "${TABLE_FILTER_ARGS[@]}" -f "$incremental_sql" "$DUMP_FILE"; then
+        # Build pg_restore command with proper handling of empty array
+        pg_restore_cmd=("pg_restore" "--data-only" "--no-owner" "--no-privileges")
+        if [ ${#TABLE_FILTER_ARGS[@]} -gt 0 ]; then
+            pg_restore_cmd+=("${TABLE_FILTER_ARGS[@]}")
+        fi
+        pg_restore_cmd+=("-f" "$incremental_sql" "$DUMP_FILE")
+        if "${pg_restore_cmd[@]}"; then
             if [ ${#INCLUDE_TABLES[@]} -gt 0 ]; then
                 TARGET_TABLE_LIST=$(for t in "${INCLUDE_TABLES[@]}"; do printf "'%s'," "$t"; done)
                 TARGET_TABLE_LIST="${TARGET_TABLE_LIST%,}"

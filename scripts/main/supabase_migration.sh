@@ -115,7 +115,7 @@ Arguments:
   <target_env>            Target environment (prod, test, dev, backup) - REQUIRED
 
 Options:
-  --full                  Shortcut for schema+data+users+files migration (equivalent to --mode full --data --users --files)
+  --full                  Shortcut for complete migration (equivalent to --mode full --data --users --files --secret)
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
   --increment             Prefer incremental/delta updates where supported (e.g. data) instead of full replace
   --data                  Include database row data migration (default: disabled)
@@ -151,7 +151,7 @@ Default Behavior:
   Use --files to include storage bucket file migration.
   Use --users to copy auth users/identities so login state matches source.
   Use --secret to migrate secrets (adds new secret keys incrementally; existing secrets in target are never modified or removed).
-  Use --full for an all-in-one migration (schema + data + users + files).
+  Use --full for a complete migration (schema + data + users + files + secrets + edge functions).
 
 Examples:
   # Schema-only migration (default - no data, no files)
@@ -218,6 +218,7 @@ parse_args() {
                 INCLUDE_DATA=true
                 INCLUDE_USERS=true
                 INCLUDE_FILES=true
+                INCLUDE_SECRETS=true
                 shift
                 ;;
             --increment|--incremental)

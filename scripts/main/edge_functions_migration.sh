@@ -31,6 +31,7 @@ Arguments:
 Options:
   --increment    Prefer incremental/delta operations (skip identical functions)
   --replace      Replace mode: Delete all target functions and redeploy from source
+  --retryMissing Only deploy edge functions that are missing in target
   --auto-confirm Automatically proceed without interactive confirmation
   -h, --help     Show this help message
 
@@ -53,6 +54,7 @@ fi
 # Configuration defaults
 INCREMENTAL_MODE="false"
 REPLACE_MODE="false"
+RETRY_MISSING_MODE="false"
 AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
 SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
 MIGRATION_DIR=""
@@ -73,6 +75,9 @@ while [ $# -gt 0 ]; do
             ;;
         --replace)
             REPLACE_MODE="true"
+            ;;
+        --retryMissing|--retry-missing)
+            RETRY_MISSING_MODE="true"
             ;;
         --auto-confirm|--yes|-y)
             AUTO_CONFIRM_COMPONENT="true"
@@ -169,8 +174,12 @@ log_info "Source: $SOURCE_ENV ($SOURCE_REF)"
 log_info "Target: $TARGET_ENV ($TARGET_REF)"
 log_info "Migration directory: $MIGRATION_DIR_ABS"
 log_info "Incremental mode: $INCREMENTAL_MODE (edge functions utility performs delta comparisons by default)"
-if [ "$REPLACE_MODE" = "true" ]; then
+if [ "$REPLACE_MODE" = "true" ] && [ "$RETRY_MISSING_MODE" = "true" ]; then
+    log_warning "⚠️  Both --replace and --retryMissing are set. Replace mode will delete all target functions, then only missing functions will be deployed."
+elif [ "$REPLACE_MODE" = "true" ]; then
     log_warning "⚠️  REPLACE MODE: All target functions will be deleted and replaced with source functions"
+elif [ "$RETRY_MISSING_MODE" = "true" ]; then
+    log_info "🔄 RETRY MISSING MODE: Only deploying functions missing in target"
 fi
 echo ""
 
@@ -241,6 +250,9 @@ if [ "$INCREMENTAL_MODE" = "true" ]; then
 fi
 if [ "$REPLACE_MODE" = "true" ]; then
     node_args+=("--replace")
+fi
+if [ "$RETRY_MISSING_MODE" = "true" ]; then
+    node_args+=("--retryMissing")
 fi
 
 # Run Node.js utility and capture output

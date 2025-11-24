@@ -372,6 +372,14 @@ async function main() {
   if (commonUserColumns.length === 0) {
     exitWithError('No overlapping columns between source and target auth.users tables.');
   }
+  
+  // Verify that encrypted_password is included (critical for password migration)
+  if (commonUserColumns.includes('encrypted_password')) {
+    logInfo('✓ Password migration enabled: encrypted_password column will be migrated', logStream);
+  } else {
+    logWarning('⚠ Password migration may be incomplete: encrypted_password not found in common columns', logStream);
+    logWarning('   This may occur if the column is not updatable or has different permissions', logStream);
+  }
 
   const sourceIdentityColumns = fetchColumnList(sourceConfig, 'identities', logStream);
   const targetIdentityColumns = fetchColumnList(targetConfig, 'identities', logStream);
