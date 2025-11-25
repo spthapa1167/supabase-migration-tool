@@ -16,7 +16,13 @@ const dotenv = require('dotenv');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
 dotenv.config({ path: path.join(PROJECT_ROOT, '.env.local') });
 
-const SUPABASE_ACCESS_TOKEN = process.env.SUPABASE_ACCESS_TOKEN || '';
+// Get access token helper function
+function getAccessTokenForEnv(env) {
+  if (!env) return '';
+  const envKey = normalizeEnvKey(env);
+  return process.env[`SUPABASE_${envKey}_ACCESS_TOKEN`] || '';
+}
+
 const fetchFn = typeof fetch === 'function' ? fetch.bind(global) : null;
 
 const args = process.argv.slice(2);
@@ -67,7 +73,7 @@ async function main() {
           throw new Error('instance-id command requires <env>');
         }
         const config = getEnvConfig(env);
-        const instanceId = await fetchInstanceId(config.projectRef);
+        const instanceId = await fetchInstanceId(config.projectRef, env);
         if (!instanceId) {
           console.error('[WARN] Unable to retrieve instance_id via Management API');
           process.exitCode = 1;
@@ -237,13 +243,30 @@ async function listAuthUsers(config) {
   return users;
 }
 
-async function fetchInstanceId(projectRef) {
-  if (!SUPABASE_ACCESS_TOKEN || !fetchFn) {
+async function fetchInstanceId(projectRef, env = null) {
+  // Try to get access token from environment if provided, otherwise try to match projectRef
+  let accessToken = '';
+  if (env) {
+    accessToken = getAccessTokenForEnv(env);
+  } else {
+    // Try to match projectRef to known environments
+    if (projectRef === process.env.SUPABASE_PROD_PROJECT_REF) {
+      accessToken = process.env.SUPABASE_PROD_ACCESS_TOKEN || '';
+    } else if (projectRef === process.env.SUPABASE_TEST_PROJECT_REF) {
+      accessToken = process.env.SUPABASE_TEST_ACCESS_TOKEN || '';
+    } else if (projectRef === process.env.SUPABASE_DEV_PROJECT_REF) {
+      accessToken = process.env.SUPABASE_DEV_ACCESS_TOKEN || '';
+    } else if (projectRef === process.env.SUPABASE_BACKUP_PROJECT_REF) {
+      accessToken = process.env.SUPABASE_BACKUP_ACCESS_TOKEN || '';
+    }
+  }
+  
+  if (!accessToken || !fetchFn) {
     return null;
   }
   const response = await fetchFn(`https://api.supabase.com/v1/projects/${projectRef}`, {
     headers: {
-      Authorization: `Bearer ${SUPABASE_ACCESS_TOKEN}`,
+      Authorization: `Bearer ${accessToken}`,
       'Content-Type': 'application/json'
     }
   });
@@ -351,7 +374,7 @@ async function importUsers(targetEnv, options = {}) {
     instanceId = await fetchInstanceId(config.projectRef);
   }
   if (!instanceId) {
-    throw new Error('Unable to resolve target instance_id (provide --instance-id or set SUPABASE_ACCESS_TOKEN)');
+    throw new Error('Unable to resolve target instance_id (provide --instance-id or set SUPABASE_<ENV>_ACCESS_TOKEN)');
   }
 
   const usersRaw = parseCsvFile(usersCsvPath);

@@ -380,8 +380,11 @@ step_validate_env_file() {
     load_env
     set -e
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-        missing_vars+=("SUPABASE_ACCESS_TOKEN")
+    # Check for environment-specific access tokens (at least one should be set)
+    local source_token=$(get_env_access_token "$source")
+    local target_token=$(get_env_access_token "$target")
+    if [ -z "$source_token" ] && [ -z "$target_token" ]; then
+        missing_vars+=("SUPABASE_${source^^}_ACCESS_TOKEN or SUPABASE_${target^^}_ACCESS_TOKEN")
     fi
     
     local ref_var="SUPABASE_$(echo "$source" | tr '[:lower:]' '[:upper:]')_PROJECT_REF"

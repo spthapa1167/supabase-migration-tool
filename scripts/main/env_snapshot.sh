@@ -90,6 +90,7 @@ run_sql_query() {
     endpoints=$(get_supabase_connection_endpoints "$project_ref" "$pooler_region" "$pooler_port")
     
     local result=""
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         
@@ -107,6 +108,33 @@ run_sql_query() {
         fi
     done <<< "$endpoints"
     
+    # If all pooler connections failed, try API to get correct pooler hostname
+    log_info "Pooler connections failed for $env_name, trying API to get pooler hostname..." >&2
+    local api_pooler_host=""
+    api_pooler_host=$(get_pooler_host_via_api "$project_ref" 2>/dev/null || echo "")
+    
+    if [ -n "$api_pooler_host" ]; then
+        log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}" >&2
+        
+        # Try with API-resolved pooler host
+        for port in "$pooler_port" "5432"; do
+            result=$(PGPASSWORD="$password" PGSSLMODE=require psql \
+                -h "$api_pooler_host" \
+                -p "$port" \
+                -U "postgres.${project_ref}" \
+                -d postgres \
+                -t -A \
+                -c "$query" 2>/dev/null || echo "")
+            
+            if [ -n "$result" ]; then
+                echo "$result" | tr -d '[:space:]'
+                return 0
+            fi
+        done
+    else
+        log_warning "Could not resolve pooler hostname via API for $env_name" >&2
+    fi
+    
     echo "0"
     return 1
 }
@@ -122,17 +150,21 @@ get_db_counts() {
     # Log to stderr so it doesn't interfere with output capture
     echo "[INFO] Collecting database counts for $env_name..." >&2
     
-    # Tables (all schemas)
+    # Tables (all schemas) - exclude system schemas
+    # Exclude: pg_catalog, information_schema, and Supabase system schemas (auth, storage, realtime, vault, etc.)
     local all_tables=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema');" 2>/dev/null || echo "0")
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema', 'auth', 'storage', 'realtime', 'vault', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor', 'extensions', 'net', 'cron');" 2>/dev/null || echo "0")
     
-    # Public schema tables
+    # Public schema tables - exclude ALL Supabase system tables
+    # In Supabase, system tables in public schema don't follow consistent ownership patterns
+    # So we exclude by comprehensive naming patterns and known system table names
     local public_tables=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';" 2>/dev/null || echo "0")
+        "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null || echo "0")
     
-    # RLS Policies
+    # RLS Policies - only count policies on user-created tables in public schema
+    # Exclude policies on system tables by matching table name patterns
     local policies=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
-        "SELECT COUNT(*) FROM pg_policies WHERE schemaname IN ('public', 'auth');" 2>/dev/null || echo "0")
+        "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null || echo "0")
     
     # Functions
     local functions=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
@@ -192,7 +224,8 @@ get_edge_functions_count() {
     local project_ref=$1
     local env_name=$2
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+    local access_token=$(get_env_access_token "$env_name")
+    if [ -z "$access_token" ]; then
         echo "N/A"
         return
     fi
@@ -205,7 +238,7 @@ get_edge_functions_count() {
     local count="0"
     local url="https://api.supabase.com/v1/projects/${project_ref}/functions"
     local response=$(curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+        -H "Authorization: Bearer ${access_token}" \
         -H "Content-Type: application/json" \
         "$url" 2>/dev/null || echo "")
     
@@ -232,7 +265,8 @@ get_edge_functions_list() {
     local project_ref=$1
     local env_name=$2
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+    local access_token=$(get_env_access_token "$env_name")
+    if [ -z "$access_token" ]; then
         echo ""
         return
     fi
@@ -244,7 +278,7 @@ get_edge_functions_list() {
     
     local url="https://api.supabase.com/v1/projects/${project_ref}/functions"
     local response=$(curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+        -H "Authorization: Bearer ${access_token}" \
         -H "Content-Type: application/json" \
         "$url" 2>/dev/null || echo "")
     
@@ -393,7 +427,8 @@ get_public_tables_list() {
     local pooler_region=$4
     local pooler_port=$5
     
-    local query="SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name;"
+    # Exclude system tables by naming patterns (ownership check not reliable in Supabase)
+    local query="SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata') ORDER BY tablename;"
     
     local endpoints
     endpoints=$(get_supabase_connection_endpoints "$project_ref" "$pooler_region" "$pooler_port")

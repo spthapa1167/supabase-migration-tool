@@ -613,14 +613,17 @@ async function main() {
     console.log('');
 
     // Get source config
+    const sourceEnvName = getEnvName(SOURCE_REF);
+    const targetEnvName = getEnvName(TARGET_REF);
+    
     const sourceConfig = {
-        accessToken: process.env.SUPABASE_ACCESS_TOKEN || '',
-        dbPassword: process.env[`SUPABASE_${getEnvName(SOURCE_REF)}_DB_PASSWORD`] || ''
+        accessToken: process.env[`SUPABASE_${sourceEnvName}_ACCESS_TOKEN`] || '',
+        dbPassword: process.env[`SUPABASE_${sourceEnvName}_DB_PASSWORD`] || ''
     };
 
     const targetConfig = {
-        accessToken: process.env.SUPABASE_ACCESS_TOKEN || '',
-        dbPassword: process.env[`SUPABASE_${getEnvName(TARGET_REF)}_DB_PASSWORD`] || ''
+        accessToken: process.env[`SUPABASE_${targetEnvName}_ACCESS_TOKEN`] || '',
+        dbPassword: process.env[`SUPABASE_${targetEnvName}_DB_PASSWORD`] || ''
     };
 
     // Determine functions to migrate

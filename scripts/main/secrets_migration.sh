@@ -130,12 +130,20 @@ TARGET_REF=$(get_project_ref "$TARGET_ENV")
 SOURCE_PASSWORD=$(get_db_password "$SOURCE_ENV")
 TARGET_PASSWORD=$(get_db_password "$TARGET_ENV")
 
-# Validate access token (required for Management API)
-if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
-    log_error "SUPABASE_ACCESS_TOKEN not set - cannot use Management API"
-    log_error "Please ensure SUPABASE_ACCESS_TOKEN is set in .env.local"
+# Get environment-specific access tokens
+SOURCE_ACCESS_TOKEN=$(get_env_access_token "$SOURCE_ENV")
+TARGET_ACCESS_TOKEN=$(get_env_access_token "$TARGET_ENV")
+
+# Validate access tokens (required for Management API)
+if [ -z "$SOURCE_ACCESS_TOKEN" ] && [ -z "$TARGET_ACCESS_TOKEN" ]; then
+    log_error "Access tokens not set for source ($SOURCE_ENV) or target ($TARGET_ENV) environments"
+    log_error "Please ensure SUPABASE_${SOURCE_ENV^^}_ACCESS_TOKEN and/or SUPABASE_${TARGET_ENV^^}_ACCESS_TOKEN are set in .env.local"
     exit 1
 fi
+
+# Use source token for reading, target token for writing (fallback to source if target not set)
+ACCESS_TOKEN_FOR_READ="${SOURCE_ACCESS_TOKEN:-$TARGET_ACCESS_TOKEN}"
+ACCESS_TOKEN_FOR_WRITE="${TARGET_ACCESS_TOKEN:-$SOURCE_ACCESS_TOKEN}"
 
 # Create migration directory if not provided
 if [ -z "$MIGRATION_DIR" ]; then
@@ -183,7 +191,7 @@ SOURCE_SECRETS_FILE="$MIGRATION_DIR/source_secrets.json"
 TARGET_SECRETS_FILE="$MIGRATION_DIR/target_secrets.json"
 
 # Fetch source secrets
-if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+if curl -s -H "Authorization: Bearer $ACCESS_TOKEN_FOR_READ" \
     "https://api.supabase.com/v1/projects/${SOURCE_REF}/secrets" \
     -o "$SOURCE_SECRETS_FILE" 2>/dev/null; then
     
@@ -216,7 +224,7 @@ if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
     fi
 else
     log_error "Failed to fetch secrets from source project"
-    log_error "Please check SUPABASE_ACCESS_TOKEN and network connection"
+    log_error "Please check SUPABASE_${SOURCE_ENV^^}_ACCESS_TOKEN and network connection"
     exit 1
 fi
 
@@ -224,7 +232,7 @@ fi
 log_info "Step 2/4: Fetching existing secrets from target project..."
 log_to_file "$LOG_FILE" "Fetching secrets from target"
 
-if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+if curl -s -H "Authorization: Bearer $ACCESS_TOKEN_FOR_WRITE" \
     "https://api.supabase.com/v1/projects/${TARGET_REF}/secrets" \
     -o "$TARGET_SECRETS_FILE" 2>/dev/null; then
     

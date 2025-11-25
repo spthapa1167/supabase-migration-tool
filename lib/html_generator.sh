@@ -133,12 +133,12 @@ generate_result_html() {
         
         if [ -n "$pooler_host" ]; then
             # Query via pooler
-            tables=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+            tables=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null | tr -d ' ' || echo "0")
             views=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
             functions=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
             sequences=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
             indexes=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
-            policies=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+            policies=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null | tr -d ' ' || echo "0")
             triggers=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' ' || echo "0")
             types=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' ' || echo "0")
             enums=$(PGPASSWORD="$password" psql -h "$pooler_host" -p 6543 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' ' || echo "0")
@@ -147,12 +147,12 @@ generate_result_html() {
         # If pooler failed or wasn't available, try direct connection
         if [ -z "$pooler_host" ] || [ "$tables" = "" ]; then
             local direct_host="db.${project_ref}.supabase.co"
-            tables=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+            tables=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null | tr -d ' ' || echo "0")
             views=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_views WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
             functions=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid WHERE n.nspname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
             sequences=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM information_schema.sequences WHERE sequence_schema = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
             indexes=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
-            policies=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public';" 2>/dev/null | tr -d ' ' || echo "0")
+            policies=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null | tr -d ' ' || echo "0")
             triggers=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_trigger t JOIN pg_class c ON t.tgrelid = c.oid JOIN pg_namespace n ON c.relnamespace = n.oid WHERE n.nspname = 'public' AND NOT t.tgisinternal;" 2>/dev/null | tr -d ' ' || echo "0")
             types=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'c';" 2>/dev/null | tr -d ' ' || echo "0")
             enums=$(PGPASSWORD="$password" psql -h "$direct_host" -p 5432 -U postgres.${project_ref} -d postgres -t -A -c "SELECT COUNT(*) FROM pg_type t JOIN pg_namespace n ON t.typnamespace = n.oid WHERE n.nspname = 'public' AND t.typtype = 'e';" 2>/dev/null | tr -d ' ' || echo "0")
@@ -192,7 +192,24 @@ generate_result_html() {
     query_edge_functions_count() {
         local project_ref=$1
         
-        if [ -z "$project_ref" ] || [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+        if [ -z "$project_ref" ]; then
+            echo "0"
+            return 0
+        fi
+        
+        # Determine environment from project_ref and get corresponding access token
+        local access_token=""
+        if [ "$project_ref" = "${SUPABASE_PROD_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "prod")
+        elif [ "$project_ref" = "${SUPABASE_TEST_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "test")
+        elif [ "$project_ref" = "${SUPABASE_DEV_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "dev")
+        elif [ "$project_ref" = "${SUPABASE_BACKUP_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "backup")
+        fi
+        
+        if [ -z "$access_token" ]; then
             echo "0"
             return 0
         fi
@@ -200,7 +217,7 @@ generate_result_html() {
         local temp_json=$(mktemp)
         local count=0
         
-        if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+        if curl -s -H "Authorization: Bearer $access_token" \
             "https://api.supabase.com/v1/projects/${project_ref}/functions" \
             -o "$temp_json" 2>/dev/null; then
             if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then
@@ -243,7 +260,24 @@ generate_result_html() {
     query_secrets_count() {
         local project_ref=$1
         
-        if [ -z "$project_ref" ] || [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+        if [ -z "$project_ref" ]; then
+            echo "0"
+            return 0
+        fi
+        
+        # Determine environment from project_ref and get corresponding access token
+        local access_token=""
+        if [ "$project_ref" = "${SUPABASE_PROD_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "prod")
+        elif [ "$project_ref" = "${SUPABASE_TEST_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "test")
+        elif [ "$project_ref" = "${SUPABASE_DEV_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "dev")
+        elif [ "$project_ref" = "${SUPABASE_BACKUP_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "backup")
+        fi
+        
+        if [ -z "$access_token" ]; then
             echo "0"
             return 0
         fi
@@ -251,7 +285,7 @@ generate_result_html() {
         local temp_json=$(mktemp)
         local count=0
         
-        if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+        if curl -s -H "Authorization: Bearer $access_token" \
             "https://api.supabase.com/v1/projects/${project_ref}/secrets" \
             -o "$temp_json" 2>/dev/null; then
             if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then

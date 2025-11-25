@@ -15,6 +15,74 @@ source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
 source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
+# Helper function for reliable database connections (same as database_migration.sh)
+# Helper: run psql script file with fallback
+run_psql_script_with_fallback() {
+    local description=$1
+    local ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    local script_path=$6
+
+    local success=false
+    local tmp_err
+    tmp_err=$(mktemp)
+
+    # First, try database connectivity via shared pooler (no API calls)
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        log_info "${description} via ${label} (${host}:${port})"
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -v ON_ERROR_STOP=off \
+            -f "$script_path" \
+            >>"$LOG_FILE" 2>"$tmp_err"; then
+            success=true
+            break
+        else
+            log_warning "${description} failed via ${label}: $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "${pooler_region:-}" "${pooler_port:-6543}")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying ${description} with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "${pooler_port:-6543}" "5432"; do
+                log_info "${description} via API-resolved pooler (${api_pooler_host}:${port})"
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=off \
+                    -f "$script_path" \
+                    >>"$LOG_FILE" 2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "${description} failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
+
+    rm -f "$tmp_err"
+    $success && return 0 || return 1
+}
+
 # Usage function (must be defined before it's called)
 usage() {
     cat << EOF
@@ -145,6 +213,12 @@ fi
 
 # Load environment
 load_env
+
+# Get pooler configuration for source and target environments
+SOURCE_POOLER_REGION=$(get_pooler_region_for_env "$SOURCE_ENV")
+TARGET_POOLER_REGION=$(get_pooler_region_for_env "$TARGET_ENV")
+SOURCE_POOLER_PORT=$(get_pooler_port_for_env "$SOURCE_ENV")
+TARGET_POOLER_PORT=$(get_pooler_port_for_env "$TARGET_ENV")
 validate_environments "$SOURCE_ENV" "$TARGET_ENV"
 
 log_script_context "$(basename "$0")" "$SOURCE_ENV" "$TARGET_ENV"
@@ -200,19 +274,21 @@ if [ "$SKIP_COMPONENT_CONFIRM" != "true" ]; then
     fi
 fi
 
-# Step 1: Verify Supabase CLI is logged in
+# Step 1: Verify Supabase CLI is logged in (optional)
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log_info "  Step 1/4: Verifying Supabase CLI Authentication"
+log_info "  Step 1/4: Checking Supabase CLI Authentication (Optional)"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
 
-if ! supabase projects list >/dev/null 2>&1; then
-    log_error "Supabase CLI is not authenticated"
-    log_error "Please run: supabase login"
-    exit 1
+if supabase projects list >/dev/null 2>&1; then
+    log_success "✓ Supabase CLI is authenticated"
+    log_to_file "$LOG_FILE" "Supabase CLI authentication verified"
+else
+    log_warning "⚠ Supabase CLI is not authenticated (optional - using direct database connections)"
+    log_info "  This script uses pg_dump/psql directly, so CLI authentication is not required"
+    log_info "  If you want to use Supabase CLI features, run: supabase login"
+    log_to_file "$LOG_FILE" "Supabase CLI not authenticated - continuing with direct database connections"
 fi
-log_success "✓ Supabase CLI is authenticated"
-log_to_file "$LOG_FILE" "Supabase CLI authentication verified"
 echo ""
 
 # Step 2: Export schema from source project
@@ -230,32 +306,18 @@ log_to_file "$LOG_FILE" "Exporting schema from source project"
 log_info "Exporting schema from source project..."
 log_to_file "$LOG_FILE" "Exporting schema from source project using pg_dump"
 
-# Get connection endpoints for source
-endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}")
+# Use the same connection pattern as database_migration.sh (which works)
+# Use run_pg_tool_with_fallback helper function for reliable connections
+log_info "Dumping source schema using reliable connection fallback..."
+log_to_file "$LOG_FILE" "Dumping source schema from source project using pg_dump"
+
+PG_DUMP_ARGS=(-d postgres --schema-only --no-owner --no-privileges -f "$SCHEMA_DUMP_FILE")
 dump_success=false
 
-while IFS='|' read -r host port user label; do
-    [ -z "$host" ] && continue
-    log_info "Attempting schema dump via ${label} (${host}:${port})..."
-    log_to_file "$LOG_FILE" "Attempting schema dump via ${label}"
-    
-    # Use pg_dump directly with schema-only flag
-    if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require pg_dump \
-        -h "$host" \
-        -p "$port" \
-        -U "$user" \
-        -d postgres \
-        --schema-only \
-        --no-owner \
-        --no-privileges \
-        -f "$SCHEMA_DUMP_FILE" 2>&1 | tee -a "$LOG_FILE"; then
-        dump_success=true
-        break
-    else
-        log_warning "Schema dump via ${label} failed, trying next endpoint..."
-        log_to_file "$LOG_FILE" "Schema dump via ${label} failed"
-    fi
-done <<< "$endpoints"
+if run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}" "$LOG_FILE" \
+    "${PG_DUMP_ARGS[@]}"; then
+    dump_success=true
+fi
 
 if [ "$dump_success" = "true" ]; then
     if [ -s "$SCHEMA_DUMP_FILE" ]; then
@@ -381,39 +443,24 @@ if [ "$SKIP_COMPONENT_CONFIRM" != "true" ] && [ "$AUTO_CONFIRM_COMPONENT" != "tr
     fi
 fi
 
-# Apply schema to target project using direct SQL application
+# Apply schema to target project using direct SQL application (same pattern as database_migration.sh)
 # Note: We use psql directly for reliability, as db push requires migrations directory setup
 log_info "Applying schema to target project..."
 log_to_file "$LOG_FILE" "Applying schema to target project"
 
-# Apply SQL file directly using psql with fallback
-endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
+# Use run_psql_script_with_fallback helper function for reliable connections
 sql_applied=false
-while IFS='|' read -r host port user label; do
-    [ -z "$host" ] && continue
-    log_info "Applying schema via ${label} (${host}:${port})..."
-    log_to_file "$LOG_FILE" "Attempting schema application via ${label}"
-    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
-        -h "$host" \
-        -p "$port" \
-        -U "$user" \
-        -d postgres \
-        -f "$SCHEMA_DUMP_FILE" 2>&1 | tee -a "$LOG_FILE"; then
-        sql_applied=true
-        log_success "✓ Schema applied successfully to target"
-        log_to_file "$LOG_FILE" "Schema applied successfully to target via ${label}"
-        break
-    else
-        log_warning "Schema application via ${label} failed, trying next endpoint..."
-        log_to_file "$LOG_FILE" "Schema application via ${label} failed"
-    fi
-done <<< "$endpoints"
-
-if [ "$sql_applied" != "true" ]; then
+set +e
+if run_psql_script_with_fallback "Applying schema" "$TARGET_REF" "$TARGET_PASSWORD" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}" "$SCHEMA_DUMP_FILE"; then
+    sql_applied=true
+    log_success "✓ Schema applied successfully to target"
+    log_to_file "$LOG_FILE" "Schema applied successfully to target"
+else
     log_error "Failed to apply schema to target via any connection method"
     log_to_file "$LOG_FILE" "ERROR: Failed to apply schema to target"
     exit 1
 fi
+set -e
 echo ""
 
 # Step 4: Verify migration success
@@ -425,27 +472,18 @@ log_info ""
 log_info "Verifying policies were migrated correctly..."
 log_to_file "$LOG_FILE" "Verifying migration success"
 
-# Export target schema after migration using pg_dump
+# Export target schema after migration using pg_dump (same pattern as database_migration.sh)
 TARGET_SCHEMA_AFTER="$MIGRATION_DIR_ABS/target_schema_after.sql"
 log_info "Exporting target schema for verification..."
-endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
+log_to_file "$LOG_FILE" "Exporting target schema for verification"
+
+PG_DUMP_ARGS=(-d postgres --schema-only --no-owner --no-privileges -f "$TARGET_SCHEMA_AFTER")
 target_after_dump_success=false
 
-while IFS='|' read -r host port user label; do
-    [ -z "$host" ] && continue
-    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_dump \
-        -h "$host" \
-        -p "$port" \
-        -U "$user" \
-        -d postgres \
-        --schema-only \
-        --no-owner \
-        --no-privileges \
-        -f "$TARGET_SCHEMA_AFTER" 2>&1 | tee -a "$LOG_FILE"; then
-        target_after_dump_success=true
-        break
-    fi
-done <<< "$endpoints"
+if run_pg_tool_with_fallback "pg_dump" "$TARGET_REF" "$TARGET_PASSWORD" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}" "$LOG_FILE" \
+    "${PG_DUMP_ARGS[@]}"; then
+    target_after_dump_success=true
+fi
 
 if [ "$target_after_dump_success" = "true" ]; then
     if [ -s "$TARGET_SCHEMA_AFTER" ]; then

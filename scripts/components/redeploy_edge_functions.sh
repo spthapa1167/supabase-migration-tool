@@ -128,10 +128,18 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
-if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
-    log_error "SUPABASE_ACCESS_TOKEN not set - cannot use Node.js utility"
+# Get environment-specific access tokens
+SOURCE_ACCESS_TOKEN=$(get_env_access_token "$SOURCE_ENV")
+TARGET_ACCESS_TOKEN=$(get_env_access_token "$TARGET_ENV")
+
+if [ -z "$SOURCE_ACCESS_TOKEN" ] && [ -z "$TARGET_ACCESS_TOKEN" ]; then
+    log_error "Access tokens not set for source ($SOURCE_ENV) or target ($TARGET_ENV) environments"
+    log_error "Please ensure SUPABASE_${SOURCE_ENV^^}_ACCESS_TOKEN and/or SUPABASE_${TARGET_ENV^^}_ACCESS_TOKEN are set in .env.local"
     exit 1
 fi
+
+# Export for Node.js utility
+export SUPABASE_ACCESS_TOKEN="${SOURCE_ACCESS_TOKEN:-$TARGET_ACCESS_TOKEN}"
 
 if ! command -v supabase >/dev/null 2>&1; then
     log_error "Supabase CLI not found - please install Supabase CLI"

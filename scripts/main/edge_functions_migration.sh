@@ -210,12 +210,18 @@ else
     fi
 fi
 
-# Check for SUPABASE_ACCESS_TOKEN
-if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
-    log_error "SUPABASE_ACCESS_TOKEN not set - cannot use Node.js utility"
-    log_error "Please ensure SUPABASE_ACCESS_TOKEN is set in your environment"
+# Check for environment-specific access tokens
+SOURCE_ACCESS_TOKEN=$(get_env_access_token "$SOURCE_ENV")
+TARGET_ACCESS_TOKEN=$(get_env_access_token "$TARGET_ENV")
+
+if [ -z "$SOURCE_ACCESS_TOKEN" ] && [ -z "$TARGET_ACCESS_TOKEN" ]; then
+    log_error "Access tokens not set for source ($SOURCE_ENV) or target ($TARGET_ENV) environments"
+    log_error "Please ensure SUPABASE_${SOURCE_ENV^^}_ACCESS_TOKEN and/or SUPABASE_${TARGET_ENV^^}_ACCESS_TOKEN are set in .env.local"
     exit 1
 fi
+
+# Export tokens for Node.js utility (it will determine which one to use based on project_ref)
+export SUPABASE_ACCESS_TOKEN="${SOURCE_ACCESS_TOKEN:-$TARGET_ACCESS_TOKEN}"
 
 # Check if edge-functions-migration.js exists
 EDGE_FUNCTIONS_UTIL="$PROJECT_ROOT/utils/edge-functions-migration.js"

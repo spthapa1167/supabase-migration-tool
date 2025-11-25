@@ -65,12 +65,8 @@ load_env() {
     set -e  # Re-enable exit on error
     set -u  # Re-enable unbound variable checking
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-        log_error "SUPABASE_ACCESS_TOKEN not set in .env.local"
-        return 1
-    fi
-    
-    export SUPABASE_ACCESS_TOKEN
+    # Note: SUPABASE_ACCESS_TOKEN is now environment-specific
+    # Use get_env_access_token() function to get token for a specific environment
     return 0
 }
 
@@ -130,6 +126,21 @@ get_env_project_ref() {
     local primary_var="SUPABASE_${key}_PROJECT_REF"
     local legacy_var="SUPABSE_${key}_PROJECT_REF"
     local value="${!primary_var:-${!legacy_var:-}}"
+    echo "$value"
+    return 0
+}
+
+# Get the access token for a given environment (returns empty string if unset)
+get_env_access_token() {
+    local env="${1:-}"
+    local key
+    key=$(normalize_env_key "$env")
+    if [ -z "$key" ]; then
+        echo ""
+        return 0
+    fi
+    local token_var="SUPABASE_${key}_ACCESS_TOKEN"
+    local value="${!token_var:-}"
     echo "$value"
     return 0
 }
@@ -298,8 +309,58 @@ get_pooler_host_for_env() {
     return 1
 }
 
-# Get pooler hostname (tries common regions, can be overridden)
+# Get pooler hostname via API (only called when database connection fails)
+get_pooler_host_via_api() {
+    local project_ref=$1
+    
+    # Determine which environment this project_ref belongs to and use its access token
+    local access_token=""
+    if [ ${#project_ref} -eq 20 ]; then
+        # Try to match project_ref to an environment
+        if [ "$project_ref" = "${SUPABASE_PROD_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "prod")
+        elif [ "$project_ref" = "${SUPABASE_TEST_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "test")
+        elif [ "$project_ref" = "${SUPABASE_DEV_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "dev")
+        elif [ "$project_ref" = "${SUPABASE_BACKUP_PROJECT_REF:-}" ]; then
+            access_token=$(get_env_access_token "backup")
+        fi
+    fi
+    
+    if [ -z "$access_token" ]; then
+        return 1
+    fi
+    
+    local api_response=$(curl -s -H "Authorization: Bearer $access_token" \
+        "https://api.supabase.com/v1/projects/${project_ref}/config/database/pooler" 2>/dev/null)
+    
+    # Try multiple JSON parsing methods to extract pooler_url
+    local pooler_url=""
+    if command -v jq >/dev/null 2>&1; then
+        pooler_url=$(echo "$api_response" | jq -r '.pooler_url // .connectionString // empty' 2>/dev/null)
+    fi
+    
+    # Fallback to grep if jq not available
+    if [ -z "$pooler_url" ] || [ "$pooler_url" = "null" ]; then
+        pooler_url=$(echo "$api_response" | grep -o '"pooler_url":"[^"]*"' | cut -d'"' -f4 || echo "")
+    fi
+    
+    if [ -n "$pooler_url" ] && [ "$pooler_url" != "null" ] && [ "$pooler_url" != "" ]; then
+        # Extract hostname from URL (e.g., aws-1-us-east-2.pooler.supabase.com)
+        local hostname=$(echo "$pooler_url" | sed -E 's|.*://([^:]+)(:[0-9]+)?(/.*)?|\1|' | sed 's|/$||')
+        if [ -n "$hostname" ] && [ "$hostname" != "" ]; then
+            echo "$hostname"
+            return 0
+        fi
+    fi
+    
+    return 1
+}
+
+# Get pooler hostname (tries environment variables first, NO API calls)
 # This function supports both project_ref and env_name for backward compatibility
+# Use get_pooler_host_via_api() only if database connection fails
 get_pooler_host() {
     local project_ref_or_env=$1
     
@@ -324,33 +385,8 @@ get_pooler_host() {
         return 0
     fi
     
-    # Try to get pooler URL from Supabase API if available (only if it looks like a project_ref)
-    if [ -n "$SUPABASE_ACCESS_TOKEN" ] && [ ${#project_ref_or_env} -eq 20 ]; then
-        local api_response=$(curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
-            "https://api.supabase.com/v1/projects/${project_ref_or_env}/config/database/pooler" 2>/dev/null)
-        
-        # Try multiple JSON parsing methods to extract pooler_url
-        local pooler_url=""
-        if command -v jq >/dev/null 2>&1; then
-            pooler_url=$(echo "$api_response" | jq -r '.pooler_url // .connectionString // empty' 2>/dev/null)
-        fi
-        
-        # Fallback to grep if jq not available
-        if [ -z "$pooler_url" ] || [ "$pooler_url" = "null" ]; then
-            pooler_url=$(echo "$api_response" | grep -o '"pooler_url":"[^"]*"' | cut -d'"' -f4 || echo "")
-        fi
-        
-        if [ -n "$pooler_url" ] && [ "$pooler_url" != "null" ] && [ "$pooler_url" != "" ]; then
-            # Extract hostname from URL (e.g., aws-1-us-east-2.pooler.supabase.com)
-            local hostname=$(echo "$pooler_url" | sed -E 's|.*://([^:]+)(:[0-9]+)?(/.*)?|\1|' | sed 's|/$||')
-            if [ -n "$hostname" ] && [ "$hostname" != "" ]; then
-                echo "$hostname"
-                return 0
-            fi
-        fi
-    fi
-    
     # Default to common pooler hostname (can be overridden via env var)
+    # NO API CALLS - API will only be used if connection fails
     echo "${SUPABASE_POOLER_HOST:-aws-1-us-east-2.pooler.supabase.com}"
 }
 
@@ -426,6 +462,7 @@ get_supabase_connection_endpoints() {
 }
 
 # Run a PostgreSQL tool (pg_dump, pg_restore, etc.) with fallback connections
+# First tries database connectivity via shared pooler, only uses API if connection fails
 run_pg_tool_with_fallback() {
     local tool=$1
     local project_ref=$2
@@ -436,13 +473,16 @@ run_pg_tool_with_fallback() {
     shift 6
     local tool_args=("$@")
 
+    if [ "$tool" = "psql" ]; then
+        log_error "run_pg_tool_with_fallback does not support psql; use run_psql_with_fallback instead"
+        return 1
+    fi
+
     local success=1
+    
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
-        if [ "$tool" = "psql" ]; then
-            log_error "run_pg_tool_with_fallback does not support psql; use run_psql_with_fallback instead"
-            return 1
-        fi
 
         log_info "Trying ${tool} via ${label} (${host}:${port})"
 
@@ -465,6 +505,43 @@ run_pg_tool_with_fallback() {
             log_warning "${tool} failed via ${label}"
         fi
     done < <(get_supabase_connection_endpoints "$project_ref" "$pooler_region" "$pooler_port")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ $success -ne 0 ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$project_ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying ${tool} with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                log_info "Trying ${tool} via API-resolved pooler (${api_pooler_host}:${port})"
+                
+                local status
+                if [ -n "$log_file" ]; then
+                    PGPASSWORD="$password" PGSSLMODE=require "$tool" \
+                        -h "$api_pooler_host" -p "$port" -U "postgres.${project_ref}" "${tool_args[@]}" 2>&1 | tee -a "$log_file"
+                    status=${PIPESTATUS[0]}
+                else
+                    PGPASSWORD="$password" PGSSLMODE=require "$tool" \
+                        -h "$api_pooler_host" -p "$port" -U "postgres.${project_ref}" "${tool_args[@]}"
+                    status=$?
+                fi
+                
+                if [ $status -eq 0 ]; then
+                    log_success "${tool} succeeded via API-resolved pooler (${api_pooler_host}:${port})"
+                    success=0
+                    break
+                else
+                    log_warning "${tool} failed via API-resolved pooler (${api_pooler_host}:${port})"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
 
     if [ $success -ne 0 ]; then
         log_error "${tool} failed for all connection attempts"
