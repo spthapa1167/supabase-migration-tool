@@ -1709,13 +1709,9 @@ perform_migration() {
     if [ "$INCLUDE_SECRETS" = "true" ]; then
         log_info "Migrating secrets..."
         # Call secrets_migration.sh component script
-        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/main/secrets_migration.sh" "$source" "$target" "$migration_dir")
-        if [ "$INCREMENTAL_MODE" = "true" ]; then
-            secrets_migration_cmd+=("--increment")
-        fi
-        if [ "$AUTO_CONFIRM" = "true" ]; then
-            secrets_migration_cmd+=("--auto-confirm")
-        fi
+        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target")
+        # Note: Component script doesn't need --increment or --auto-confirm flags
+        # It always runs in incremental mode (only creates new keys)
         if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
             log_warning "Secrets migration skipped by user."
             SKIPPED_COMPONENTS+=("secrets")

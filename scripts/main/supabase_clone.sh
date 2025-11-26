@@ -120,6 +120,7 @@ if [ ${#EXTRA_FLAGS[@]} -gt 0 ]; then
 fi
 
 echo "[INFO] Step 1/7: Running comprehensive migration (schema, data, users, files, secrets, edge functions)..."
+echo "[INFO] Note: Edge functions are migrated once in this step. Failed functions can be retried manually if needed."
 # Capture the migration directory from the main migration output if possible
 # The main migration will create a backup directory automatically
 if ! "${MAIN_CMD[@]}"; then
@@ -215,19 +216,23 @@ else
     echo "[WARNING] policies_migration_new.sh not found or not executable; skipping policies verification."
 fi
 
-# Step 7: Retry any failed edge function deployments
-RETRY_SCRIPT="$PROJECT_ROOT/scripts/components/retry_edge_functions.sh"
-if [ -x "$RETRY_SCRIPT" ]; then
-    echo "[INFO] Step 7/7: Retrying any failed edge function deployments..."
-    if ! "$RETRY_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --allow-missing; then
-        echo "[WARNING] Edge functions retry reported issues. Review logs above."
+# Step 7: Migrate secrets (incremental - only new keys)
+SECRETS_SCRIPT="$PROJECT_ROOT/scripts/components/secrets_migration.sh"
+if [ -x "$SECRETS_SCRIPT" ]; then
+    echo "[INFO] Step 7/7: Migrating secrets (incremental - new keys only)..."
+    if ! "$SECRETS_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV"; then
+        echo "[WARNING] Secrets migration reported issues. Review logs above."
     else
-        echo "[SUCCESS] Step 7/7: Edge functions deployment verified"
+        echo "[SUCCESS] Step 7/7: Secrets migration completed (keys created with blank values - UPDATE REQUIRED)"
     fi
     echo ""
 else
-    echo "[WARNING] retry_edge_functions.sh not found or not executable; skipping edge functions retry."
+    echo "[WARNING] secrets_migration.sh not found or not executable; skipping secrets migration."
 fi
+
+# Note: Edge functions are migrated once in Step 1 via supabase_migration.sh
+# If any edge functions failed, they can be retried manually using:
+#   ./scripts/components/retry_edge_functions.sh <source_env> <target_env>
 
 # Optional: Verify environment parity
 COMPARE_SCRIPT="$PROJECT_ROOT/scripts/main/compare_env.sh"
