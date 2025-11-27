@@ -18,10 +18,11 @@ generate_migration_html_report() {
     
     # Parse summary data (expecting key=value pairs or JSON)
     # For now, we'll use a simple approach with predefined variables
-    local migrated_count=${MIGRATED_COUNT:-0}
-    local skipped_count=${SKIPPED_COUNT:-0}
-    local failed_count=${FAILED_COUNT:-0}
-    local removed_count=${REMOVED_COUNT:-0}
+    # Ensure all count variables are integers (remove any whitespace)
+    local migrated_count=$(echo "${MIGRATED_COUNT:-0}" | tr -d '[:space:]' | grep -E '^[0-9]+$' || echo "0")
+    local skipped_count=$(echo "${SKIPPED_COUNT:-0}" | tr -d '[:space:]' | grep -E '^[0-9]+$' || echo "0")
+    local failed_count=$(echo "${FAILED_COUNT:-0}" | tr -d '[:space:]' | grep -E '^[0-9]+$' || echo "0")
+    local removed_count=$(echo "${REMOVED_COUNT:-0}" | tr -d '[:space:]' | grep -E '^[0-9]+$' || echo "0")
     local details_section=${DETAILS_SECTION:-""}
     
     cat > "$html_file" << HTML_EOF
@@ -223,7 +224,7 @@ generate_migration_html_report() {
                         <div class="summary-card-value">$failed_count</div>
                         <div class="summary-card-label">Failed</div>
                     </div>
-                    $(if [ "$removed_count" -gt 0 ]; then
+                    $(if [ "${removed_count:-0}" -gt 0 ] 2>/dev/null; then
                         echo "<div class=\"summary-card\">
                         <div class=\"summary-card-value\">$removed_count</div>
                         <div class=\"summary-card-label\">Removed</div>

@@ -148,6 +148,7 @@ run_psql_with_fallback() {
     local success=false
     local attempt_label=""
 
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         if PGPASSWORD="$password" PGSSLMODE=require psql \
@@ -172,6 +173,43 @@ run_psql_with_fallback() {
             log_warning "Trying next endpoint..."
         fi
     done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying $description with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -t -A \
+                    ${psql_extra_flags[@]+"${psql_extra_flags[@]}"} \
+                    -c "$query" \
+                    >"$tmp_file" 2>"$tmp_err"; then
+                    success=true
+                    attempt_label="API-resolved pooler (${api_pooler_host}:${port})"
+                    break
+                else
+                    status=$?
+                    if [ -s "$tmp_err" ]; then
+                        log_warning "$description for $ref failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -1 "$tmp_err")"
+                    else
+                        log_warning "$description for $ref failed via API-resolved pooler (${api_pooler_host}:${port}) (psql exited with status $status)"
+                    fi
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
 
     if $success; then
         mv "$tmp_file" "$output_path"
@@ -332,8 +370,9 @@ get_edge_functions_info() {
     
     log_info "Collecting edge functions information from $env..."
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-        log_error "SUPABASE_ACCESS_TOKEN not set - cannot collect edge functions for $env"
+    local env_token=$(get_env_access_token "$env")
+    if [ -z "$env_token" ]; then
+        log_error "SUPABASE_${env^^}_ACCESS_TOKEN not set - cannot collect edge functions for $env"
         return 1
     fi
     
@@ -347,7 +386,7 @@ get_edge_functions_info() {
     local tmp_file="$raw_file.tmp"
     local http_status
     
-    http_status=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    http_status=$(curl -s -w "%{http_code}" -H "Authorization: Bearer $env_token" \
         "https://api.supabase.com/v1/projects/${ref}/functions" \
         -o "$tmp_file" 2>/dev/null || echo "000")
     
@@ -421,14 +460,15 @@ get_secrets_info() {
     
     log_info "Collecting secrets information from $env..."
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-        log_warning "SUPABASE_ACCESS_TOKEN not set - skipping secrets"
+    local env_token=$(get_env_access_token "$env")
+    if [ -z "$env_token" ]; then
+        log_warning "SUPABASE_${env^^}_ACCESS_TOKEN not set - skipping secrets"
         echo "" > "$output_file.secrets"
         return
     fi
     
     # Get secrets using Management API
-    if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    if curl -s -H "Authorization: Bearer $env_token" \
         "https://api.supabase.com/v1/projects/${ref}/secrets" \
         -o "$output_file.secrets_raw" 2>/dev/null; then
         

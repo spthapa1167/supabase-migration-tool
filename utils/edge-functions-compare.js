@@ -63,11 +63,41 @@ if (SOURCE_ENV === TARGET_ENV) {
     process.exit(1);
 }
 
-const ACCESS_TOKEN = process.env.SUPABASE_ACCESS_TOKEN;
-if (!ACCESS_TOKEN) {
-    logError('SUPABASE_ACCESS_TOKEN not set in environment');
+// Get access token for an environment
+const getAccessTokenForEnv = (env) => {
+    const envKey = envToRef(env) ? env.toLowerCase() : '';
+    if (!envKey) return '';
+    switch (envKey) {
+        case 'prod':
+        case 'production':
+        case 'main':
+            return process.env.SUPABASE_PROD_ACCESS_TOKEN || '';
+        case 'test':
+        case 'staging':
+            return process.env.SUPABASE_TEST_ACCESS_TOKEN || '';
+        case 'dev':
+        case 'develop':
+            return process.env.SUPABASE_DEV_ACCESS_TOKEN || '';
+        case 'backup':
+        case 'bkup':
+        case 'bkp':
+            return process.env.SUPABASE_BACKUP_ACCESS_TOKEN || '';
+        default:
+            return '';
+    }
+};
+
+const SOURCE_ACCESS_TOKEN = getAccessTokenForEnv(SOURCE_ENV);
+const TARGET_ACCESS_TOKEN = getAccessTokenForEnv(TARGET_ENV);
+
+if (!SOURCE_ACCESS_TOKEN && !TARGET_ACCESS_TOKEN) {
+    logError(`Access tokens not set for source (${SOURCE_ENV}) or target (${TARGET_ENV}) environments`);
+    logError(`Please set SUPABASE_${SOURCE_ENV.toUpperCase()}_ACCESS_TOKEN and/or SUPABASE_${TARGET_ENV.toUpperCase()}_ACCESS_TOKEN in .env.local`);
     process.exit(1);
 }
+
+// Use source token as default, fallback to target if source not available
+const ACCESS_TOKEN = SOURCE_ACCESS_TOKEN || TARGET_ACCESS_TOKEN;
 
 const envToRef = (env) => {
     switch (env.toLowerCase()) {

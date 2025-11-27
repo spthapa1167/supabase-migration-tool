@@ -21,7 +21,9 @@ run_psql_query_with_fallback() {
 
     local tmp_err
     tmp_err=$(mktemp)
+    local success=false
 
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         if PGPASSWORD="$password" PGSSLMODE=require psql \
@@ -34,15 +36,52 @@ run_psql_query_with_fallback() {
             -v ON_ERROR_STOP=on \
             -c "$query" \
             2>"$tmp_err"; then
-            rm -f "$tmp_err"
-            return 0
+            success=true
+            break
         fi
         log_warning "Snapshot query failed via ${label}: $(tail -n 1 "$tmp_err")"
     done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
 
-    cat "$tmp_err" >&2
-    rm -f "$tmp_err"
-    return 1
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..." >&2
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}" >&2
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -F '' \
+                    -t -A \
+                    -v ON_ERROR_STOP=on \
+                    -c "$query" \
+                    2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "Snapshot query failed via API-resolved pooler (${api_pooler_host}:${port}): $(tail -n 1 "$tmp_err")"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API" >&2
+        fi
+    fi
+
+    if [ "$success" = "true" ]; then
+        rm -f "$tmp_err"
+        return 0
+    else
+        cat "$tmp_err" >&2
+        rm -f "$tmp_err"
+        return 1
+    fi
 }
 
 SOURCE_ENV=${1:-}

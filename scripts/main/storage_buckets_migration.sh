@@ -201,11 +201,19 @@ if [ ! -f "$STORAGE_UTIL" ]; then
     exit 1
 fi
 
-# Check for SUPABASE_ACCESS_TOKEN
-if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-    log_error "SUPABASE_ACCESS_TOKEN not set - required for storage migration"
+# Get environment-specific access tokens
+SOURCE_ACCESS_TOKEN=$(get_env_access_token "$SOURCE_ENV")
+TARGET_ACCESS_TOKEN=$(get_env_access_token "$TARGET_ENV")
+
+# Check for access tokens (at least one should be set)
+if [ -z "$SOURCE_ACCESS_TOKEN" ] && [ -z "$TARGET_ACCESS_TOKEN" ]; then
+    log_error "Access tokens not set for source ($SOURCE_ENV) or target ($TARGET_ENV) environments"
+    log_error "Please ensure SUPABASE_${SOURCE_ENV^^}_ACCESS_TOKEN and/or SUPABASE_${TARGET_ENV^^}_ACCESS_TOKEN are set in .env.local"
     exit 1
 fi
+
+# Export for Node.js utility (it will determine which one to use)
+export SUPABASE_ACCESS_TOKEN="${SOURCE_ACCESS_TOKEN:-$TARGET_ACCESS_TOKEN}"
 
 # Migrate buckets with delta comparison and file migration using Node.js utility
 # Default behavior: Only migrate NEW bucket names (incremental - buckets that exist in source but not in target)

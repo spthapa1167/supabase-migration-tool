@@ -90,6 +90,7 @@ run_sql_query() {
     endpoints=$(get_supabase_connection_endpoints "$project_ref" "$pooler_region" "$pooler_port")
     
     local result=""
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         
@@ -107,6 +108,33 @@ run_sql_query() {
         fi
     done <<< "$endpoints"
     
+    # If all pooler connections failed, try API to get correct pooler hostname
+    log_info "Pooler connections failed for $env_name, trying API to get pooler hostname..." >&2
+    local api_pooler_host=""
+    api_pooler_host=$(get_pooler_host_via_api "$project_ref" 2>/dev/null || echo "")
+    
+    if [ -n "$api_pooler_host" ]; then
+        log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}" >&2
+        
+        # Try with API-resolved pooler host
+        for port in "$pooler_port" "5432"; do
+            result=$(PGPASSWORD="$password" PGSSLMODE=require psql \
+                -h "$api_pooler_host" \
+                -p "$port" \
+                -U "postgres.${project_ref}" \
+                -d postgres \
+                -t -A \
+                -c "$query" 2>/dev/null || echo "")
+            
+            if [ -n "$result" ]; then
+                echo "$result" | tr -d '[:space:]'
+                return 0
+            fi
+        done
+    else
+        log_warning "Could not resolve pooler hostname via API for $env_name" >&2
+    fi
+    
     echo "0"
     return 1
 }
@@ -122,17 +150,21 @@ get_db_counts() {
     # Log to stderr so it doesn't interfere with output capture
     echo "[INFO] Collecting database counts for $env_name..." >&2
     
-    # Tables (all schemas)
+    # Tables (all schemas) - exclude system schemas
+    # Exclude: pg_catalog, information_schema, and Supabase system schemas (auth, storage, realtime, vault, etc.)
     local all_tables=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema');" 2>/dev/null || echo "0")
+        "SELECT COUNT(*) FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema', 'auth', 'storage', 'realtime', 'vault', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor', 'extensions', 'net', 'cron');" 2>/dev/null || echo "0")
     
-    # Public schema tables
+    # Public schema tables - exclude ALL Supabase system tables
+    # In Supabase, system tables in public schema don't follow consistent ownership patterns
+    # So we exclude by comprehensive naming patterns and known system table names
     local public_tables=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
-        "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';" 2>/dev/null || echo "0")
+        "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null || echo "0")
     
-    # RLS Policies
+    # RLS Policies - only count policies on user-created tables in public schema
+    # Exclude policies on system tables by matching table name patterns
     local policies=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
-        "SELECT COUNT(*) FROM pg_policies WHERE schemaname IN ('public', 'auth');" 2>/dev/null || echo "0")
+        "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null || echo "0")
     
     # Functions
     local functions=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
@@ -192,7 +224,8 @@ get_edge_functions_count() {
     local project_ref=$1
     local env_name=$2
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
+    local access_token=$(get_env_access_token "$env_name")
+    if [ -z "$access_token" ]; then
         echo "N/A"
         return
     fi
@@ -205,7 +238,7 @@ get_edge_functions_count() {
     local count="0"
     local url="https://api.supabase.com/v1/projects/${project_ref}/functions"
     local response=$(curl -s -w "\n%{http_code}" \
-        -H "Authorization: Bearer ${SUPABASE_ACCESS_TOKEN}" \
+        -H "Authorization: Bearer ${access_token}" \
         -H "Content-Type: application/json" \
         "$url" 2>/dev/null || echo "")
     
@@ -225,6 +258,46 @@ get_edge_functions_count() {
     fi
     
     echo "$count"
+}
+
+# Function to get edge functions list (names) using Management API
+get_edge_functions_list() {
+    local project_ref=$1
+    local env_name=$2
+    
+    local access_token=$(get_env_access_token "$env_name")
+    if [ -z "$access_token" ]; then
+        echo ""
+        return
+    fi
+    
+    if ! command -v curl >/dev/null 2>&1; then
+        echo ""
+        return
+    fi
+    
+    local url="https://api.supabase.com/v1/projects/${project_ref}/functions"
+    local response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${access_token}" \
+        -H "Content-Type: application/json" \
+        "$url" 2>/dev/null || echo "")
+    
+    local http_code=$(echo "$response" | tail -1)
+    local body=$(echo "$response" | sed '$d')
+    
+    if [ "$http_code" = "200" ] && [ -n "$body" ]; then
+        # Use Python or Node.js to parse JSON and extract names
+        if command -v python3 >/dev/null 2>&1; then
+            echo "$body" | python3 -c "import sys, json; data = json.load(sys.stdin); names = [item.get('name', '') for item in data if isinstance(data, list) and isinstance(item, dict)]; print('\n'.join(sorted(names)))" 2>/dev/null || echo ""
+        elif [ "$NODE_AVAILABLE" = "true" ]; then
+            echo "$body" | node -e "try { const data = JSON.parse(require('fs').readFileSync(0, 'utf-8')); const names = Array.isArray(data) ? data.map(item => item.name || '').filter(Boolean).sort() : []; console.log(names.join('\n')); } catch(e) { console.log(''); }" 2>/dev/null || echo ""
+        else
+            # Fallback: extract names using grep and sed (less reliable)
+            echo "$body" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | sort || echo ""
+        fi
+    else
+        echo ""
+    fi
 }
 
 # Function to get storage buckets count using REST API
@@ -287,6 +360,101 @@ get_buckets_count() {
     echo "$count"
 }
 
+# Function to get storage buckets list (names) using REST API
+get_buckets_list() {
+    local project_ref=$1
+    local env_name=$2
+    
+    # Get service role key for the environment
+    local env_lc=$(echo "$env_name" | tr '[:upper:]' '[:lower:]')
+    local env_key=""
+    case "$env_lc" in
+        prod|production|main) env_key="PROD" ;;
+        test|staging) env_key="TEST" ;;
+        dev|develop) env_key="DEV" ;;
+        backup|bkup|bkp) env_key="BACKUP" ;;
+    esac
+    
+    if [ -z "$env_key" ]; then
+        echo ""
+        return
+    fi
+    
+    local service_key_var="SUPABASE_${env_key}_SERVICE_ROLE_KEY"
+    local service_key="${!service_key_var:-}"
+    local project_url="https://${project_ref}.supabase.co"
+    
+    if [ -z "$service_key" ]; then
+        echo ""
+        return
+    fi
+    
+    if ! command -v curl >/dev/null 2>&1; then
+        echo ""
+        return
+    fi
+    
+    # Use REST API to get buckets
+    local url="${project_url}/storage/v1/bucket"
+    local response=$(curl -s -w "\n%{http_code}" \
+        -H "Authorization: Bearer ${service_key}" \
+        -H "apikey: ${service_key}" \
+        "$url" 2>/dev/null || echo "")
+    
+    local http_code=$(echo "$response" | tail -1)
+    local body=$(echo "$response" | sed '$d')
+    
+    if [ "$http_code" = "200" ] && [ -n "$body" ]; then
+        # Use Python or Node.js to parse JSON and extract names
+        if command -v python3 >/dev/null 2>&1; then
+            echo "$body" | python3 -c "import sys, json; data = json.load(sys.stdin); names = [item.get('name', '') for item in data if isinstance(data, list) and isinstance(item, dict)]; print('\n'.join(sorted(names)))" 2>/dev/null || echo ""
+        elif [ "$NODE_AVAILABLE" = "true" ]; then
+            echo "$body" | node -e "try { const data = JSON.parse(require('fs').readFileSync(0, 'utf-8')); const names = Array.isArray(data) ? data.map(item => item.name || '').filter(Boolean).sort() : []; console.log(names.join('\n')); } catch(e) { console.log(''); }" 2>/dev/null || echo ""
+        else
+            # Fallback: extract names using grep and sed (less reliable)
+            echo "$body" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | sort || echo ""
+        fi
+    else
+        echo ""
+    fi
+}
+
+# Function to get public tables list (names) from database
+get_public_tables_list() {
+    local env_name=$1
+    local project_ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    
+    # Exclude system tables by naming patterns (ownership check not reliable in Supabase)
+    local query="SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata') ORDER BY tablename;"
+    
+    local endpoints
+    endpoints=$(get_supabase_connection_endpoints "$project_ref" "$pooler_region" "$pooler_port")
+    
+    local result=""
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        
+        result=$(PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -t -A \
+            -c "$query" 2>/dev/null || echo "")
+        
+        if [ -n "$result" ]; then
+            echo "$result" | grep -v '^[[:space:]]*$' | sort
+            return 0
+        fi
+    done <<< "$endpoints"
+    
+    echo ""
+    return 1
+}
+
 # Collect counts for source
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info "  Collecting Source Environment Snapshot: $SOURCE_ENV"
@@ -306,6 +474,11 @@ IFS='|' read -r source_all_tables source_public_tables source_policies source_fu
 
 source_edge_functions=$(get_edge_functions_count "$SOURCE_REF" "$SOURCE_ENV")
 source_buckets=$(get_buckets_count "$SOURCE_REF" "$SOURCE_ENV")
+
+# Get lists for comparison (only if counts differ, we'll fetch lists)
+source_edge_functions_list=""
+source_buckets_list=""
+source_public_tables_list=""
 
 # Collect counts for target
 log_info ""
@@ -327,6 +500,11 @@ IFS='|' read -r target_all_tables target_public_tables target_policies target_fu
 
 target_edge_functions=$(get_edge_functions_count "$TARGET_REF" "$TARGET_ENV")
 target_buckets=$(get_buckets_count "$TARGET_REF" "$TARGET_ENV")
+
+# Get lists for comparison (only if counts differ, we'll fetch lists)
+target_edge_functions_list=""
+target_buckets_list=""
+target_public_tables_list=""
 
 # Helper function to calculate difference
 calculate_diff() {
@@ -476,6 +654,32 @@ fi
 if safe_compare "$source_public_tables" "$target_public_tables"; then
     log_warning "⚠ Public tables count differs: Source has $source_public_tables, Target has $target_public_tables"
     differences_found=true
+    
+    # Get lists to show missing tables
+    log_info "  Fetching public tables lists for comparison..."
+    source_public_tables_list=$(get_public_tables_list "$SOURCE_ENV" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
+    target_public_tables_list=$(get_public_tables_list "$TARGET_ENV" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    
+    # Find missing in target
+    missing_in_target=""
+    while IFS= read -r table_name; do
+        [ -z "$table_name" ] && continue
+        if ! echo "$target_public_tables_list" | grep -Fxq "$table_name" 2>/dev/null; then
+            if [ -z "$missing_in_target" ]; then
+                missing_in_target="$table_name"
+            else
+                missing_in_target="$missing_in_target
+  $table_name"
+            fi
+        fi
+    done <<< "$source_public_tables_list"
+    
+    if [ -n "$missing_in_target" ]; then
+        log_warning "  Missing public tables in target (compared to source):"
+        echo "$missing_in_target" | while IFS= read -r line; do
+            [ -n "$line" ] && log_warning "    - $line"
+        done
+    fi
 fi
 
 if safe_compare "$source_policies" "$target_policies"; then
@@ -497,6 +701,32 @@ if [ "$source_edge_functions" != "N/A" ] && [ "$target_edge_functions" != "N/A" 
     if [ "$source_edge_functions" -ne "$target_edge_functions" ]; then
         log_warning "⚠ Edge functions count differs: Source has $source_edge_functions, Target has $target_edge_functions"
         differences_found=true
+        
+        # Get lists to show missing functions
+        log_info "  Fetching edge functions lists for comparison..."
+        source_edge_functions_list=$(get_edge_functions_list "$SOURCE_REF" "$SOURCE_ENV")
+        target_edge_functions_list=$(get_edge_functions_list "$TARGET_REF" "$TARGET_ENV")
+        
+        # Find missing in target
+        missing_in_target=""
+        while IFS= read -r func_name; do
+            [ -z "$func_name" ] && continue
+            if ! echo "$target_edge_functions_list" | grep -Fxq "$func_name" 2>/dev/null; then
+                if [ -z "$missing_in_target" ]; then
+                    missing_in_target="$func_name"
+                else
+                    missing_in_target="$missing_in_target
+  $func_name"
+                fi
+            fi
+        done <<< "$source_edge_functions_list"
+        
+        if [ -n "$missing_in_target" ]; then
+            log_warning "  Missing edge functions in target (compared to source):"
+            echo "$missing_in_target" | while IFS= read -r line; do
+                [ -n "$line" ] && log_warning "    - $line"
+            done
+        fi
     fi
 fi
 
@@ -504,6 +734,32 @@ if [ "$source_buckets" != "N/A" ] && [ "$target_buckets" != "N/A" ]; then
     if [ "$source_buckets" -ne "$target_buckets" ]; then
         log_warning "⚠ Storage buckets count differs: Source has $source_buckets, Target has $target_buckets"
         differences_found=true
+        
+        # Get lists to show missing buckets
+        log_info "  Fetching storage buckets lists for comparison..."
+        source_buckets_list=$(get_buckets_list "$SOURCE_REF" "$SOURCE_ENV")
+        target_buckets_list=$(get_buckets_list "$TARGET_REF" "$TARGET_ENV")
+        
+        # Find missing in target
+        missing_in_target=""
+        while IFS= read -r bucket_name; do
+            [ -z "$bucket_name" ] && continue
+            if ! echo "$target_buckets_list" | grep -Fxq "$bucket_name" 2>/dev/null; then
+                if [ -z "$missing_in_target" ]; then
+                    missing_in_target="$bucket_name"
+                else
+                    missing_in_target="$missing_in_target
+  $bucket_name"
+                fi
+            fi
+        done <<< "$source_buckets_list"
+        
+        if [ -n "$missing_in_target" ]; then
+            log_warning "  Missing storage buckets in target (compared to source):"
+            echo "$missing_in_target" | while IFS= read -r line; do
+                [ -n "$line" ] && log_warning "    - $line"
+            done
+        fi
     fi
 fi
 

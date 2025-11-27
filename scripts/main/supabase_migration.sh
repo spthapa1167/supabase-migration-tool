@@ -115,7 +115,7 @@ Arguments:
   <target_env>            Target environment (prod, test, dev, backup) - REQUIRED
 
 Options:
-  --full                  Shortcut for schema+data+users+files migration (equivalent to --mode full --data --users --files)
+  --full                  Shortcut for complete migration (equivalent to --mode full --data --users --files --secret)
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
   --increment             Prefer incremental/delta updates where supported (e.g. data) instead of full replace
   --data                  Include database row data migration (default: disabled)
@@ -151,7 +151,7 @@ Default Behavior:
   Use --files to include storage bucket file migration.
   Use --users to copy auth users/identities so login state matches source.
   Use --secret to migrate secrets (adds new secret keys incrementally; existing secrets in target are never modified or removed).
-  Use --full for an all-in-one migration (schema + data + users + files).
+  Use --full for a complete migration (schema + data + users + files + secrets + edge functions).
 
 Examples:
   # Schema-only migration (default - no data, no files)
@@ -218,6 +218,7 @@ parse_args() {
                 INCLUDE_DATA=true
                 INCLUDE_USERS=true
                 INCLUDE_FILES=true
+                INCLUDE_SECRETS=true
                 shift
                 ;;
             --increment|--incremental)
@@ -379,8 +380,11 @@ step_validate_env_file() {
     load_env
     set -e
     
-    if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-        missing_vars+=("SUPABASE_ACCESS_TOKEN")
+    # Check for environment-specific access tokens (at least one should be set)
+    local source_token=$(get_env_access_token "$source")
+    local target_token=$(get_env_access_token "$target")
+    if [ -z "$source_token" ] && [ -z "$target_token" ]; then
+        missing_vars+=("SUPABASE_${source^^}_ACCESS_TOKEN or SUPABASE_${target^^}_ACCESS_TOKEN")
     fi
     
     local ref_var="SUPABASE_$(echo "$source" | tr '[:lower:]' '[:upper:]')_PROJECT_REF"
@@ -1705,13 +1709,9 @@ perform_migration() {
     if [ "$INCLUDE_SECRETS" = "true" ]; then
         log_info "Migrating secrets..."
         # Call secrets_migration.sh component script
-        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/main/secrets_migration.sh" "$source" "$target" "$migration_dir")
-        if [ "$INCREMENTAL_MODE" = "true" ]; then
-            secrets_migration_cmd+=("--increment")
-        fi
-        if [ "$AUTO_CONFIRM" = "true" ]; then
-            secrets_migration_cmd+=("--auto-confirm")
-        fi
+        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target")
+        # Note: Component script doesn't need --increment or --auto-confirm flags
+        # It always runs in incremental mode (only creates new keys)
         if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
             log_warning "Secrets migration skipped by user."
             SKIPPED_COMPONENTS+=("secrets")

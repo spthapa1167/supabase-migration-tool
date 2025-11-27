@@ -71,8 +71,15 @@ set -u
 
 log_script_context "$(basename "$0")" "prod" "test" "dev"
 
-if [ -z "${SUPABASE_ACCESS_TOKEN:-}" ]; then
-    log_error "SUPABASE_ACCESS_TOKEN not set in .env.local"
+# Check that at least one environment has an access token set
+PROD_TOKEN=$(get_env_access_token "prod")
+TEST_TOKEN=$(get_env_access_token "test")
+DEV_TOKEN=$(get_env_access_token "dev")
+BACKUP_TOKEN=$(get_env_access_token "backup")
+
+if [ -z "$PROD_TOKEN" ] && [ -z "$TEST_TOKEN" ] && [ -z "$DEV_TOKEN" ] && [ -z "$BACKUP_TOKEN" ]; then
+    log_error "No environment-specific access tokens found in .env.local"
+    log_error "Please set at least one of: SUPABASE_PROD_ACCESS_TOKEN, SUPABASE_TEST_ACCESS_TOKEN, SUPABASE_DEV_ACCESS_TOKEN, SUPABASE_BACKUP_ACCESS_TOKEN"
     exit 1
 fi
 
@@ -177,7 +184,24 @@ query_auth_users_count() {
 query_edge_functions_count() {
     local project_ref=$1
     
-    if [ -z "$project_ref" ] || [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+    if [ -z "$project_ref" ]; then
+        echo "0"
+        return 0
+    fi
+    
+    # Determine environment from project_ref and get corresponding access token
+    local access_token=""
+    if [ "$project_ref" = "${SUPABASE_PROD_PROJECT_REF:-}" ]; then
+        access_token="$PROD_TOKEN"
+    elif [ "$project_ref" = "${SUPABASE_TEST_PROJECT_REF:-}" ]; then
+        access_token="$TEST_TOKEN"
+    elif [ "$project_ref" = "${SUPABASE_DEV_PROJECT_REF:-}" ]; then
+        access_token="$DEV_TOKEN"
+    elif [ "$project_ref" = "${SUPABASE_BACKUP_PROJECT_REF:-}" ]; then
+        access_token="$BACKUP_TOKEN"
+    fi
+    
+    if [ -z "$access_token" ]; then
         echo "0"
         return 0
     fi
@@ -185,7 +209,7 @@ query_edge_functions_count() {
     local temp_json=$(mktemp)
     local count=0
     
-    if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    if curl -s -H "Authorization: Bearer $access_token" \
         "https://api.supabase.com/v1/projects/${project_ref}/functions" \
         -o "$temp_json" 2>/dev/null; then
         if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then
@@ -322,7 +346,24 @@ query_storage_object_counts() {
 query_secrets_count() {
     local project_ref=$1
     
-    if [ -z "$project_ref" ] || [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
+    if [ -z "$project_ref" ]; then
+        echo "0"
+        return 0
+    fi
+    
+    # Determine environment from project_ref and get corresponding access token
+    local access_token=""
+    if [ "$project_ref" = "${SUPABASE_PROD_PROJECT_REF:-}" ]; then
+        access_token="$PROD_TOKEN"
+    elif [ "$project_ref" = "${SUPABASE_TEST_PROJECT_REF:-}" ]; then
+        access_token="$TEST_TOKEN"
+    elif [ "$project_ref" = "${SUPABASE_DEV_PROJECT_REF:-}" ]; then
+        access_token="$DEV_TOKEN"
+    elif [ "$project_ref" = "${SUPABASE_BACKUP_PROJECT_REF:-}" ]; then
+        access_token="$BACKUP_TOKEN"
+    fi
+    
+    if [ -z "$access_token" ]; then
         echo "0"
         return 0
     fi
@@ -330,7 +371,7 @@ query_secrets_count() {
     local temp_json=$(mktemp)
     local count=0
     
-    if curl -s -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" \
+    if curl -s -H "Authorization: Bearer $access_token" \
         "https://api.supabase.com/v1/projects/${project_ref}/secrets" \
         -o "$temp_json" 2>/dev/null; then
         if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then

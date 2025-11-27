@@ -36,6 +36,148 @@ source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
 source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
+# Helper functions for reliable database connections (same as database_migration.sh)
+# Helper: run psql query and capture output with fallback
+run_psql_query_with_fallback() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local query=$5
+
+    local tmp_err
+    tmp_err=$(mktemp)
+    local success=false
+
+    # First, try database connectivity via shared pooler (no API calls)
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -F '|' \
+            -t -A \
+            -v ON_ERROR_STOP=on \
+            -c "$query" \
+            2>"$tmp_err"; then
+            success=true
+            break
+        else
+            log_warning "Query execution failed via ${label}: $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -F '|' \
+                    -t -A \
+                    -v ON_ERROR_STOP=on \
+                    -c "$query" \
+                    2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "Query execution failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
+
+    if [ "$success" = "true" ]; then
+        rm -f "$tmp_err"
+        return 0
+    else
+        cat "$tmp_err" >&2
+        rm -f "$tmp_err"
+        return 1
+    fi
+}
+
+# Helper: run psql script file with fallback
+run_psql_script_with_fallback() {
+    local description=$1
+    local ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    local script_path=$6
+
+    local success=false
+    local tmp_err
+    tmp_err=$(mktemp)
+
+    # First, try database connectivity via shared pooler (no API calls)
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        log_info "${description} via ${label} (${host}:${port})"
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -v ON_ERROR_STOP=off \
+            -f "$script_path" \
+            >>"$LOG_FILE" 2>"$tmp_err"; then
+            success=true
+            break
+        else
+            log_warning "${description} failed via ${label}: $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying ${description} with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                log_info "${description} via API-resolved pooler (${api_pooler_host}:${port})"
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=off \
+                    -f "$script_path" \
+                    >>"$LOG_FILE" 2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "${description} failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
+
+    rm -f "$tmp_err"
+    $success && return 0 || return 1
+}
+
 # Usage function (must be defined before it's called)
 usage() {
     cat << 'EOF'
@@ -441,19 +583,21 @@ if [ "$INCLUDE_DATA" = "true" ] && [ "$AUTO_CONFIRM_COMPONENT" != "true" ] && [ 
     echo ""
 fi
 
-# Step 1: Verify Supabase CLI is logged in
+# Step 1: Verify Supabase CLI is logged in (optional - script uses pg_dump directly)
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-log_info "  Step 1/4: Verifying Supabase CLI Authentication"
+log_info "  Step 1/4: Checking Supabase CLI Authentication (Optional)"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
 
-if ! supabase projects list >/dev/null 2>&1; then
-    log_error "Supabase CLI is not authenticated"
-    log_error "Please run: supabase login"
-    exit 1
-fi
+if supabase projects list >/dev/null 2>&1; then
 log_success "✓ Supabase CLI is authenticated"
 log_to_file "$LOG_FILE" "Supabase CLI authentication verified"
+else
+    log_warning "⚠ Supabase CLI is not authenticated (optional - using direct database connections)"
+    log_info "  This script uses pg_dump/psql directly, so CLI authentication is not required"
+    log_info "  If you want to use Supabase CLI features, run: supabase login"
+    log_to_file "$LOG_FILE" "Supabase CLI not authenticated - continuing with direct database connections"
+fi
 echo ""
 
 # Step 2: Export schema from source project
@@ -477,33 +621,18 @@ fi
 log_info "Exporting schema from source project using pg_dump..."
 log_to_file "$LOG_FILE" "Exporting schema from source project using pg_dump"
 
-# Get connection endpoints for source
-endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}")
+# Use the same connection pattern as database_migration.sh (which works)
+# Use run_pg_tool_with_fallback helper function for reliable connections
+log_info "Dumping source schema using reliable connection fallback..."
+log_to_file "$LOG_FILE" "Dumping source schema from source project using pg_dump"
+
+PG_DUMP_ARGS=(-d postgres --schema-only --no-owner -f "$SCHEMA_DUMP_FILE")
 dump_success=false
 
-while IFS='|' read -r host port user label; do
-    [ -z "$host" ] && continue
-    log_info "Attempting schema dump via ${label} (${host}:${port})..."
-    log_to_file "$LOG_FILE" "Attempting schema dump via ${label}"
-    
-    # Use pg_dump directly with schema-only flag
-    # Note: We use --no-owner but NOT --no-privileges to ensure policies are included
-    # Policies are part of the schema and should be migrated
-    if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require pg_dump \
-        -h "$host" \
-        -p "$port" \
-        -U "$user" \
-        -d postgres \
-        --schema-only \
-        --no-owner \
-        -f "$SCHEMA_DUMP_FILE" 2>&1 | tee -a "$LOG_FILE"; then
-        dump_success=true
-        break
-    else
-        log_warning "Schema dump via ${label} failed, trying next endpoint..."
-        log_to_file "$LOG_FILE" "Schema dump via ${label} failed"
-    fi
-done <<< "$endpoints"
+if run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$LOG_FILE" \
+    "${PG_DUMP_ARGS[@]}"; then
+    dump_success=true
+fi
 
 if [ "$dump_success" = "true" ]; then
     if [ -s "$SCHEMA_DUMP_FILE" ]; then
@@ -591,92 +720,140 @@ if [ "$dump_success" = "true" ]; then
             # Convert policies to incremental format (DROP IF EXISTS + CREATE)
             log_info "  Converting policies to incremental format (DROP IF EXISTS + CREATE)..."
             POLICIES_INCREMENTAL="$POLICIES_FILE.incremental"
-            awk '
-            BEGIN {
-                in_policy = 0
-                policy_lines = ""
-                policy_name = ""
-                table_name = ""
-                schema_name = "public"
-            }
-            /^CREATE POLICY/ {
-                if (in_policy) {
-                    # Finish previous policy (shouldn't happen but handle it)
-                    if (policy_name != "" && table_name != "") {
-                        print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
-                    }
-                    print policy_lines
-                    policy_lines = ""
-                }
-                in_policy = 1
-                policy_lines = $0
-                # Extract policy name (first quoted string after CREATE POLICY)
-                if (match($0, /CREATE POLICY "([^"]+)"/, arr)) {
-                    policy_name = arr[1]
-                }
-                # Extract table name (after ON schema.table or ON table)
-                # Pattern: ON public.table_name or ON table_name
-                if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\.([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
-                    schema_name = arr[1]
-                    table_name = arr[2]
-                } else if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
-                    # No schema specified, default to public
-                    schema_name = "public"
-                    table_name = arr[1]
-                }
-                # Check if this is a single-line policy (ends with semicolon)
-                if ($0 ~ /;[[:space:]]*$/) {
-                    if (policy_name != "" && table_name != "") {
-                        print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
-                    }
-                    print policy_lines
-                    policy_lines = ""
-                    in_policy = 0
-                    policy_name = ""
-                    table_name = ""
-                    schema_name = "public"
-                }
-                next
-            }
-            in_policy {
-                policy_lines = policy_lines "\n" $0
-                # Extract schema.table if not found yet (might be on continuation line)
-                if (table_name == "") {
-                    if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\.([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
-                        schema_name = arr[1]
-                        table_name = arr[2]
-                    } else if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
-                        schema_name = "public"
-                        table_name = arr[1]
-                    }
-                }
-                # Check if policy statement ends (semicolon)
-                if ($0 ~ /;[[:space:]]*$/) {
-                    if (policy_name != "" && table_name != "") {
-                        print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
-                    }
-                    print policy_lines
-                    policy_lines = ""
-                    in_policy = 0
-                    policy_name = ""
-                    table_name = ""
-                    schema_name = "public"
-                }
-                next
-            }
-            /^ALTER TABLE.*ENABLE ROW LEVEL SECURITY/ {
-                print
-                next
-            }
-            ' "$POLICIES_FILE" > "$POLICIES_INCREMENTAL" 2>/dev/null || cp "$POLICIES_FILE" "$POLICIES_INCREMENTAL"
             
-            # Verify conversion worked
+            # Write awk script to temporary file to avoid bash parsing issues
+            AWK_SCRIPT=$(mktemp)
+            cat > "$AWK_SCRIPT" << 'AWK_EOF'
+BEGIN {
+    in_policy = 0
+    policy_lines = ""
+    policy_name = ""
+    table_name = ""
+    schema_name = "public"
+}
+/^CREATE POLICY/ {
+    if (in_policy) {
+        # Finish previous policy - shouldn't happen but handle it
+        if (policy_name != "" && table_name != "") {
+            print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
+        }
+        print policy_lines
+        policy_lines = ""
+    }
+    in_policy = 1
+    policy_lines = $0
+    # Extract policy name (first quoted string after CREATE POLICY)
+    if (match($0, /CREATE POLICY "([^"]+)"/, arr)) {
+        policy_name = arr[1]
+    }
+    # Extract table name (after ON schema.table or ON table)
+    # Pattern: ON public.table_name or ON table_name
+    if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\.([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+        schema_name = arr[1]
+        table_name = arr[2]
+    } else if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+        # No schema specified, default to public
+        schema_name = "public"
+        table_name = arr[1]
+    }
+    # Check if this is a single-line policy (ends with semicolon)
+    if ($0 ~ /;[[:space:]]*$/) {
+        if (policy_name != "" && table_name != "") {
+            print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
+        }
+        print policy_lines
+        policy_lines = ""
+        in_policy = 0
+        policy_name = ""
+        table_name = ""
+        schema_name = "public"
+    }
+    next
+}
+in_policy {
+    policy_lines = policy_lines "\n" $0
+    # Extract schema.table if not found yet (might be on continuation line)
+    if (table_name == "") {
+        if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)[[:space:]]*\.([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+            schema_name = arr[1]
+            table_name = arr[2]
+        } else if (match($0, /ON[[:space:]]+([a-zA-Z_][a-zA-Z0-9_]*)/, arr)) {
+            schema_name = "public"
+            table_name = arr[1]
+        }
+    }
+    # Check if policy statement ends (semicolon)
+    if ($0 ~ /;[[:space:]]*$/) {
+        if (policy_name != "" && table_name != "") {
+            print "DROP POLICY IF EXISTS \"" policy_name "\" ON " schema_name "." table_name ";"
+        }
+        print policy_lines
+        policy_lines = ""
+        in_policy = 0
+        policy_name = ""
+        table_name = ""
+        schema_name = "public"
+    }
+    next
+}
+/^ALTER TABLE.*ENABLE ROW LEVEL SECURITY/ {
+    print
+    next
+}
+AWK_EOF
+            
+            # Execute awk script from file
+            awk -f "$AWK_SCRIPT" "$POLICIES_FILE" > "$POLICIES_INCREMENTAL" 2>/dev/null || cp "$POLICIES_FILE" "$POLICIES_INCREMENTAL"
+            rm -f "$AWK_SCRIPT"
+            
+            # Verify conversion worked and ensure all CREATE POLICY have DROP IF EXISTS
             if [ -f "$POLICIES_INCREMENTAL" ] && [ -s "$POLICIES_INCREMENTAL" ]; then
-                incremental_count=$(grep -c "^DROP POLICY IF EXISTS" "$POLICIES_INCREMENTAL" 2>/dev/null || echo "0")
-                create_count=$(grep -c "^CREATE POLICY" "$POLICIES_INCREMENTAL" 2>/dev/null || echo "0")
+                incremental_count=$(grep -c "^DROP POLICY IF EXISTS" "$POLICIES_INCREMENTAL" 2>/dev/null | tr -d '[:space:]' || echo "0")
+                create_count=$(grep -c "^CREATE POLICY" "$POLICIES_INCREMENTAL" 2>/dev/null | tr -d '[:space:]' || echo "0")
+                
+                # Sanitize to ensure they're integers (remove any non-numeric characters)
+                incremental_count=$(echo "$incremental_count" | tr -d '[:space:]' | sed 's/[^0-9]//g')
+                create_count=$(echo "$create_count" | tr -d '[:space:]' | sed 's/[^0-9]//g')
+                incremental_count=$((incremental_count + 0))
+                create_count=$((create_count + 0))
+                
+                # If conversion didn't add DROP for all CREATE statements, add them manually
+                if [ "$create_count" -gt 0 ] && [ "$incremental_count" -lt "$create_count" ]; then
+                    log_warning "  Some policies missing DROP IF EXISTS, adding them..."
+                    # Create a new file with DROP IF EXISTS before each CREATE POLICY
+                    TEMP_POLICIES=$(mktemp)
+                    while IFS= read -r line; do
+                        if [[ "$line" =~ ^CREATE\ POLICY ]]; then
+                            # Extract policy name and table from CREATE POLICY statement
+                            policy_name=$(echo "$line" | sed -n 's/.*CREATE POLICY "\([^"]*\)".*/\1/p')
+                            table_match=$(echo "$line" | sed -n 's/.*ON[[:space:]]*\([a-zA-Z_][a-zA-Z0-9_]*\)\.\([a-zA-Z_][a-zA-Z0-9_]*\).*/\1.\2/p')
+                            if [ -z "$table_match" ]; then
+                                table_match=$(echo "$line" | sed -n 's/.*ON[[:space:]]*\([a-zA-Z_][a-zA-Z0-9_]*\).*/\1/p')
+                                table_match="public.$table_match"
+                            fi
+                            if [ -n "$policy_name" ] && [ -n "$table_match" ]; then
+                                echo "DROP POLICY IF EXISTS \"$policy_name\" ON $table_match;"
+                            fi
+                        fi
+                        echo "$line"
+                    done < "$POLICIES_INCREMENTAL" > "$TEMP_POLICIES"
+                    mv "$TEMP_POLICIES" "$POLICIES_INCREMENTAL"
+                    incremental_count=$(grep -c "^DROP POLICY IF EXISTS" "$POLICIES_INCREMENTAL" 2>/dev/null | tr -d '[:space:]' | sed 's/[^0-9]//g' || echo "0")
+                    incremental_count=$((incremental_count + 0))
+                    log_info "  Added DROP IF EXISTS for all policies (now $incremental_count DROP statements)"
+                fi
+                
+                # Sanitize again before comparison
+                incremental_count=$((incremental_count + 0))
+                create_count=$((create_count + 0))
+                
                 if [ "$incremental_count" -gt 0 ] && [ "$incremental_count" -eq "$create_count" ]; then
                     mv "$POLICIES_INCREMENTAL" "$POLICIES_FILE"
                     log_info "  Converted $incremental_count policies to incremental format (DROP IF EXISTS + CREATE)"
+                elif [ "$create_count" -gt 0 ]; then
+                    # Even if counts don't match exactly, use the incremental file if it has DROP statements
+                    mv "$POLICIES_INCREMENTAL" "$POLICIES_FILE"
+                    log_info "  Using incremental format with $incremental_count DROP and $create_count CREATE statements"
                 else
                     log_warning "  Policy conversion may have issues (DROP: $incremental_count, CREATE: $create_count), using original"
                     rm -f "$POLICIES_INCREMENTAL"
@@ -967,6 +1144,15 @@ if [ "$dump_success" = "true" ]; then
 else
     log_error "Failed to dump schema from source project via any connection method"
     log_to_file "$LOG_FILE" "ERROR: Failed to dump schema from source"
+    log_error "Tried:"
+    log_error "  1. Pooler connections (via environment variables)"
+    log_error "  2. API-resolved pooler hostname"
+    log_error ""
+    log_error "Please check:"
+    log_error "  - Database passwords are correct (SUPABASE_${SOURCE_ENV}_DB_PASSWORD)"
+    log_error "  - Pooler region/port settings are correct"
+    log_error "  - Network connectivity to Supabase"
+    log_error "  - Access tokens have permission to query pooler config (SUPABASE_${SOURCE_ENV}_ACCESS_TOKEN)"
     exit 1
 fi
 echo ""
@@ -990,6 +1176,7 @@ if [ "$VERIFY_ONLY" = "true" ]; then
     endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
     target_dump_success=false
     
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_dump \
@@ -1004,6 +1191,42 @@ if [ "$VERIFY_ONLY" = "true" ]; then
             break
         fi
     done <<< "$endpoints"
+    
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$target_dump_success" = "false" ]; then
+        log_info "Pooler connections failed for target, trying API to get pooler hostname..."
+        log_to_file "$LOG_FILE" "Pooler connections failed for target, trying API to get pooler hostname"
+        api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$TARGET_REF" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying target schema dump with API-resolved pooler host: ${api_pooler_host}"
+            log_to_file "$LOG_FILE" "Retrying target schema dump with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "${TARGET_POOLER_PORT:-6543}" "5432"; do
+                log_info "Attempting target schema dump via API-resolved pooler (${api_pooler_host}:${port})..."
+                log_to_file "$LOG_FILE" "Attempting target schema dump via API-resolved pooler (${api_pooler_host}:${port})"
+                if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_dump \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${TARGET_REF}" \
+                    -d postgres \
+                    --schema-only \
+                    --no-owner \
+                    -f "$TARGET_SCHEMA_FILE" 2>&1 | tee -a "$LOG_FILE"; then
+                    target_dump_success=true
+                    break
+                else
+                    log_warning "Target schema dump via API-resolved pooler (${api_pooler_host}:${port}) failed"
+                    log_to_file "$LOG_FILE" "Target schema dump via API-resolved pooler (${api_pooler_host}:${port}) failed"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API for target"
+            log_to_file "$LOG_FILE" "Could not resolve pooler hostname via API for target"
+        fi
+    fi
     
     if [ "$target_dump_success" = "true" ]; then
         if [ -s "$TARGET_SCHEMA_FILE" ]; then
@@ -1026,17 +1249,17 @@ if [ "$VERIFY_ONLY" = "true" ]; then
         fi
         
         if [ "$source_non_storage" -eq "$target_policy_count" ]; then
-            log_success "✓ Policy counts match between source and target"
-        else
+                log_success "✓ Policy counts match between source and target"
+            else
             diff=$((source_non_storage - target_policy_count))
-            if [ "$diff" -gt 0 ]; then
+                if [ "$diff" -gt 0 ]; then
                 log_warning "⚠ Target has $diff fewer policy(ies) than source (expected $source_non_storage, got $target_policy_count)"
                 log_warning "  This indicates some policies failed to migrate"
                 log_to_file "$LOG_FILE" "WARNING: Policy count mismatch - $diff policies missing"
-            else
-                log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
+                else
+                    log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
+                fi
             fi
-        fi
             
             # Compare schemas using diff command
             log_info "Running detailed diff check..."
@@ -1108,168 +1331,309 @@ else
     log_to_file "$LOG_FILE" "Applying schema only to target"
 fi
 
-# Apply SQL file directly using psql with fallback
-endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
+# Helper function to get timeout command (handles macOS where timeout may not be available)
+get_timeout_cmd() {
+    if command -v timeout >/dev/null 2>&1; then
+        echo "timeout"
+    elif command -v gtimeout >/dev/null 2>&1; then
+        echo "gtimeout"
+    else
+        echo ""  # No timeout available
+    fi
+}
+
+TIMEOUT_CMD=$(get_timeout_cmd)
+if [ -z "$TIMEOUT_CMD" ]; then
+    log_info "Note: timeout command not available - psql will run without timeout (like source dump)"
+fi
+
+# Apply SQL file directly using psql with fallback (same pattern as database_migration.sh)
+# Use run_psql_script_with_fallback helper function for reliable connections
 sql_applied=false
-while IFS='|' read -r host port user label; do
-    [ -z "$host" ] && continue
-    log_info "Applying schema via ${label} (${host}:${port})..."
-    log_to_file "$LOG_FILE" "Attempting schema application via ${label}"
-    # Apply schema with error handling - continue on non-critical errors
-    # Use ON_ERROR_STOP=off to continue even if some statements fail
-    # This is important for policies - we want to apply all policies even if some fail
-    psql_output_file="$MIGRATION_DIR_ABS/psql_output_${label//[^a-zA-Z0-9]/_}.log"
-    set +e  # Don't exit on psql errors - we'll check the output file
-    
-    # First apply the main schema (without policies)
-    PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
-        -h "$host" \
-        -p "$port" \
-        -U "$user" \
-        -d postgres \
-        -v ON_ERROR_STOP=off \
-        -f "$SCHEMA_DUMP_FILE" > "$psql_output_file" 2>&1
+schema_file_size=$(du -h "$SCHEMA_DUMP_FILE" 2>/dev/null | cut -f1 || echo "unknown")
+schema_line_count=$(wc -l < "$SCHEMA_DUMP_FILE" 2>/dev/null | tr -d '[:space:]' || echo "0")
+log_info "Applying schema dump (size: $schema_file_size, ~$schema_line_count lines)..."
+log_info "This may take several minutes for large schemas. Please wait..."
+log_to_file "$LOG_FILE" "Applying schema to target project using reliable connection fallback"
+
+# Use run_psql_script_with_fallback which handles all connection retries automatically
+set +e  # Don't exit on psql errors - we'll check the output
+if run_psql_script_with_fallback "Applying schema" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$SCHEMA_DUMP_FILE"; then
+    psql_exit_code=0
+    log_info "Schema application completed successfully"
+    sql_applied=true
+else
     psql_exit_code=$?
+    log_warning "Schema application completed with exit code $psql_exit_code (checking for expected errors)..."
+    sql_applied=false
+fi
+set -e
+
+# Apply policies separately with better error handling (using same connection pattern)
+if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
+    policy_count=$(grep -c "^CREATE POLICY\|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$POLICIES_FILE" 2>/dev/null || echo "0")
+    log_info "Applying $policy_count policy statement(s) separately (this may take a moment)..."
+    policies_output_file="$MIGRATION_DIR_ABS/policies_output.log"
+    log_to_file "$LOG_FILE" "Applying policies to target project using reliable connection fallback"
     
-    # Then apply policies separately with better error handling
-    if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
-        log_info "  Applying policies separately for better error tracking..."
-        policies_output_file="$MIGRATION_DIR_ABS/policies_output_${label//[^a-zA-Z0-9]/_}.log"
-        PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
-            -h "$host" \
-            -p "$port" \
-            -U "$user" \
-            -d postgres \
-            -v ON_ERROR_STOP=off \
-            -f "$POLICIES_FILE" > "$policies_output_file" 2>&1
+    # Use run_psql_script_with_fallback which handles all connection retries automatically
+    set +e
+    if run_psql_script_with_fallback "Applying policies" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$POLICIES_FILE"; then
+        policies_exit_code=0
+        log_info "Policy application completed successfully"
+    else
         policies_exit_code=$?
+        log_warning "Policy application completed with exit code $policies_exit_code (checking for expected errors)..."
         
-        # Append policies output to main output file
-        cat "$policies_output_file" >> "$psql_output_file"
+        # Extract policy output from log file
+        if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+            tail -100 "$LOG_FILE" | grep -A 50 "Applying policies" > "$policies_output_file" 2>/dev/null || true
+        fi
+    fi
+    set -e
+    
+    # Check for policy errors in the log file (since run_psql_script_with_fallback writes to LOG_FILE)
+    if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+        # Extract policy-related output from log file for error checking
+        policies_output_section=$(tail -200 "$LOG_FILE" | grep -A 100 "Applying policies" 2>/dev/null || tail -100 "$LOG_FILE")
+        
+        # Filter out expected policy errors (already exists, syntax errors on CREATE)
+        filtered_policy_errors=$(echo "$policies_output_section" | grep "ERROR:" 2>/dev/null | \
+            grep -vE "policy.*already exists|syntax error.*CREATE|syntax error at or near" | \
+            wc -l | tr -d '[:space:]' || echo "0")
+        
+        if [ "$filtered_policy_errors" -gt 0 ]; then
+            log_warning "Found $filtered_policy_errors unexpected policy error(s) (expected errors filtered out)"
+        else
+            log_info "Policy errors are expected (already exists, syntax issues) - continuing..."
+        fi
         
         # Count policy application results
         policies_in_file=$(grep -c "^CREATE POLICY\|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$POLICIES_FILE" 2>/dev/null || echo "0")
-        policies_errors=$(grep -cE "ERROR.*[Pp]olicy|ERROR.*POLICY" "$policies_output_file" 2>/dev/null || echo "0")
+        policies_errors=$(echo "$policies_output_section" | grep -cE "ERROR.*[Pp]olicy|ERROR.*POLICY" 2>/dev/null || echo "0")
         if [ "$policies_in_file" -gt 0 ]; then
-            log_info "  Applied $policies_in_file policy statement(s) separately"
+            log_info "Applied $policies_in_file policy statement(s) separately"
             if [ "$policies_errors" -gt 0 ]; then
-                log_warning "  $policies_errors policy statement(s) had errors"
-                # Extract and log policy errors
-                policy_error_details=$(grep -E "ERROR.*[Pp]olicy|ERROR.*POLICY" "$policies_output_file" 2>/dev/null | head -10 || echo "")
-                if [ -n "$policy_error_details" ]; then
-                    log_to_file "$LOG_FILE" "Policy application errors via ${label}:"
-                    echo "$policy_error_details" | while IFS= read -r error_line; do
-                        log_to_file "$LOG_FILE" "  $error_line"
-                    done
-                fi
-            fi
-        fi
-        rm -f "$policies_output_file"
-    fi
-    
-    set -e
-    
-    # Check if connection was successful (even if SQL had errors)
-    if [ ! -f "$psql_output_file" ]; then
-        log_warning "psql output file not created - connection may have failed"
-        continue
-    fi
-    
-    # Check for connection errors
-    if grep -qE "FATAL|could not connect|connection refused|timeout" "$psql_output_file" 2>/dev/null; then
-        log_warning "Connection failed via ${label}, trying next endpoint..."
-        continue
-    fi
-    
-    # Count policy application results
-    policies_applied=0
-    policies_failed=0
-    policy_errors=""
-    if grep -q "CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null; then
-        # Count policies in the dump file
-        policies_applied=$(grep -c "CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
-        # Count policy-related errors (more comprehensive pattern matching)
-        policies_failed=$(grep -cE "ERROR.*[Pp]olicy|ERROR.*POLICY|ERROR.*policy.*already exists|ERROR.*duplicate" "$psql_output_file" 2>/dev/null || echo "0")
-        # Extract policy error details
-        policy_errors=$(grep -E "ERROR.*[Pp]olicy|ERROR.*POLICY" "$psql_output_file" 2>/dev/null | head -10 || echo "")
-        
-        if [ "$policies_applied" -gt 0 ]; then
-            log_info "  Attempted to apply $policies_applied policy(ies) via ${label}"
-            if [ "$policies_failed" -gt 0 ]; then
-                log_warning "  $policies_failed policy(ies) had errors (may already exist or require different permissions)"
-                if [ -n "$policy_errors" ]; then
-                    log_to_file "$LOG_FILE" "Policy errors encountered via ${label}:"
-                    echo "$policy_errors" | while IFS= read -r error_line; do
-                        log_to_file "$LOG_FILE" "  $error_line"
-                    done
-                fi
-            else
-                log_info "  No policy errors detected in output"
+                log_warning "$policies_errors policy statement(s) had errors (may be expected)"
             fi
         fi
     fi
+fi
+
+# Check for connection errors in the log file
+if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+    if grep -qE "FATAL|could not connect|connection refused|timeout" "$LOG_FILE" 2>/dev/null; then
+        log_error "Connection failed - check log file for details"
+        sql_applied=false
+    fi
+fi
+
+# Check for critical errors in the log file (excluding expected system/permission errors)
+if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+    # Extract schema application output from log file
+    schema_output_section=$(tail -200 "$LOG_FILE" | grep -A 100 "Applying schema" 2>/dev/null || tail -100 "$LOG_FILE")
+    # Get all ERROR lines from the schema output section
+    all_errors=$(echo "$schema_output_section" | grep "ERROR:" 2>/dev/null || true)
     
-    # Log the output
-    cat "$psql_output_file" | tee -a "$LOG_FILE"
-    
-    # Check for critical errors (excluding expected system/permission errors)
-    # Ignore: must be owner, already exists, event trigger errors, auth schema ownership errors
-    # Use a more robust filtering approach
-    if [ -f "$psql_output_file" ] && [ -s "$psql_output_file" ]; then
-        # Get all ERROR lines
-        all_errors=$(grep "ERROR:" "$psql_output_file" 2>/dev/null || true)
+    if [ -n "$all_errors" ]; then
+        # Filter out system errors - these are expected and should be ignored
+        critical_errors=$(echo "$all_errors" | \
+            grep -viE "must be owner|already exists|Non-superuser owned event trigger|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication|syntax error|at or near" | \
+            wc -l | tr -d '[:space:]' || echo "0")
         
-        if [ -n "$all_errors" ]; then
-            # Filter out system errors - these are expected and should be ignored
-            # Use a single grep with extended regex to match any system error pattern
-            # Include auth schema permission errors as they're expected in Supabase
-            # Also ignore "policy already exists" errors since we use DROP IF EXISTS (but some may still fail)
-            critical_errors=$(echo "$all_errors" | \
-                grep -vE "must be owner|already exists|Non-superuser owned event trigger|syntax error|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication" | \
-                wc -l | tr -d '[:space:]' || echo "0")
-            
-            # Count total and system errors
-            total_errors=$(echo "$all_errors" | wc -l | tr -d '[:space:]' || echo "0")
-            system_errors=$(echo "$all_errors" | \
-                grep -E "must be owner|already exists|Non-superuser owned event trigger|syntax error|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication" | \
-                wc -l | tr -d '[:space:]' || echo "0")
-        else
-            critical_errors=0
-            total_errors=0
-            system_errors=0
-        fi
+        # Count total and system errors
+        total_errors=$(echo "$all_errors" | wc -l | tr -d '[:space:]' || echo "0")
+        system_errors=$(echo "$all_errors" | \
+            grep -iE "must be owner|already exists|Non-superuser owned event trigger|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication|syntax error|at or near" | \
+            wc -l | tr -d '[:space:]' || echo "0")
     else
         critical_errors=0
         total_errors=0
         system_errors=0
     fi
     
-    # Debug logging
-    log_to_file "$LOG_FILE" "DEBUG [${label}]: critical_errors=$critical_errors, total_errors=$total_errors, system_errors=$system_errors"
+    # Convert to integers for comparison
+    total_errors_int=$((total_errors + 0))
+    system_errors_int=$((system_errors + 0))
+    critical_errors_int=$((critical_errors + 0))
     
-    if [ "$critical_errors" -eq 0 ]; then
+    # If we have errors, check if they're all system errors (expected)
+    if [ "$total_errors_int" -gt 0 ] && [ "$system_errors_int" -eq "$total_errors_int" ]; then
+        # All errors are system errors (expected) - this is success
         sql_applied=true
-        if [ "$total_errors" -gt 0 ] && [ "$system_errors" -eq "$total_errors" ]; then
-            # All errors are system errors (expected)
-            log_success "✓ Schema applied successfully to target ($system_errors system object errors expected and ignored)"
-            log_to_file "$LOG_FILE" "Schema applied successfully to target via ${label} ($system_errors system errors ignored)"
-        elif [ "$total_errors" -gt 0 ]; then
-            # Some errors but not all are system errors - log warning but continue
+        log_success "✓ Schema applied successfully to target ($system_errors system object errors expected and ignored)"
+        log_to_file "$LOG_FILE" "Schema applied successfully to target ($system_errors system errors ignored)"
+    elif [ "$critical_errors_int" -eq 0 ]; then
+        # No critical errors - success
+        sql_applied=true
+        if [ "$total_errors_int" -gt 0 ]; then
             log_warning "⚠ Schema applied with some non-system errors ($critical_errors critical, $system_errors system)"
-            log_to_file "$LOG_FILE" "Schema applied with warnings via ${label} ($critical_errors critical errors, $system_errors system errors)"
-            sql_applied=true  # Still consider it applied since critical_errors is 0
+            log_to_file "$LOG_FILE" "Schema applied with warnings ($critical_errors critical errors, $system_errors system errors)"
         else
             log_success "✓ Schema applied successfully to target"
-            log_to_file "$LOG_FILE" "Schema applied successfully to target via ${label}"
+            log_to_file "$LOG_FILE" "Schema applied successfully to target"
         fi
-        rm -f "$psql_output_file"
-        break
     else
-        log_warning "Schema application via ${label} had $critical_errors critical error(s), trying next endpoint..."
-        log_to_file "$LOG_FILE" "Schema application via ${label} had $critical_errors critical errors (total: $total_errors, system: $system_errors)"
-        rm -f "$psql_output_file"
+        log_warning "Schema application had $critical_errors critical error(s)"
+        log_to_file "$LOG_FILE" "Schema application had $critical_errors critical errors (total: $total_errors, system: $system_errors)"
+        if [ -n "$all_errors" ]; then
+            log_to_file "$LOG_FILE" "First few errors:"
+            echo "$all_errors" | head -5 | while IFS= read -r error_line; do
+                log_to_file "$LOG_FILE" "  $error_line"
+            done
+        fi
+        sql_applied=false
     fi
-done <<< "$endpoints"
+else
+    # No output file - connection likely failed
+    log_error "No output file generated - connection may have failed"
+    sql_applied=false
+fi
+
+# If connection failed, the helper function already tried all endpoints, so we're done
+if [ "$sql_applied" = "false" ]; then
+    log_info "Pooler connections failed for target SQL application, trying API to get pooler hostname..."
+    log_to_file "$LOG_FILE" "Pooler connections failed for target SQL application, trying API to get pooler hostname"
+    api_pooler_host=""
+    api_pooler_host=$(get_pooler_host_via_api "$TARGET_REF" 2>/dev/null || echo "")
+    
+    if [ -n "$api_pooler_host" ]; then
+        log_info "Retrying SQL application with API-resolved pooler host: ${api_pooler_host}"
+        log_to_file "$LOG_FILE" "Retrying SQL application with API-resolved pooler host: ${api_pooler_host}"
+        
+        # Try with API-resolved pooler host
+        for port in "${TARGET_POOLER_PORT:-6543}" "5432"; do
+            log_info "Applying schema via API-resolved pooler (${api_pooler_host}:${port})..."
+            log_to_file "$LOG_FILE" "Attempting schema application via API-resolved pooler (${api_pooler_host}:${port})"
+            
+            psql_output_file="$MIGRATION_DIR_ABS/psql_output_api_pooler.log"
+            set +e
+            
+            # Apply main schema
+            schema_file_size=$(du -h "$SCHEMA_DUMP_FILE" 2>/dev/null | cut -f1 || echo "unknown")
+            log_info "  Applying schema via API-resolved pooler (${api_pooler_host}:${port}, size: $schema_file_size)..."
+            if [ -n "$TIMEOUT_CMD" ]; then
+                PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require $TIMEOUT_CMD 600 psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${TARGET_REF}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=off \
+                    --echo-errors \
+                    -f "$SCHEMA_DUMP_FILE" > "$psql_output_file" 2>&1
+            else
+                PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${TARGET_REF}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=off \
+                    --echo-errors \
+                    -f "$SCHEMA_DUMP_FILE" > "$psql_output_file" 2>&1
+            fi
+            psql_exit_code=$?
+            
+            if [ $psql_exit_code -eq 124 ]; then
+                log_error "  Schema application timed out after 10 minutes via API-resolved pooler"
+                if [ -f "$psql_output_file" ] && [ -s "$psql_output_file" ]; then
+                    log_info "  Partial output found (last 20 lines):"
+                    tail -20 "$psql_output_file" | while IFS= read -r line; do
+                        log_info "    $line"
+                    done
+                fi
+                rm -f "$psql_output_file"
+                continue
+            elif [ $psql_exit_code -ne 0 ]; then
+                log_warning "  Schema application completed with exit code $psql_exit_code (checking for expected errors)..."
+            else
+                log_info "  Schema application completed successfully"
+            fi
+            
+            # Apply policies if available
+            if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
+                log_info "  Applying policies via API-resolved pooler..."
+                policies_output_file="$MIGRATION_DIR_ABS/policies_output_api_pooler.log"
+                if [ -n "$TIMEOUT_CMD" ]; then
+                    PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require $TIMEOUT_CMD 600 psql \
+                        -h "$api_pooler_host" \
+                        -p "$port" \
+                        -U "postgres.${TARGET_REF}" \
+                        -d postgres \
+                        -v ON_ERROR_STOP=off \
+                        --echo-errors \
+                        -f "$POLICIES_FILE" > "$policies_output_file" 2>&1
+                else
+                    PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
+                        -h "$api_pooler_host" \
+                        -p "$port" \
+                        -U "postgres.${TARGET_REF}" \
+                        -d postgres \
+                        -v ON_ERROR_STOP=off \
+                        --echo-errors \
+                        -f "$POLICIES_FILE" > "$policies_output_file" 2>&1
+                fi
+                policies_exit_code=$?
+                
+                if [ $policies_exit_code -eq 124 ]; then
+                    log_error "  Policy application timed out after 10 minutes via API-resolved pooler"
+                    if [ -f "$policies_output_file" ] && [ -s "$policies_output_file" ]; then
+                        log_info "  Partial output found (last 20 lines):"
+                        tail -20 "$policies_output_file" | while IFS= read -r line; do
+                            log_info "    $line"
+                        done
+                    fi
+                elif [ $policies_exit_code -ne 0 ]; then
+                    log_warning "  Policy application completed with exit code $policies_exit_code (checking for expected errors)..."
+                else
+                    log_info "  Policy application completed successfully"
+                fi
+                
+                cat "$policies_output_file" >> "$psql_output_file"
+                rm -f "$policies_output_file"
+            fi
+            
+            set -e
+            
+            # Check for connection errors
+            if grep -qE "FATAL|could not connect|connection refused|timeout" "$psql_output_file" 2>/dev/null; then
+                log_warning "Connection failed via API-resolved pooler (${api_pooler_host}:${port}), trying next port..."
+                rm -f "$psql_output_file"
+                continue
+            fi
+            
+            # Check for critical errors (same logic as above)
+            if [ -f "$psql_output_file" ] && [ -s "$psql_output_file" ]; then
+                all_errors=$(grep "ERROR:" "$psql_output_file" 2>/dev/null || true)
+                if [ -n "$all_errors" ]; then
+                    critical_errors=$(echo "$all_errors" | \
+                        grep -viE "must be owner|already exists|Non-superuser owned event trigger|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication|syntax error|at or near" | \
+                        wc -l | tr -d '[:space:]' || echo "0")
+                    
+                    if [ "$critical_errors" -eq "0" ]; then
+                        sql_applied=true
+                        log_success "✓ Schema applied successfully via API-resolved pooler (${api_pooler_host}:${port})"
+                        log_to_file "$LOG_FILE" "Schema applied successfully via API-resolved pooler (${api_pooler_host}:${port})"
+                        cat "$psql_output_file" | tee -a "$LOG_FILE"
+                        rm -f "$psql_output_file"
+                        break
+                    fi
+                else
+                    sql_applied=true
+                    log_success "✓ Schema applied successfully via API-resolved pooler (${api_pooler_host}:${port})"
+                    log_to_file "$LOG_FILE" "Schema applied successfully via API-resolved pooler (${api_pooler_host}:${port})"
+                    cat "$psql_output_file" | tee -a "$LOG_FILE"
+                    rm -f "$psql_output_file"
+                    break
+                fi
+            fi
+            
+            rm -f "$psql_output_file"
+        done
+    else
+        log_warning "Could not resolve pooler hostname via API for target SQL application"
+        log_to_file "$LOG_FILE" "Could not resolve pooler hostname via API for target SQL application"
+    fi
+fi
 
 if [ "$sql_applied" != "true" ]; then
     # Check if we have any actual critical errors or if all errors were system errors
@@ -1280,9 +1644,9 @@ if [ "$sql_applied" != "true" ]; then
     # Check if we can find any critical errors in the logs
     # If not, it means all errors were system errors and we should proceed
     if [ -f "$LOG_FILE" ]; then
-        # Look for any non-system errors in the log
+        # Look for any non-system errors in the log (use same patterns as above)
         non_system_errors=$(grep "ERROR:" "$LOG_FILE" 2>/dev/null | \
-            grep -vE "must be owner|already exists|Non-superuser owned event trigger|syntax error" | \
+            grep -viE "must be owner|already exists|Non-superuser owned event trigger|permission denied for schema auth|permission denied for schema extensions|permission denied for schema realtime|permission denied for schema storage|schema.*already exists|type.*already exists|policy.*already exists|publication.*already exists|relation.*already member of publication|syntax error|at or near" | \
             wc -l | tr -d '[:space:]' || echo "0")
         
         if [ "$non_system_errors" -eq 0 ]; then
@@ -1335,26 +1699,18 @@ log_info ""
 log_info "Verifying policies were migrated correctly..."
 log_to_file "$LOG_FILE" "Verifying migration success"
 
-# Export target schema after migration using pg_dump
+# Export target schema after migration using pg_dump (same pattern as database_migration.sh)
 TARGET_SCHEMA_AFTER="$MIGRATION_DIR_ABS/target_schema_after.sql"
 log_info "Exporting target schema for verification..."
-endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
+log_to_file "$LOG_FILE" "Exporting target schema for verification"
+
+PG_DUMP_ARGS=(-d postgres --schema-only --no-owner -f "$TARGET_SCHEMA_AFTER")
 target_after_dump_success=false
 
-while IFS='|' read -r host port user label; do
-    [ -z "$host" ] && continue
-    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_dump \
-        -h "$host" \
-        -p "$port" \
-        -U "$user" \
-        -d postgres \
-        --schema-only \
-        --no-owner \
-        -f "$TARGET_SCHEMA_AFTER" 2>&1 | tee -a "$LOG_FILE"; then
-        target_after_dump_success=true
-        break
-    fi
-done <<< "$endpoints"
+if run_pg_tool_with_fallback "pg_dump" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$LOG_FILE" \
+    "${PG_DUMP_ARGS[@]}"; then
+    target_after_dump_success=true
+fi
 
 if [ "$target_after_dump_success" = "true" ]; then
     if [ -s "$TARGET_SCHEMA_AFTER" ]; then
@@ -1422,45 +1778,29 @@ if [ "$target_after_dump_success" = "true" ]; then
                 source_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
                 target_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
                 
-                # Query source policies
+                # Query source policies (using same connection pattern as database_migration.sh)
                 source_policies_list_file="$MIGRATION_DIR_ABS/source_policies_list.txt"
-                endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}")
                 source_policies_success=false
                 
-                while IFS='|' read -r host port user label; do
-                    [ -z "$host" ] && continue
-                    if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require psql \
-                        -h "$host" \
-                        -p "$port" \
-                        -U "$user" \
-                        -d postgres \
-                        -t -A \
-                        -c "$source_policies_query" > "$source_policies_list_file" 2>/dev/null; then
-                        source_policies_success=true
-                        log_info "    Source policies queried via $label"
-                        break
-                    fi
-                done <<< "$endpoints"
+                # Use run_psql_query_with_fallback helper
+                if run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$source_policies_query" > "$source_policies_list_file" 2>/dev/null; then
+                    source_policies_success=true
+                    log_info "    Source policies queried successfully"
+                else
+                    log_warning "    Failed to query source policies"
+                fi
                 
-                # Query target policies
+                # Query target policies (using same connection pattern as database_migration.sh)
                 target_policies_list_file="$MIGRATION_DIR_ABS/target_policies_list.txt"
-                endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
                 target_policies_success=false
                 
-                while IFS='|' read -r host port user label; do
-                    [ -z "$host" ] && continue
-                    if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
-                        -h "$host" \
-                        -p "$port" \
-                        -U "$user" \
-                        -d postgres \
-                        -t -A \
-                        -c "$target_policies_query" > "$target_policies_list_file" 2>/dev/null; then
-                        target_policies_success=true
-                        log_info "    Target policies queried via $label"
-                        break
-                    fi
-                done <<< "$endpoints"
+                # Use run_psql_query_with_fallback helper
+                if run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$target_policies_query" > "$target_policies_list_file" 2>/dev/null; then
+                    target_policies_success=true
+                    log_info "    Target policies queried successfully"
+                else
+                    log_warning "    Failed to query target policies"
+                fi
                 
                 # Compare and identify missing policies
                 if [ "$source_policies_success" = "true" ] && [ "$target_policies_success" = "true" ]; then
@@ -1513,57 +1853,37 @@ if [ "$target_after_dump_success" = "true" ]; then
             fi
         else
             # Fallback comparison if we don't have unfiltered dump
-            if [ "$source_policy_count" -eq "$target_policy_count" ]; then
-                log_success "✓ Policy counts match! Migration successful"
-                log_to_file "$LOG_FILE" "SUCCESS: Policy counts match ($source_policy_count policies)"
-            else
-                diff=$((source_policy_count - target_policy_count))
-                if [ "$diff" -gt 0 ]; then
-                    log_warning "⚠ Target has $diff fewer policy(ies) than source"
-                    log_to_file "$LOG_FILE" "WARNING: Target has $diff fewer policies than source"
+        if [ "$source_policy_count" -eq "$target_policy_count" ]; then
+            log_success "✓ Policy counts match! Migration successful"
+            log_to_file "$LOG_FILE" "SUCCESS: Policy counts match ($source_policy_count policies)"
+        else
+            diff=$((source_policy_count - target_policy_count))
+            if [ "$diff" -gt 0 ]; then
+                log_warning "⚠ Target has $diff fewer policy(ies) than source"
+                log_to_file "$LOG_FILE" "WARNING: Target has $diff fewer policies than source"
                     
                     # Enhanced: Direct database query to identify missing policies
                     log_info "  Querying databases directly to identify missing policies..."
                     source_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
                     target_policies_query="SELECT schemaname||'.'||tablename||'.'||policyname FROM pg_policies WHERE schemaname NOT IN ('storage', 'pg_catalog', 'information_schema') ORDER BY schemaname, tablename, policyname;"
                     
-                    # Query source policies
+                    # Query source policies (using same connection pattern as database_migration.sh)
                     source_policies_list_file="$MIGRATION_DIR_ABS/source_policies_list.txt"
-                    endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}")
                     source_policies_success=false
                     
-                    while IFS='|' read -r host port user label; do
-                        [ -z "$host" ] && continue
-                        if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require psql \
-                            -h "$host" \
-                            -p "$port" \
-                            -U "$user" \
-                            -d postgres \
-                            -t -A \
-                            -c "$source_policies_query" > "$source_policies_list_file" 2>/dev/null; then
-                            source_policies_success=true
-                            break
-                        fi
-                    done <<< "$endpoints"
+                    # Use run_psql_query_with_fallback helper
+                    if run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$source_policies_query" > "$source_policies_list_file" 2>/dev/null; then
+                        source_policies_success=true
+                    fi
                     
-                    # Query target policies
+                    # Query target policies (using same connection pattern as database_migration.sh)
                     target_policies_list_file="$MIGRATION_DIR_ABS/target_policies_list.txt"
-                    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}")
                     target_policies_success=false
                     
-                    while IFS='|' read -r host port user label; do
-                        [ -z "$host" ] && continue
-                        if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require psql \
-                            -h "$host" \
-                            -p "$port" \
-                            -U "$user" \
-                            -d postgres \
-                            -t -A \
-                            -c "$target_policies_query" > "$target_policies_list_file" 2>/dev/null; then
-                            target_policies_success=true
-                            break
-                        fi
-                    done <<< "$endpoints"
+                    # Use run_psql_query_with_fallback helper
+                    if run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$target_policies_query" > "$target_policies_list_file" 2>/dev/null; then
+                        target_policies_success=true
+                    fi
                     
                     # Compare and identify missing policies
                     if [ "$source_policies_success" = "true" ] && [ "$target_policies_success" = "true" ]; then
@@ -1596,9 +1916,9 @@ if [ "$target_after_dump_success" = "true" ]; then
                             fi
                         fi
                     fi
-                else
-                    log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
-                    log_to_file "$LOG_FILE" "WARNING: Target has $((diff * -1)) more policies than source"
+            else
+                log_warning "⚠ Target has $((diff * -1)) more policy(ies) than source"
+                log_to_file "$LOG_FILE" "WARNING: Target has $((diff * -1)) more policies than source"
                 fi
             fi
         fi

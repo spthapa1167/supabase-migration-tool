@@ -188,6 +188,7 @@ run_psql_command_with_fallback() {
         env_name="$TARGET_ENV"
     fi
 
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         log_info "${description} via ${label} (${host}:${port})"
@@ -206,6 +207,35 @@ run_psql_command_with_fallback() {
         fi
     done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
 
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if ! $success; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying ${description} with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=on \
+                    -c "$command" \
+                    >>"$PROJECT_ROOT/logs/policies_sync.log" 2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "${description} failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err")"
+                fi
+            done
+        fi
+    fi
+
+    # If still failed, try direct connection as last resort
     if ! $success; then
         log_warning "${description} failed across all poolers, retrying via direct host..."
         local direct_host
@@ -252,6 +282,7 @@ run_psql_query_with_fallback() {
         env_name="$TARGET_ENV"
     fi
 
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         if PGPASSWORD="$password" PGSSLMODE=require psql \
@@ -266,6 +297,32 @@ run_psql_query_with_fallback() {
         fi
     done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
 
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if ! $success; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..." >&2
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}" >&2
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -t -A -F '' --no-align --quiet \
+                    -c "$query" >"$tmp_file" 2>/dev/null; then
+                    success=true
+                    break
+                fi
+            done
+        fi
+    fi
+
+    # If still failed, try direct connection as last resort
     if ! $success; then
         local direct_host
         while IFS= read -r direct_host; do

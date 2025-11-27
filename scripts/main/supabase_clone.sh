@@ -20,12 +20,14 @@ Description:
   Creates a complete replica of the source environment in the target, including:
   - Database schema (tables, indexes, constraints, functions, triggers)
   - Database data (all table rows - REPLACED, not merged)
-  - Authentication users and identities (REPLACED)
+  - Authentication users and identities (REPLACED, including encrypted passwords)
   - Storage buckets (all bucket configurations)
   - Storage files (all files in all buckets)
   - RLS policies, roles, grants, and access controls
-  - Edge functions (all functions with code)
+  - Edge functions (all functions with code and shared dependencies)
   - Secrets (new secret keys added incrementally)
+  
+  User passwords are preserved during migration via the encrypted_password column in auth.users.
 
 Notes:
   - Target environment will be REPLACED with source state (destructive!)
@@ -76,14 +78,14 @@ echo " Target: $TARGET_ENV"
 echo " Mode  : FULL REPLICA (complete replacement)"
 echo ""
 echo " Components to clone:"
-echo "  ✓ Database schema (tables, indexes, functions, triggers)"
-echo "  ✓ Database data (all table rows - REPLACED)"
-echo "  ✓ Authentication users and identities (REPLACED)"
-echo "  ✓ Storage buckets (all bucket configurations)"
-echo "  ✓ Storage files (all files in all buckets)"
-echo "  ✓ RLS policies, roles, grants, and access controls"
-echo "  ✓ Edge functions (all functions with code)"
-echo "  ✓ Secrets (new keys added incrementally)"
+echo "  ✓ Database schema (tables, indexes, functions, triggers, types, extensions)"
+echo "  ✓ Database data (all table rows - REPLACED, not merged)"
+echo "  ✓ Authentication users and identities (REPLACED, including encrypted passwords)"
+echo "  ✓ Storage buckets (all bucket configurations and policies)"
+echo "  ✓ Storage files (all files in all buckets - complete file migration)"
+echo "  ✓ RLS policies, roles, grants, and access controls (complete policy sync)"
+echo "  ✓ Edge functions (all functions with code and shared dependencies)"
+echo "  ✓ Secrets (new secret keys added incrementally)"
 echo "==================================================================="
 echo
 echo "⚠️  WARNING: This operation is DESTRUCTIVE on the target environment."
@@ -101,15 +103,14 @@ if [ "$AUTO_PROCEED" != "true" ]; then
 fi
 
 # Step 1: Run comprehensive main migration with all components
+# Using --full flag which includes: schema, data, users, files, secrets, edge functions
+# Plus --replace-data to ensure complete replacement
 MAIN_CMD=(
     "$PROJECT_ROOT/scripts/main/supabase_migration.sh"
     "$SOURCE_ENV"
     "$TARGET_ENV"
-    --data              # Include database row data migration
-    --replace-data      # REPLACE all target data (destructive)
-    --users             # Include auth users/identities migration
-    --files             # Include storage bucket files migration
-    --secret            # Include secrets migration
+    --full              # Complete migration: schema + data + users + files + secrets + edge functions
+    --replace-data      # REPLACE all target data (destructive - ensures complete clone)
     --backup            # Create backup before migration
     --auto-confirm      # Skip confirmation prompts
 )
@@ -119,12 +120,24 @@ if [ ${#EXTRA_FLAGS[@]} -gt 0 ]; then
 fi
 
 echo "[INFO] Step 1/7: Running comprehensive migration (schema, data, users, files, secrets, edge functions)..."
+echo "[INFO] Note: Edge functions are migrated once in this step. Failed functions can be retried manually if needed."
+# Capture the migration directory from the main migration output if possible
+# The main migration will create a backup directory automatically
 if ! "${MAIN_CMD[@]}"; then
     echo "[ERROR] Primary migration failed; aborting clone."
     exit 1
 fi
 echo "[SUCCESS] Step 1/7: Main migration completed"
 echo ""
+
+# Find the most recent migration directory created by the main migration
+# This ensures Step 5 uses the same migration directory
+# Use macOS/BSD compatible find command
+LATEST_MIGRATION_DIR=$(find "$PROJECT_ROOT/backups" -maxdepth 1 -type d -name "*migration_${SOURCE_ENV}_to_${TARGET_ENV}_*" -print0 2>/dev/null | xargs -0 ls -td 2>/dev/null | head -1)
+if [ -z "$LATEST_MIGRATION_DIR" ] || [ ! -d "$LATEST_MIGRATION_DIR" ]; then
+    # Fallback: let storage migration script create its own directory
+    LATEST_MIGRATION_DIR=""
+fi
 
 # Step 2: Ensure all table data is completely replaced (double-check for completeness)
 PUBLIC_SCHEMA_SCRIPT="$PROJECT_ROOT/scripts/components/migrate_all_table_data.sh"
@@ -169,17 +182,24 @@ else
 fi
 
 # Step 5: Ensure storage buckets and files are completely migrated
+# Note: This step is redundant since --full already includes files, but it ensures completeness
 STORAGE_SCRIPT="$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh"
 if [ -x "$STORAGE_SCRIPT" ]; then
-    echo "[INFO] Step 5/7: Migrating all storage buckets with files..."
-    if ! "$STORAGE_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --files --auto-confirm; then
-        echo "[ERROR] Storage buckets and files migration failed; aborting clone."
-        exit 1
+    echo "[INFO] Step 5/7: Verifying storage buckets and files migration (with files)..."
+    STORAGE_CMD=("$STORAGE_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV")
+    if [ -n "$LATEST_MIGRATION_DIR" ]; then
+        STORAGE_CMD+=("$LATEST_MIGRATION_DIR")
     fi
-    echo "[SUCCESS] Step 5/7: Storage buckets and files migration completed"
+    STORAGE_CMD+=(--files --auto-confirm)
+    if ! "${STORAGE_CMD[@]}"; then
+        echo "[WARNING] Storage buckets verification reported issues. Review logs above."
+        echo "[INFO] Continuing clone process (storage was already migrated in Step 1 with --full flag)..."
+    else
+        echo "[SUCCESS] Step 5/7: Storage buckets and files verification completed"
+    fi
     echo ""
 else
-    echo "[WARNING] storage_buckets_migration.sh not found or not executable; skipping storage migration."
+    echo "[WARNING] storage_buckets_migration.sh not found or not executable; skipping storage verification."
 fi
 
 # Step 6: Ensure policies, roles, and access controls are synced (already done in main migration, but double-check)
@@ -196,19 +216,23 @@ else
     echo "[WARNING] policies_migration_new.sh not found or not executable; skipping policies verification."
 fi
 
-# Step 7: Retry any failed edge function deployments
-RETRY_SCRIPT="$PROJECT_ROOT/scripts/components/retry_edge_functions.sh"
-if [ -x "$RETRY_SCRIPT" ]; then
-    echo "[INFO] Step 7/7: Retrying any failed edge function deployments..."
-    if ! "$RETRY_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --allow-missing; then
-        echo "[WARNING] Edge functions retry reported issues. Review logs above."
+# Step 7: Migrate secrets (incremental - only new keys)
+SECRETS_SCRIPT="$PROJECT_ROOT/scripts/components/secrets_migration.sh"
+if [ -x "$SECRETS_SCRIPT" ]; then
+    echo "[INFO] Step 7/7: Migrating secrets (incremental - new keys only)..."
+    if ! "$SECRETS_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV"; then
+        echo "[WARNING] Secrets migration reported issues. Review logs above."
     else
-        echo "[SUCCESS] Step 7/7: Edge functions deployment verified"
+        echo "[SUCCESS] Step 7/7: Secrets migration completed (keys created with blank values - UPDATE REQUIRED)"
     fi
     echo ""
 else
-    echo "[WARNING] retry_edge_functions.sh not found or not executable; skipping edge functions retry."
+    echo "[WARNING] secrets_migration.sh not found or not executable; skipping secrets migration."
 fi
+
+# Note: Edge functions are migrated once in Step 1 via supabase_migration.sh
+# If any edge functions failed, they can be retried manually using:
+#   ./scripts/components/retry_edge_functions.sh <source_env> <target_env>
 
 # Optional: Verify environment parity
 COMPARE_SCRIPT="$PROJECT_ROOT/scripts/main/compare_env.sh"
@@ -230,14 +254,19 @@ echo "==================================================================="
 echo " Target environment ($TARGET_ENV) should now be a complete replica of source ($SOURCE_ENV)"
 echo ""
 echo " Components cloned:"
-echo "  ✓ Database schema (tables, indexes, functions, triggers)"
-echo "  ✓ Database data (all table rows - REPLACED)"
-echo "  ✓ Authentication users and identities (REPLACED)"
-echo "  ✓ Storage buckets (all bucket configurations)"
-echo "  ✓ Storage files (all files in all buckets)"
-echo "  ✓ RLS policies, roles, grants, and access controls"
-echo "  ✓ Edge functions (all functions with code)"
-echo "  ✓ Secrets (new keys added incrementally)"
+echo "  ✓ Database schema (tables, indexes, functions, triggers, types, extensions)"
+echo "  ✓ Database data (all table rows - REPLACED, not merged)"
+echo "  ✓ Authentication users and identities (REPLACED, including encrypted passwords)"
+echo "  ✓ Storage buckets (all bucket configurations and policies)"
+echo "  ✓ Storage files (all files in all buckets - complete file migration)"
+echo "  ✓ RLS policies, roles, grants, and access controls (complete policy sync)"
+echo "  ✓ Edge functions (all functions with code and shared dependencies)"
+echo "  ✓ Secrets (new secret keys added incrementally)"
+echo ""
+echo " Verification:"
+echo "  - Review migration logs in the backups/ directory"
+echo "  - Check component summaries in the migration directory"
+echo "  - Use compare_env.sh to verify environment parity if needed"
 echo ""
 echo " Note: Review migration logs in the backups/ directory for detailed information."
 echo "==================================================================="

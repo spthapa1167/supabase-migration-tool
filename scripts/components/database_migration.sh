@@ -13,6 +13,7 @@ run_psql_command_with_fallback() {
     local tmp_err
     tmp_err=$(mktemp)
 
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         log_info "${description} via ${label} (${host}:${port})"
@@ -31,6 +32,37 @@ run_psql_command_with_fallback() {
         fi
     done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
 
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying ${description} with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                log_info "${description} via API-resolved pooler (${api_pooler_host}:${port})"
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=on \
+                    -c "$command" \
+                    >>"$LOG_FILE" 2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "${description} failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err")"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
+
     rm -f "$tmp_err"
     $success && return 0 || return 1
 }
@@ -45,7 +77,9 @@ run_psql_query_with_fallback() {
 
     local tmp_err
     tmp_err=$(mktemp)
+    local success=false
 
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         if PGPASSWORD="$password" PGSSLMODE=require psql \
@@ -58,16 +92,53 @@ run_psql_query_with_fallback() {
             -v ON_ERROR_STOP=on \
             -c "$query" \
             2>"$tmp_err"; then
-            rm -f "$tmp_err"
-            return 0
+            success=true
+            break
         else
             log_warning "Query execution failed via ${label}: $(head -n 1 "$tmp_err")"
         fi
     done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
 
-    cat "$tmp_err" >&2
-    rm -f "$tmp_err"
-    return 1
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -F '|' \
+                    -t -A \
+                    -v ON_ERROR_STOP=on \
+                    -c "$query" \
+                    2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "Query execution failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err")"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
+
+    if [ "$success" = "true" ]; then
+        rm -f "$tmp_err"
+        return 0
+    else
+        cat "$tmp_err" >&2
+        rm -f "$tmp_err"
+        return 1
+    fi
 }
 
 # Helper: run psql script file with fallback
@@ -83,6 +154,7 @@ run_psql_script_with_fallback() {
     local tmp_err
     tmp_err=$(mktemp)
 
+    # First, try database connectivity via shared pooler (no API calls)
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         log_info "${description} via ${label} (${host}:${port})"
@@ -100,6 +172,37 @@ run_psql_script_with_fallback() {
             log_warning "${description} failed via ${label}: $(head -n 1 "$tmp_err")"
         fi
     done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying ${description} with API-resolved pooler host: ${api_pooler_host}"
+            
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                log_info "${description} via API-resolved pooler (${api_pooler_host}:${port})"
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=off \
+                    -f "$script_path" \
+                    >>"$LOG_FILE" 2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "${description} failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err")"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
 
     rm -f "$tmp_err"
     $success && return 0 || return 1
@@ -411,9 +514,10 @@ if [ "$INCLUDE_DATA" = "true" ]; then
     
     DUMP_FILE="$MIGRATION_DIR/source_full.dump"
     
-    if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD"; then
-        log_error "Failed to link to source project"
-        exit 1
+    # CLI linking is optional - direct pg_dump connections don't require it
+    if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD" 2>/dev/null; then
+        log_warning "Supabase CLI linking failed (Unauthorized) - continuing with direct database connections"
+        log_info "Direct pg_dump connections don't require CLI authentication"
     fi
     
     # Get pooler host using environment name (more reliable)
@@ -438,9 +542,10 @@ else
     
     DUMP_FILE="$MIGRATION_DIR/source_schema.dump"
     
-    if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD"; then
-        log_error "Failed to link to source project"
-        exit 1
+    # CLI linking is optional - direct pg_dump connections don't require it
+    if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD" 2>/dev/null; then
+        log_warning "Supabase CLI linking failed (Unauthorized) - continuing with direct database connections"
+        log_info "Direct pg_dump connections don't require CLI authentication"
     fi
     
     # Get pooler host using environment name (more reliable)
@@ -475,13 +580,9 @@ if [ "$INCLUDE_USERS" = "true" ]; then
     
     AUTH_USERS_DUMP="$MIGRATION_DIR/auth_users.dump"
     
-    # Ensure we're still linked to source
+    # CLI linking is optional - direct connections don't require it
     if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD" 2>/dev/null; then
-        log_info "Re-linking to source project for auth users dump..."
-        if ! link_project "$SOURCE_REF" "$SOURCE_PASSWORD"; then
-            log_error "Failed to link to source project for auth users dump"
-            exit 1
-        fi
+        log_warning "Supabase CLI linking failed - continuing with direct database connections"
     fi
     
     # Get pooler host using environment name (more reliable)
@@ -543,9 +644,10 @@ if [ "$INCLUDE_DATA" = "true" ]; then
     log_info "Step 2/3: Restoring to target environment..."
     log_to_file "$LOG_FILE" "Restoring to target environment"
     
-    if ! link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
-        log_error "Failed to link to target project"
-        exit 1
+    # CLI linking is optional - direct pg_restore connections don't require it
+    if ! link_project "$TARGET_REF" "$TARGET_PASSWORD" 2>/dev/null; then
+        log_warning "Supabase CLI linking failed (Unauthorized) - continuing with direct database connections"
+        log_info "Direct pg_restore connections don't require CLI authentication"
     fi
     
     if [ "$REPLACE_TARGET_DATA" = "true" ]; then
@@ -606,9 +708,10 @@ else
     log_info "Step 2/3: Restoring schema to target environment..."
     log_to_file "$LOG_FILE" "Restoring schema to target environment"
     
-    if ! link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
-        log_error "Failed to link to target project"
-        exit 1
+    # CLI linking is optional - direct pg_restore connections don't require it
+    if ! link_project "$TARGET_REF" "$TARGET_PASSWORD" 2>/dev/null; then
+        log_warning "Supabase CLI linking failed (Unauthorized) - continuing with direct database connections"
+        log_info "Direct pg_restore connections don't require CLI authentication"
     fi
 fi
 
@@ -983,7 +1086,13 @@ if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
                 TABLE_FILTER_ARGS+=(--table="$t")
             done
         fi
-        if pg_restore --data-only --no-owner --no-privileges "${TABLE_FILTER_ARGS[@]}" -f "$incremental_sql" "$DUMP_FILE"; then
+        # Build pg_restore command with proper handling of empty array
+        pg_restore_cmd=("pg_restore" "--data-only" "--no-owner" "--no-privileges")
+        if [ ${#TABLE_FILTER_ARGS[@]} -gt 0 ]; then
+            pg_restore_cmd+=("${TABLE_FILTER_ARGS[@]}")
+        fi
+        pg_restore_cmd+=("-f" "$incremental_sql" "$DUMP_FILE")
+        if "${pg_restore_cmd[@]}"; then
             if [ ${#INCLUDE_TABLES[@]} -gt 0 ]; then
                 TARGET_TABLE_LIST=$(for t in "${INCLUDE_TABLES[@]}"; do printf "'%s'," "$t"; done)
                 TARGET_TABLE_LIST="${TARGET_TABLE_LIST%,}"
@@ -1158,13 +1267,9 @@ if [ "$INCLUDE_USERS" = "true" ] && [ "$RESTORE_SUCCESS" = "true" ]; then
     log_info "Step 4/4: Syncing auth users from source to target..."
     log_to_file "$LOG_FILE" "Syncing auth users from source to target"
     
-    # Ensure we're linked to target
+    # CLI linking is optional - direct connections don't require it
     if ! link_project "$TARGET_REF" "$TARGET_PASSWORD" 2>/dev/null; then
-        log_info "Re-linking to target project for auth users sync..."
-        if ! link_project "$TARGET_REF" "$TARGET_PASSWORD"; then
-            log_error "Failed to link to target project for auth users sync"
-            exit 1
-        fi
+        log_warning "Supabase CLI linking failed - continuing with direct database connections"
     fi
     
     # Get pooler hosts using environment names (more reliable)

@@ -16,7 +16,7 @@ const ensureUnzip = () => {
 
 const createManagementClient = (accessToken) => {
     if (!accessToken) {
-        throw new Error('SUPABASE_ACCESS_TOKEN is required');
+        throw new Error('Access token is required (set SUPABASE_<ENV>_ACCESS_TOKEN)');
     }
 
     const client = createClient('https://api.supabase.com', accessToken, {
