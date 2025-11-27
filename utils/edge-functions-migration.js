@@ -433,6 +433,24 @@ const normalizeTimestamp = (value) => {
     return null;
 };
 
+// Check if function code actually imports from shared files (not just mentions "_shared")
+// Uses regex to match only actual import/require statements
+function hasSharedFileImports(functionCode) {
+    if (!functionCode || typeof functionCode !== 'string') {
+        return false;
+    }
+    
+    // Match actual import/require statements that reference _shared directory
+    // Patterns: 
+    // - import ... from '../_shared/...'
+    // - import ... from './_shared/...'
+    // - import ... from '_shared/...'
+    // - require('../_shared/...')
+    // - from '../_shared/...' (ES6 imports)
+    const sharedImportPattern = /(?:import|require|from)\s+['"](?:\.\.?\/)?_shared\/[^'"]+['"]/i;
+    return sharedImportPattern.test(functionCode);
+}
+
 // Get Supabase URLs, access token, and database password from environment
 function getSupabaseConfig(projectRef) {
     let envName = '';
@@ -1383,11 +1401,7 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
         } else if (fs.existsSync(functionIndexJsPath)) {
             functionCode = fs.readFileSync(functionIndexJsPath, 'utf8');
         }
-        const functionNeedsSharedFiles = functionCode.includes('_shared') || 
-                                         functionCode.includes('../_shared') || 
-                                         functionCode.includes('./_shared') ||
-                                         functionCode.includes('from \'../_shared') ||
-                                         functionCode.includes('from "../_shared');
+        const functionNeedsSharedFiles = hasSharedFileImports(functionCode);
         
         // Use collectSharedFiles to find all shared files
         let sharedFilesResult = collectSharedFiles(functionsParentDir, [functionDir]);
@@ -2194,11 +2208,7 @@ async function migrateEdgeFunctions() {
                 } else if (fs.existsSync(localIndexJsPath)) {
                     localFunctionCode = fs.readFileSync(localIndexJsPath, 'utf8');
                 }
-                functionNeedsSharedFiles = localFunctionCode.includes('_shared') || 
-                                           localFunctionCode.includes('../_shared') || 
-                                           localFunctionCode.includes('./_shared') ||
-                                           localFunctionCode.includes('from \'../_shared') ||
-                                           localFunctionCode.includes('from "../_shared');
+                functionNeedsSharedFiles = hasSharedFileImports(localFunctionCode);
             }
             
             // Check if function has shared files - if so, skip in main migration
@@ -2270,11 +2280,7 @@ async function migrateEdgeFunctions() {
             } else if (fs.existsSync(downloadedIndexJsPath)) {
                 downloadedFunctionCode = fs.readFileSync(downloadedIndexJsPath, 'utf8');
             }
-            const downloadedFunctionNeedsSharedFiles = downloadedFunctionCode.includes('_shared') || 
-                                                       downloadedFunctionCode.includes('../_shared') || 
-                                                       downloadedFunctionCode.includes('./_shared') ||
-                                                       downloadedFunctionCode.includes('from \'../_shared') ||
-                                                       downloadedFunctionCode.includes('from "../_shared');
+            const downloadedFunctionNeedsSharedFiles = hasSharedFileImports(downloadedFunctionCode);
             
             if (downloadedFunctionNeedsSharedFiles) {
                 logInfo(`  ✓ Confirmed: Has shared files dependency`);
