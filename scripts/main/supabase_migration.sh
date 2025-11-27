@@ -808,6 +808,16 @@ echo ""
 # Link to target project
 log_info "Linking to target project..."
 if command -v supabase >/dev/null 2>&1; then
+    # Export target access token for Supabase CLI
+    # Construct variable name from TARGET_ENV (e.g., TARGET_ENV=backup -> SUPABASE_BACKUP_ACCESS_TOKEN)
+    TARGET_ENV_UPPER=\$(echo "\$TARGET_ENV" | tr '[:lower:]' '[:upper:]')
+    TARGET_TOKEN_VAR="SUPABASE_\${TARGET_ENV_UPPER}_ACCESS_TOKEN"
+    if [ -n "\${!TARGET_TOKEN_VAR:-}" ]; then
+        export SUPABASE_ACCESS_TOKEN="\${!TARGET_TOKEN_VAR}"
+        log_info "Using access token from \$TARGET_TOKEN_VAR"
+    else
+        log_warning "Access token not found in \$TARGET_TOKEN_VAR - linking may fail if not authenticated"
+    fi
     if supabase link --project-ref "\$TARGET_REF" --password "\$TARGET_PASSWORD" 2>&1 | tee /tmp/supabase_link.log; then
         log_success "Successfully linked to project"
     else

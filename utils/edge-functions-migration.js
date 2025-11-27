@@ -590,7 +590,17 @@ async function getEdgeFunctions(projectRef, accessToken, projectName, dbPassword
                                         // Ignore - will try without password
                                     }
                                 }
-                                const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse);
+                                // Get access token from config if available
+                                let accessTokenToUse = accessToken;
+                                if (!accessTokenToUse) {
+                                    try {
+                                        const config = getSupabaseConfig(projectRef);
+                                        accessTokenToUse = config.accessToken;
+                                    } catch (e) {
+                                        // Ignore - will try without access token
+                                    }
+                                }
+                                const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse, accessTokenToUse);
                                 if (cliFunctions && cliFunctions.length > 0) {
                                     logSuccess(`  ✓ Successfully retrieved ${cliFunctions.length} function(s) via Supabase CLI`);
                                     resolve(cliFunctions);
@@ -658,9 +668,15 @@ async function getEdgeFunctions(projectRef, accessToken, projectName, dbPassword
 }
 
 // Get edge functions using Supabase CLI (fallback when API returns 403)
-function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword) {
+function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword, accessToken = null) {
     try {
         logInfo(`  Attempting to list functions via Supabase CLI for ${projectName || 'project'}...`);
+        
+        // Prepare environment with access token if provided
+        const env = { ...process.env };
+        if (accessToken) {
+            env.SUPABASE_ACCESS_TOKEN = accessToken;
+        }
         
         // First, try to link to the project
         let linked = false;
@@ -668,7 +684,11 @@ function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword) {
             try {
                 // Unlink first to avoid conflicts
                 try {
-                    execSync('supabase unlink --yes', { stdio: 'pipe', timeout: 5000 });
+                    execSync('supabase unlink --yes', { 
+                        stdio: 'pipe', 
+                        timeout: 5000,
+                        env: env
+                    });
                 } catch (e) {
                     // Ignore errors - project might not be linked
                 }
@@ -676,7 +696,8 @@ function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword) {
                 // Link to project
                 execSync(`supabase link --project-ref ${projectRef} --password "${dbPassword}"`, {
                     stdio: 'pipe',
-                    timeout: 30000
+                    timeout: 30000,
+                    env: env
                 });
                 linked = true;
             } catch (linkError) {
@@ -685,7 +706,8 @@ function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword) {
                 try {
                     execSync(`supabase link --project-ref ${projectRef}`, {
                         stdio: 'pipe',
-                        timeout: 30000
+                        timeout: 30000,
+                        env: env
                     });
                     linked = true;
                 } catch (e) {
@@ -697,7 +719,8 @@ function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword) {
             try {
                 execSync(`supabase link --project-ref ${projectRef}`, {
                     stdio: 'pipe',
-                    timeout: 30000
+                    timeout: 30000,
+                    env: env
                 });
                 linked = true;
             } catch (e) {
@@ -714,7 +737,8 @@ function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword) {
         const output = execSync('supabase functions list', {
             stdio: 'pipe',
             timeout: 30000,
-            encoding: 'utf8'
+            encoding: 'utf8',
+            env: env
         });
         
         // Parse the output - Supabase CLI outputs function names, one per line
@@ -757,11 +781,21 @@ function checkDocker() {
 }
 
 // Link project using Supabase CLI
-function linkProject(projectRef, dbPassword) {
+function linkProject(projectRef, dbPassword, accessToken = null) {
     try {
+        // Prepare environment with access token if provided
+        const env = { ...process.env };
+        if (accessToken) {
+            env.SUPABASE_ACCESS_TOKEN = accessToken;
+        }
+        
         // Unlink first to avoid conflicts
         try {
-            execSync('supabase unlink --yes', { stdio: 'pipe', timeout: 5000 });
+            execSync('supabase unlink --yes', { 
+                stdio: 'pipe', 
+                timeout: 5000,
+                env: env
+            });
         } catch (e) {
             // Ignore errors - project might not be linked
         }
@@ -770,14 +804,16 @@ function linkProject(projectRef, dbPassword) {
         if (dbPassword) {
             execSync(`supabase link --project-ref ${projectRef} --password "${dbPassword}"`, {
                 stdio: 'pipe',
-                timeout: 30000
+                timeout: 30000,
+                env: env
             });
         } else {
             // Try without password (may fail, but worth trying)
             logWarning(`    ⚠ No database password provided, trying to link without password...`);
             execSync(`supabase link --project-ref ${projectRef}`, {
                 stdio: 'pipe',
-                timeout: 30000
+                timeout: 30000,
+                env: env
             });
         }
         
@@ -886,11 +922,17 @@ function findFunctionDirectory(rootDir, functionName) {
     return null;
 }
 
-async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword, quiet = false) {
+async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPassword, quiet = false, accessToken = null) {
     let finalFunctionPath = path.join(downloadDir, functionName);
     try {
         if (!quiet) {
             logInfo(`    Downloading function code: ${functionName}...`);
+        }
+
+        // Prepare environment with access token if provided
+        const env = { ...process.env };
+        if (accessToken) {
+            env.SUPABASE_ACCESS_TOKEN = accessToken;
         }
 
         if (!checkDocker()) {
@@ -914,7 +956,7 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
                 logInfo(`    Linking to source project for CLI download...`);
             }
             // Linking is optional - try to link, but continue if it fails (project might already be linked)
-            if (!linkProject(projectRef, dbPassword)) {
+            if (!linkProject(projectRef, dbPassword, accessToken)) {
                 logWarning(`    ⚠ Could not link to project ${projectRef} - continuing anyway (project might already be linked)`);
             }
 
@@ -923,7 +965,8 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
                 await retryWithBackoff(async () => {
                     execSync(`supabase functions download ${functionName}`, {
                         stdio: 'pipe',
-                        timeout: 60000
+                        timeout: 60000,
+                        env: env
                     });
                 }, 3, 2000, quiet);
             } catch (e) {
@@ -943,7 +986,8 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
                         await retryWithBackoff(async () => {
                             execSync(`supabase functions download --legacy-bundle ${functionName}`, {
                                 stdio: 'pipe',
-                                timeout: 60000
+                                timeout: 60000,
+                                env: env
                             });
                         }, 3, 2000, quiet);
                     } catch (legacyError) {
@@ -1231,11 +1275,17 @@ function getAllCodeFiles(dir, baseDir = dir, fileList = []) {
 }
 
 // Delete edge function using Supabase CLI
-async function deleteEdgeFunction(functionName, targetRef, dbPassword) {
+async function deleteEdgeFunction(functionName, targetRef, dbPassword, accessToken = null) {
     const originalCwd = process.cwd();
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-delete-${functionName}-`));
     
     try {
+        // Prepare environment with access token if provided
+        const env = { ...process.env };
+        if (accessToken) {
+            env.SUPABASE_ACCESS_TOKEN = accessToken;
+        }
+        
         const supabaseDir = path.join(tempDir, 'supabase');
         fs.mkdirSync(supabaseDir, { recursive: true });
         fs.writeFileSync(path.join(supabaseDir, 'config.toml'), `project_id = "${targetRef}"\n`);
@@ -1243,7 +1293,7 @@ async function deleteEdgeFunction(functionName, targetRef, dbPassword) {
         process.chdir(tempDir);
         
         // Link to target project (optional - might already be linked)
-        if (!linkProject(targetRef, dbPassword)) {
+        if (!linkProject(targetRef, dbPassword, accessToken)) {
             logWarning(`    ⚠ Could not link to target project ${targetRef} - continuing anyway (project might already be linked)`);
         }
         
@@ -1251,7 +1301,8 @@ async function deleteEdgeFunction(functionName, targetRef, dbPassword) {
         await retryWithBackoff(async () => {
             execSync(`supabase functions delete ${functionName}`, {
                 stdio: 'pipe',
-                timeout: 60000
+                timeout: 60000,
+                env: env
             });
         }, 3, 2000, false);
         
@@ -1274,7 +1325,7 @@ async function deleteEdgeFunction(functionName, targetRef, dbPassword) {
 
 // Deploy edge function using Supabase CLI
 // Note: No retry logic - failures are added to retry list for manual retry
-async function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, sourceRef = null, sourceDbPassword = null) {
+async function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, sourceRef = null, sourceDbPassword = null, targetAccessToken = null) {
     try {
         logInfo(`    Deploying function: ${functionName}...`);
         
@@ -1582,7 +1633,7 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
         try {
             // Link to target project (in supabase directory) - optional, might already be linked
             logInfo(`    Linking to target project...`);
-            if (!linkProject(targetRef, dbPassword)) {
+            if (!linkProject(targetRef, dbPassword, targetAccessToken)) {
                 logWarning(`    ⚠ Could not link to target project ${targetRef} - continuing anyway (project might already be linked)`);
             }
             
@@ -1621,9 +1672,16 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
             try {
                 // Wrap deploy in retry logic for rate limiting
                 await retryWithBackoff(async () => {
+                    // Prepare environment with access token if provided
+                    const env = { ...process.env };
+                    if (targetAccessToken) {
+                        env.SUPABASE_ACCESS_TOKEN = targetAccessToken;
+                    }
+                    
                     const deployProcess = spawn('supabase', ['functions', 'deploy', functionName], {
                         cwd: supabaseConfigDir,
-                        stdio: ['pipe', 'pipe', 'pipe']
+                        stdio: ['pipe', 'pipe', 'pipe'],
+                        env: env
                         // Removed shell: true to fix deprecation warning - args are already properly separated
                     });
                     
@@ -1954,7 +2012,7 @@ async function migrateEdgeFunctions() {
             
             logInfo(`Deleting function: ${functionName}...`);
             try {
-                if (await deleteEdgeFunction(functionName, TARGET_REF, targetConfig.dbPassword)) {
+                if (await deleteEdgeFunction(functionName, TARGET_REF, targetConfig.dbPassword, targetConfig.accessToken)) {
                     logSuccess(`  ✓ Deleted function: ${functionName}`);
                     deletedFunctions.push(functionName);
                 } else {
@@ -2157,7 +2215,14 @@ async function migrateEdgeFunctions() {
             const functionDir = path.join(functionsDir, functionName);
             logInfo(`  Downloading edge function from source...`);
             
-            const downloadSuccess = await downloadEdgeFunction(functionName, SOURCE_REF, functionsDir, sourceConfig.dbPassword, false);
+            const downloadSuccess = await downloadEdgeFunction(
+                functionName,
+                SOURCE_REF,
+                functionsDir,
+                sourceConfig.dbPassword,
+                false,
+                sourceConfig.accessToken
+            );
             
             if (!downloadSuccess) {
                 logWarning(`  ⚠ Could not download function code - skipping deployment`);
@@ -2229,7 +2294,14 @@ async function migrateEdgeFunctions() {
                 // Download target function for comparison (quiet mode to reduce noise)
                 const targetCompareDir = fs.mkdtempSync(path.join(os.tmpdir(), `edge-compare-${functionName}-`));
                 try {
-                    const targetDownloadSuccess = await downloadEdgeFunction(functionName, TARGET_REF, targetCompareDir, targetConfig.dbPassword, true);
+                    const targetDownloadSuccess = await downloadEdgeFunction(
+                        functionName,
+                        TARGET_REF,
+                        targetCompareDir,
+                        targetConfig.dbPassword,
+                        true,
+                        targetConfig.accessToken
+                    );
                     
                     if (targetDownloadSuccess) {
                         const targetFunctionDir = path.join(targetCompareDir, functionName);
@@ -2268,7 +2340,7 @@ async function migrateEdgeFunctions() {
             }
             
             // Deploy function to target (no retry - failures go to retry list)
-            const deployResult = await deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword, SOURCE_REF, sourceConfig.dbPassword);
+            const deployResult = await deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword, SOURCE_REF, sourceConfig.dbPassword, targetConfig.accessToken);
             
             // Handle different return types (boolean or object)
             const deploySuccess = typeof deployResult === 'object' ? deployResult.success : deployResult;

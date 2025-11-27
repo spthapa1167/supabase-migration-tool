@@ -220,8 +220,8 @@ if [ -z "$SOURCE_ACCESS_TOKEN" ] && [ -z "$TARGET_ACCESS_TOKEN" ]; then
     exit 1
 fi
 
-# Export tokens for Node.js utility (it will determine which one to use based on project_ref)
-export SUPABASE_ACCESS_TOKEN="${SOURCE_ACCESS_TOKEN:-$TARGET_ACCESS_TOKEN}"
+# Note: Node.js utility handles tokens internally based on project_ref
+# No need to export SUPABASE_ACCESS_TOKEN - utilities read from SUPABASE_${ENV}_ACCESS_TOKEN directly
 
 # Check if edge-functions-migration.js exists
 EDGE_FUNCTIONS_UTIL="$PROJECT_ROOT/utils/edge-functions-migration.js"

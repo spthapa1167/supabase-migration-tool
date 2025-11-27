@@ -104,21 +104,33 @@ function checkDocker() {
 }
 
 // Link project
-function linkProject(projectRef, dbPassword) {
+function linkProject(projectRef, dbPassword, accessToken = null) {
     try {
+        // Prepare environment with access token if provided
+        const env = { ...process.env };
+        if (accessToken) {
+            env.SUPABASE_ACCESS_TOKEN = accessToken;
+        }
+        
         try {
-            execSync('supabase unlink --yes', { stdio: 'pipe', timeout: 5000 });
+            execSync('supabase unlink --yes', { 
+                stdio: 'pipe', 
+                timeout: 5000,
+                env: env
+            });
         } catch {}
         
         if (dbPassword) {
             execSync(`supabase link --project-ref ${projectRef} --password "${dbPassword}"`, {
                 stdio: 'pipe',
-                timeout: 30000
+                timeout: 30000,
+                env: env
             });
         } else {
             execSync(`supabase link --project-ref ${projectRef}`, {
                 stdio: 'pipe',
-                timeout: 30000
+                timeout: 30000,
+                env: env
             });
         }
         return true;
@@ -146,9 +158,15 @@ function mergeDirectories(srcDir, destDir) {
 }
 
 // Download function with shared files
-async function downloadFunctionWithShared(functionName, projectRef, downloadDir, dbPassword) {
+async function downloadFunctionWithShared(functionName, projectRef, downloadDir, dbPassword, accessToken = null) {
     if (!checkDocker()) {
         throw new Error('Docker is not running');
+    }
+
+    // Prepare environment with access token if provided
+    const env = { ...process.env };
+    if (accessToken) {
+        env.SUPABASE_ACCESS_TOKEN = accessToken;
     }
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `shared-func-${functionName}-`));
@@ -162,21 +180,23 @@ async function downloadFunctionWithShared(functionName, projectRef, downloadDir,
 
         process.chdir(tempDir);
 
-        if (!linkProject(projectRef, dbPassword)) {
+        if (!linkProject(projectRef, dbPassword, accessToken)) {
             throw new Error('Failed to link to project');
         }
 
         try {
             execSync(`supabase functions download ${functionName}`, {
                 stdio: 'pipe',
-                timeout: 60000
+                timeout: 60000,
+                env: env
             });
         } catch (e) {
             const output = `${e.message}\n${e.stderr?.toString() || ''}\n${e.stdout?.toString() || ''}`;
             if (/legacy[- ]bundle/i.test(output)) {
                 execSync(`supabase functions download --legacy-bundle ${functionName}`, {
                     stdio: 'pipe',
-                    timeout: 60000
+                    timeout: 60000,
+                    env: env
                 });
             } else {
                 throw e;
@@ -239,7 +259,8 @@ async function downloadFunctionWithShared(functionName, projectRef, downloadDir,
                 const functionsList = execSync(`supabase functions list`, {
                     stdio: 'pipe',
                     timeout: 30000,
-                    encoding: 'utf8'
+                    encoding: 'utf8',
+                    env: env
                 });
                 
                 // Parse function names from the list (format: function_name)
@@ -260,7 +281,8 @@ async function downloadFunctionWithShared(functionName, projectRef, downloadDir,
                     try {
                         execSync(`supabase functions download ${funcName}`, {
                             stdio: 'pipe',
-                            timeout: 60000
+                            timeout: 60000,
+                            env: env
                         });
                     } catch (e) {
                         // Continue with other functions if one fails
@@ -437,7 +459,13 @@ function bundleSharedFiles(functionDir, sharedDir) {
 }
 
 // Deploy function with shared files
-async function deployFunctionWithShared(functionName, functionDir, targetRef, dbPassword) {
+async function deployFunctionWithShared(functionName, functionDir, targetRef, dbPassword, targetAccessToken = null) {
+    // Prepare environment with access token if provided
+    const env = { ...process.env };
+    if (targetAccessToken) {
+        env.SUPABASE_ACCESS_TOKEN = targetAccessToken;
+    }
+    
     const originalCwd = process.cwd();
     const functionsParentDir = path.dirname(functionDir);
     const supabaseDir = path.join(functionsParentDir, 'supabase', 'functions');
@@ -557,7 +585,7 @@ async function deployFunctionWithShared(functionName, functionDir, targetRef, db
 
         process.chdir(configDir);
 
-        if (!linkProject(targetRef, dbPassword)) {
+        if (!linkProject(targetRef, dbPassword, targetAccessToken)) {
             throw new Error('Failed to link to target project');
         }
 
@@ -566,7 +594,8 @@ async function deployFunctionWithShared(functionName, functionDir, targetRef, db
         const deployProcess = spawn('supabase', ['functions', 'deploy', functionName], {
             cwd: configDir,
             stdio: ['pipe', 'pipe', 'pipe'],
-            shell: true
+            shell: true,
+            env: env
         });
 
         let stdout = '';
@@ -693,7 +722,13 @@ async function main() {
             
             process.chdir(tempDownloadDir);
             
-            if (linkProject(SOURCE_REF, sourceConfig.dbPassword)) {
+            // Prepare environment with source access token
+            const sourceEnv = { ...process.env };
+            if (sourceConfig.accessToken) {
+                sourceEnv.SUPABASE_ACCESS_TOKEN = sourceConfig.accessToken;
+            }
+            
+            if (linkProject(SOURCE_REF, sourceConfig.dbPassword, sourceConfig.accessToken)) {
                 try {
                     logInfo(`  Getting list of functions from source project...`);
                     // Get list of all functions
@@ -702,7 +737,8 @@ async function main() {
                         functionsList = execSync(`supabase functions list`, {
                             stdio: 'pipe',
                             timeout: 30000,
-                            encoding: 'utf8'
+                            encoding: 'utf8',
+                            env: sourceEnv
                         });
                     } catch (e) {
                         logWarning(`  Could not list functions: ${e.message}`);
@@ -728,7 +764,8 @@ async function main() {
                             try {
                                 execSync(`supabase functions download ${funcName}`, {
                                     stdio: 'pipe',
-                                    timeout: 60000
+                                    timeout: 60000,
+                                    env: sourceEnv
                                 });
                             } catch (e) {
                                 // Continue with other functions if one fails
@@ -818,7 +855,7 @@ async function main() {
         try {
             // Download function
             logInfo(`  Downloading ${functionName} from source...`);
-            await downloadFunctionWithShared(functionName, SOURCE_REF, FUNCTIONS_DIR, sourceConfig.dbPassword);
+            await downloadFunctionWithShared(functionName, SOURCE_REF, FUNCTIONS_DIR, sourceConfig.dbPassword, sourceConfig.accessToken);
 
             const functionDir = path.join(FUNCTIONS_DIR, functionName);
             if (!fs.existsSync(functionDir)) {
@@ -996,7 +1033,7 @@ async function main() {
 
             // Deploy to target
             logInfo(`  Deploying to target...`);
-            await deployFunctionWithShared(functionName, functionDir, TARGET_REF, targetConfig.dbPassword);
+            await deployFunctionWithShared(functionName, functionDir, TARGET_REF, targetConfig.dbPassword, targetConfig.accessToken);
 
             migrated.push(functionName);
         } catch (error) {
