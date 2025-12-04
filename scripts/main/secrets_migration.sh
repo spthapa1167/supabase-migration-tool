@@ -273,6 +273,30 @@ failed_count=0
 restricted_count=0
 restricted_secrets=""
 
+# Function to check if secret exists in target (fresh check via API)
+# This prevents overwriting existing secrets even if cached list is stale
+check_secret_exists_fresh() {
+    local secret_name_to_check=$1
+    local check_output
+    local check_names
+    
+    # Fetch current target secrets and check if this secret exists
+    check_output=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN_FOR_WRITE" \
+        "https://api.supabase.com/v1/projects/${TARGET_REF}/secrets" 2>/dev/null)
+    
+    if [ $? -eq 0 ] && echo "$check_output" | jq empty 2>/dev/null; then
+        # Extract secret names and check if this one exists
+        check_names=$(echo "$check_output" | jq -r '.[].name' 2>/dev/null || echo "")
+        if [ -n "$check_names" ]; then
+            if echo "$check_names" | grep -qFx "$secret_name_to_check" 2>/dev/null; then
+                return 0  # Secret exists
+            fi
+        fi
+    fi
+    
+    return 1  # Secret does not exist
+}
+
 log_info ""
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info "  Secrets Migration Details"
@@ -308,6 +332,15 @@ for secret_name in $source_secret_names; do
         continue
     fi
     
+    # CRITICAL SAFETY CHECK: Verify secret doesn't exist right before setting
+    # This prevents overwriting existing secrets even if cached list was stale
+    if check_secret_exists_fresh "$secret_name"; then
+        log_warning "  ⚠️  Skipping: $secret_name (exists in target - preventing overwrite)"
+        skipped_count=$((skipped_count + 1))
+        echo ""
+        continue
+    fi
+    
     # Default: migrate keys only with blank values
     # Note: Secret values cannot be retrieved via API/CLI for security reasons
     # The --values flag is mainly for documentation/intent, but values still need manual input
@@ -320,6 +353,15 @@ for secret_name in $source_secret_names; do
     
     # Try to set secret with blank value first
     log_info "    Setting secret..."
+    
+    # FINAL SAFETY CHECK: Verify secret still doesn't exist before setting
+    # This prevents race conditions where secret was added between checks
+    if check_secret_exists_fresh "$secret_name"; then
+        log_warning "    ⚠️  Skipping: $secret_name (exists in target - prevented overwrite)"
+        skipped_count=$((skipped_count + 1))
+        echo ""
+        continue
+    fi
     
     # Use PIPESTATUS to properly capture exit code when using pipes
     set +o pipefail  # Temporarily disable pipefail to check exit code manually

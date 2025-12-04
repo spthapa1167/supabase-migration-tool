@@ -3,6 +3,7 @@
 # Secrets Migration Component Script
 # Migrates secret keys (names only) from source to target with blank values
 # Only creates new keys if they don't exist in target
+# NEVER modifies or overwrites existing secrets in target - they are preserved unchanged
 # Skips secrets starting with 'SUPABASE' (reserved)
 
 set -euo pipefail
@@ -152,6 +153,30 @@ skipped_existing=0
 skipped_reserved=0
 failed_count=0
 
+# Function to check if secret exists in target (fresh check via API)
+# This prevents overwriting existing secrets even if cached list is stale
+check_secret_exists_fresh() {
+    local secret_name_to_check=$1
+    local check_output
+    local check_names
+    
+    # Fetch current target secrets and check if this secret exists
+    check_output=$(curl -s -H "Authorization: Bearer $TARGET_ACCESS_TOKEN" \
+        "https://api.supabase.com/v1/projects/${TARGET_REF}/secrets" 2>/dev/null)
+    
+    if [ $? -eq 0 ] && echo "$check_output" | jq empty 2>/dev/null; then
+        # Extract secret names and check if this one exists
+        check_names=$(echo "$check_output" | jq -r '.[].name' 2>/dev/null || echo "")
+        if [ -n "$check_names" ]; then
+            if echo "$check_names" | grep -qFx "$secret_name_to_check" 2>/dev/null; then
+                return 0  # Secret exists
+            fi
+        fi
+    fi
+    
+    return 1  # Secret does not exist
+}
+
 # Process each source secret
 for secret_name in $source_secret_names; do
     secret_name=$(echo "$secret_name" | xargs)
@@ -179,6 +204,14 @@ for secret_name in $source_secret_names; do
         continue
     fi
     
+    # CRITICAL SAFETY CHECK: Verify secret doesn't exist right before setting
+    # This prevents overwriting existing secrets even if cached list was stale
+    if check_secret_exists_fresh "$secret_name"; then
+        log_warning "  ⚠️  Skipping: $secret_name (exists in target - preventing overwrite)"
+        skipped_existing=$((skipped_existing + 1))
+        continue
+    fi
+    
     # Create secret with blank value
     log_info "  Creating: $secret_name"
     
@@ -190,6 +223,13 @@ for secret_name in $source_secret_names; do
     set_secret_via_cli() {
         local secret_value=$1
         local cli_output
+        
+        # FINAL SAFETY CHECK: Verify secret still doesn't exist before setting
+        # This prevents race conditions where secret was added between checks
+        if check_secret_exists_fresh "$secret_name"; then
+            log_warning "    ⚠️  Secret now exists - aborting to prevent overwrite"
+            return 2  # Special exit code for "exists"
+        fi
         
         # Try to set secret using Supabase CLI with access token
         # Export access token for CLI to use
@@ -215,17 +255,31 @@ for secret_name in $source_secret_names; do
     }
     
     # Try blank value first via CLI
-    if set_secret_via_cli ""; then
+    set_secret_via_cli ""
+    cli_exit_code=$?
+    
+    if [ $cli_exit_code -eq 0 ]; then
         log_success "    ✓ Created: $secret_name (blank value - UPDATE REQUIRED)"
         migrated_count=$((migrated_count + 1))
         secret_created=true
+    elif [ $cli_exit_code -eq 2 ]; then
+        # Secret exists - skip to prevent overwrite
+        log_warning "    ⏭️  Skipped: $secret_name (exists in target - prevented overwrite)"
+        skipped_existing=$((skipped_existing + 1))
     else
         # Try with placeholder if blank doesn't work
         log_info "    Blank value failed, trying placeholder..."
-        if set_secret_via_cli "PLACEHOLDER_UPDATE_REQUIRED"; then
+        set_secret_via_cli "PLACEHOLDER_UPDATE_REQUIRED"
+        cli_exit_code=$?
+        
+        if [ $cli_exit_code -eq 0 ]; then
             log_success "    ✓ Created: $secret_name (placeholder - UPDATE REQUIRED)"
             migrated_count=$((migrated_count + 1))
             secret_created=true
+        elif [ $cli_exit_code -eq 2 ]; then
+            # Secret exists - skip to prevent overwrite
+            log_warning "    ⏭️  Skipped: $secret_name (exists in target - prevented overwrite)"
+            skipped_existing=$((skipped_existing + 1))
         else
             log_error "    ✗ Failed: $secret_name"
             # Show error details if available
