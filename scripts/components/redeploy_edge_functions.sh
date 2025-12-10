@@ -138,8 +138,8 @@ if [ -z "$SOURCE_ACCESS_TOKEN" ] && [ -z "$TARGET_ACCESS_TOKEN" ]; then
     exit 1
 fi
 
-# Export for Node.js utility
-export SUPABASE_ACCESS_TOKEN="${SOURCE_ACCESS_TOKEN:-$TARGET_ACCESS_TOKEN}"
+# Note: Node.js utility handles tokens internally based on project_ref
+# No need to export SUPABASE_ACCESS_TOKEN - utilities read from SUPABASE_${ENV}_ACCESS_TOKEN directly
 
 if ! command -v supabase >/dev/null 2>&1; then
     log_error "Supabase CLI not found - please install Supabase CLI"

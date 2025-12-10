@@ -212,8 +212,8 @@ if [ -z "$SOURCE_ACCESS_TOKEN" ] && [ -z "$TARGET_ACCESS_TOKEN" ]; then
     exit 1
 fi
 
-# Export for Node.js utility (it will determine which one to use)
-export SUPABASE_ACCESS_TOKEN="${SOURCE_ACCESS_TOKEN:-$TARGET_ACCESS_TOKEN}"
+# Note: Node.js utility handles tokens internally based on project_ref
+# No need to export SUPABASE_ACCESS_TOKEN - utilities read from SUPABASE_${ENV}_ACCESS_TOKEN directly
 
 # Migrate buckets with delta comparison and file migration using Node.js utility
 # Default behavior: Only migrate NEW bucket names (incremental - buckets that exist in source but not in target)

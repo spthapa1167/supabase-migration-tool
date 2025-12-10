@@ -334,6 +334,13 @@ if [ "$dump_success" = "true" ]; then
     fi
 else
     log_error "Failed to dump schema from source project via any connection method"
+    log_error ""
+    log_error "Please check the troubleshooting steps listed above."
+    log_error "Common issues:"
+    log_error "  - Database password is incorrect or not set"
+    log_error "  - Pooler region/port configuration mismatch"
+    log_error "  - Network restrictions blocking connections"
+    log_error "  - Access token missing or lacks permissions"
     log_to_file "$LOG_FILE" "ERROR: Failed to dump schema from source"
     exit 1
 fi

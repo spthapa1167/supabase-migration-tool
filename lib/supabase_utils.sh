@@ -309,6 +309,27 @@ get_pooler_host_for_env() {
     return 1
 }
 
+# Determine environment name from project_ref
+get_env_name_from_ref() {
+    local project_ref=$1
+    local env_name=""
+    
+    if [ ${#project_ref} -eq 20 ]; then
+        # Try to match project_ref to an environment
+        if [ "$project_ref" = "${SUPABASE_PROD_PROJECT_REF:-}" ]; then
+            env_name="prod"
+        elif [ "$project_ref" = "${SUPABASE_TEST_PROJECT_REF:-}" ]; then
+            env_name="test"
+        elif [ "$project_ref" = "${SUPABASE_DEV_PROJECT_REF:-}" ]; then
+            env_name="dev"
+        elif [ "$project_ref" = "${SUPABASE_BACKUP_PROJECT_REF:-}" ]; then
+            env_name="backup"
+        fi
+    fi
+    
+    echo "$env_name"
+}
+
 # Get pooler hostname via API (only called when database connection fails)
 get_pooler_host_via_api() {
     local project_ref=$1
@@ -441,24 +462,56 @@ get_pooler_port_for_env() {
 # Enumerate connection endpoints (host|port|label) to try for a project
 get_supabase_connection_endpoints() {
     local project_ref=$1
-    local pooler_region=${2:-aws-1-us-east-2}
-    local pooler_port=${3:-6543}
+    local pooler_region=$2
+    local pooler_port=$3
+
+    # Validate project_ref
+    if [ -z "$project_ref" ] || [ "$project_ref" = "" ]; then
+        return 1
+    fi
+
+    # Handle defaults for pooler_region (handle both unset and empty string)
+    if [ -z "${pooler_region}" ] || [ "${pooler_region}" = "" ]; then
+        pooler_region="aws-1-us-east-2"
+    fi
+
+    # Handle defaults for pooler_port (handle both unset and empty string)
+    if [ -z "${pooler_port}" ] || [ "${pooler_port}" = "" ]; then
+        pooler_port="6543"
+    fi
 
     local shared_pooler_host=""
 
     # Try to resolve pooler host via helpers (env variables / Management API)
-    shared_pooler_host=$(get_pooler_host "$project_ref" 2>/dev/null || true)
-    if [ -z "$shared_pooler_host" ]; then
+    # Use a subshell to isolate any errors from get_pooler_host
+    set +e  # Temporarily disable exit on error
+    shared_pooler_host=$(get_pooler_host "$project_ref" 2>/dev/null || echo "")
+    set -e  # Re-enable exit on error
+    
+    # Always fallback to default if empty or if function failed
+    if [ -z "$shared_pooler_host" ] || [ "$shared_pooler_host" = "" ]; then
         shared_pooler_host="${pooler_region}.pooler.supabase.com"
     fi
 
-    # Prefer explicit pooler port if provided via helper
-    if [ -z "$pooler_port" ]; then
-        pooler_port="6543"
+    # Ensure we have a valid hostname before outputting (double-check)
+    if [ -z "$shared_pooler_host" ] || [ "$shared_pooler_host" = "" ]; then
+        # Final fallback - should never reach here but just in case
+        shared_pooler_host="aws-1-us-east-2.pooler.supabase.com"
     fi
 
+    # Validate we have all required components before outputting
+    if [ -z "$project_ref" ] || [ -z "$shared_pooler_host" ] || [ -z "$pooler_port" ]; then
+        # This should never happen due to validation above, but just in case
+        return 1
+    fi
+
+    # Output endpoints (host|port|user|label format)
+    # Always output at least these two endpoints - this is critical
     echo "${shared_pooler_host}|${pooler_port}|postgres.${project_ref}|shared_pooler_${pooler_port}"
     echo "${shared_pooler_host}|5432|postgres.${project_ref}|shared_pooler_5432"
+    
+    # Return success
+    return 0
 }
 
 # Run a PostgreSQL tool (pg_dump, pg_restore, etc.) with fallback connections
@@ -487,6 +540,10 @@ run_pg_tool_with_fallback() {
         log_info "Trying ${tool} via ${label} (${host}:${port})"
 
         local status
+        # Unset PGPASSFILE to prevent .pgpass from interfering with authentication
+        # Keep PGPASSWORD unset until we set it, to avoid conflicts
+        unset PGPASSFILE
+        
         if [ -n "$log_file" ]; then
             PGPASSWORD="$password" PGSSLMODE=require "$tool" \
                 -h "$host" -p "$port" -U "$user" "${tool_args[@]}" 2>&1 | tee -a "$log_file"
@@ -502,7 +559,19 @@ run_pg_tool_with_fallback() {
             success=0
             break
         else
-            log_warning "${tool} failed via ${label}"
+            # Check for specific authentication errors
+            if [ -n "$log_file" ] && [ -f "$log_file" ]; then
+                local last_error=$(tail -3 "$log_file" 2>/dev/null | grep -i "duplicate SASL\|authentication\|password" || echo "")
+                if echo "$last_error" | grep -qi "duplicate SASL"; then
+                    log_warning "${tool} failed via ${label} - duplicate SASL authentication error"
+                    log_info "  This usually means password is being sent twice or .pgpass file is interfering"
+                    log_info "  Try: unset PGPASSFILE; or check if password contains special characters"
+                else
+                    log_warning "${tool} failed via ${label}"
+                fi
+            else
+                log_warning "${tool} failed via ${label}"
+            fi
         fi
     done < <(get_supabase_connection_endpoints "$project_ref" "$pooler_region" "$pooler_port")
 
@@ -520,6 +589,9 @@ run_pg_tool_with_fallback() {
                 log_info "Trying ${tool} via API-resolved pooler (${api_pooler_host}:${port})"
                 
                 local status
+                # Unset PGPASSFILE to prevent .pgpass from interfering with authentication
+                unset PGPASSFILE
+                
                 if [ -n "$log_file" ]; then
                     PGPASSWORD="$password" PGSSLMODE=require "$tool" \
                         -h "$api_pooler_host" -p "$port" -U "postgres.${project_ref}" "${tool_args[@]}" 2>&1 | tee -a "$log_file"
@@ -545,6 +617,47 @@ run_pg_tool_with_fallback() {
 
     if [ $success -ne 0 ]; then
         log_error "${tool} failed for all connection attempts"
+        log_error ""
+        log_error "Troubleshooting steps:"
+        
+        # Determine environment name for better error messages
+        local env_name=$(get_env_name_from_ref "$project_ref")
+        local env_upper=""
+        if [ -n "$env_name" ]; then
+            env_upper=$(echo "$env_name" | tr '[:lower:]' '[:upper:]')
+        fi
+        
+        if [ -n "$env_upper" ]; then
+            log_error "  1. Verify database password: SUPABASE_${env_upper}_DB_PASSWORD"
+            log_error "     Check if password is set: [ -n \"\${SUPABASE_${env_upper}_DB_PASSWORD:-}\" ] && echo 'SET' || echo 'NOT SET'"
+            log_error "  2. If you see 'duplicate SASL authentication' error:"
+            log_error "     - Check for .pgpass file: rm ~/.pgpass (if exists, it may interfere)"
+            log_error "     - Ensure password doesn't contain special characters that need escaping"
+            log_error "     - Try using direct connection instead of pooler: db.${project_ref}.supabase.co:5432"
+            log_error "  3. Check pooler region/port settings:"
+            log_error "     - SUPABASE_${env_upper}_POOLER_REGION (current: ${pooler_region:-not set})"
+            log_error "     - SUPABASE_${env_upper}_POOLER_PORT (current: ${pooler_port:-6543})"
+            log_error "  4. Verify access token has permission: SUPABASE_${env_upper}_ACCESS_TOKEN"
+            log_error "     Access token is required to query pooler configuration via API"
+            log_error "  5. Test connection manually:"
+            log_error "     unset PGPASSFILE; PGPASSWORD='\$SUPABASE_${env_upper}_DB_PASSWORD' psql \\"
+            log_error "       -h ${pooler_region:-aws-1-us-east-2}.pooler.supabase.com \\"
+            log_error "       -p ${pooler_port:-6543} \\"
+            log_error "       -U postgres.${project_ref} \\"
+            log_error "       -d postgres -c 'SELECT 1;'"
+        else
+            log_error "  1. Verify database password is set correctly"
+            log_error "  2. Check pooler region/port settings (pooler_region: ${pooler_region:-not set}, port: ${pooler_port:-6543})"
+            log_error "  3. Verify access token has permission to query project configuration"
+            log_error "  4. Test connection manually with psql using project_ref: ${project_ref}"
+        fi
+        
+        log_error "  5. Check network restrictions in Supabase Dashboard:"
+        log_error "     - Go to: https://supabase.com/dashboard/project/${project_ref}/settings/database"
+        log_error "     - Navigate to Network Restrictions section"
+        log_error "     - Ensure your IP is allowed or temporarily allow 0.0.0.0/0 for testing"
+        log_error "  6. Verify database is accessible (not paused or suspended)"
+        log_error ""
     fi
 
     return $success

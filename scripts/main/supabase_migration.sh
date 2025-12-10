@@ -119,7 +119,10 @@ Options:
   --mode <mode>           Migration mode: full (schema+data) or schema (default: schema)
   --increment             Prefer incremental/delta updates where supported (e.g. data) instead of full replace
   --data                  Include database row data migration (default: disabled)
-  --replace-data          With --data, REPLACE all target table data with source data (destructive). Without this flag, data sync runs in delta/append mode.
+                          Automatically runs in incremental/delta mode to preserve existing target data
+                          and only add new or changed data from source to target
+  --replace-data          With --data, REPLACE all target table data with source data (destructive).
+                          Without this flag, data migration automatically runs in incremental mode.
   --users                 Include authentication users/identities migration (default: disabled; auth users are NOT copied unless this is set)
   --files                 Include storage bucket files migration (default: disabled)
   --secret                Include secrets migration (default: disabled; secrets are NOT migrated unless this is set)
@@ -145,9 +148,9 @@ Default Behavior:
   - Edge Functions: Migrated
   - Secrets: NOT migrated by default (use --secret to add new secret keys incrementally)
 
-  Use --data to include database row migration.
-  Use --data --increment for incremental/delta data sync (append / upsert semantics where possible).
+  Use --data to include database row migration (automatically runs in incremental mode by default).
   Use --data --replace-data for a full data REPLACE (target table data is truncated/replaced by source).
+  Incremental mode preserves existing target data and only adds new/delta data from source.
   Use --files to include storage bucket file migration.
   Use --users to copy auth users/identities so login state matches source.
   Use --secret to migrate secrets (adds new secret keys incrementally; existing secrets in target are never modified or removed).
@@ -227,10 +230,16 @@ parse_args() {
                 ;;
             --data)
                 INCLUDE_DATA=true
+                # Automatically enable incremental mode for data migration by default
+                # This ensures existing target data is preserved and only new/delta data is added
+                # Will be disabled if --replace-data is also specified
+                INCREMENTAL_MODE=true
                 shift
                 ;;
             --replace-data|--force-data-replace)
                 REPLACE_TARGET_DATA=true
+                # Disable incremental mode when replace-data is specified (they are mutually exclusive)
+                INCREMENTAL_MODE=false
                 shift
                 ;;
             --users)
@@ -808,6 +817,16 @@ echo ""
 # Link to target project
 log_info "Linking to target project..."
 if command -v supabase >/dev/null 2>&1; then
+    # Export target access token for Supabase CLI
+    # Construct variable name from TARGET_ENV (e.g., TARGET_ENV=backup -> SUPABASE_BACKUP_ACCESS_TOKEN)
+    TARGET_ENV_UPPER=\$(echo "\$TARGET_ENV" | tr '[:lower:]' '[:upper:]')
+    TARGET_TOKEN_VAR="SUPABASE_\${TARGET_ENV_UPPER}_ACCESS_TOKEN"
+    if [ -n "\${!TARGET_TOKEN_VAR:-}" ]; then
+        export SUPABASE_ACCESS_TOKEN="\${!TARGET_TOKEN_VAR}"
+        log_info "Using access token from \$TARGET_TOKEN_VAR"
+    else
+        log_warning "Access token not found in \$TARGET_TOKEN_VAR - linking may fail if not authenticated"
+    fi
     if supabase link --project-ref "\$TARGET_REF" --password "\$TARGET_PASSWORD" 2>&1 | tee /tmp/supabase_link.log; then
         log_success "Successfully linked to project"
     else
@@ -1556,7 +1575,13 @@ perform_migration() {
         log_info "Migrating database data..."
         local db_migration_args=("$source" "$target" "$migration_dir" "--data")
         
-        if [ "$INCREMENTAL_MODE" = "true" ]; then
+        # Automatically enable incremental mode for data migration unless replace-data is specified
+        # This ensures existing target data is preserved and only new/delta data is added
+        if [ "$REPLACE_TARGET_DATA" != "true" ]; then
+            INCREMENTAL_MODE=true
+            db_migration_args+=("--increment")
+            log_info "Incremental mode enabled: existing target data will be preserved, only new/delta data will be added"
+        elif [ "$INCREMENTAL_MODE" = "true" ]; then
             db_migration_args+=("--increment")
         fi
         if [ "$INCLUDE_USERS" = "true" ]; then
@@ -2119,8 +2144,15 @@ main() {
         exit 1
     fi
     
+    # Automatically enable incremental mode for data migration unless replace-data is specified
+    # This ensures existing target data is preserved and only new/delta data is added
+    if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
+        INCREMENTAL_MODE=true
+    fi
+    
     if [ "$REPLACE_TARGET_DATA" = "true" ] && [ "$INCREMENTAL_MODE" = "true" ]; then
         log_warning "--increment requested but --replace-data also set; replace mode will override incremental data behaviour."
+        INCREMENTAL_MODE=false
     fi
     
     # Load environment using the robust load_env function
