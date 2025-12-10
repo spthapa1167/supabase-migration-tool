@@ -364,56 +364,116 @@ if command -v psql >/dev/null 2>&1; then
                 timeout_prefix="timeout 10 "
             fi
 
-            local cmd="PGPASSWORD=\"$DB_PASSWORD\" PGSSLMODE=require ${timeout_prefix}psql -h \"$host\" -p \"$port\" -U \"$db_user\" -d postgres -c \"SELECT 1;\" >/dev/null 2>&1"
-            if eval "$cmd"; then
+            # Capture error output for better diagnostics
+            local error_output
+            local cmd="PGPASSWORD=\"$DB_PASSWORD\" PGSSLMODE=require ${timeout_prefix}psql -h \"$host\" -p \"$port\" -U \"$db_user\" -d postgres -c \"SELECT 1;\" 2>&1"
+            error_output=$(eval "$cmd" 2>&1)
+            local exit_code=$?
+            
+            if [ $exit_code -eq 0 ]; then
                 return 0
             else
+                # Log error details in verbose mode
+                if [ "$VERBOSE" = "true" ]; then
+                    log_info "    Connection error for $host:$port: $(echo "$error_output" | head -1)"
+                fi
                 return 1
             fi
         }
 
-        pooler_region="${POOLER_REGION:-aws-1-us-east-2}"
+        # Get pooler region/port (function will use defaults if empty)
+        pooler_region="${POOLER_REGION:-}"
         pooler_port="${POOLER_PORT:-6543}"
 
-        if [ "$VERBOSE" = "true" ]; then
-            log_info "  Pooler Region: $pooler_region"
-            log_info "  Pooler Port: $pooler_port"
-        fi
-
-        TESTS_TOTAL=$((TESTS_TOTAL + 1))
-
-        attempts=()
-        while IFS='|' read -r host port user label; do
-            [ -z "$host" ] && continue
-            attempts+=("$host|$port|$user|$label")
-        done < <(get_supabase_connection_endpoints "$PROJECT_REF" "$pooler_region" "$pooler_port")
-
-        if [ ${#attempts[@]} -eq 0 ]; then
-            echo "⚠️  SKIP: Database connectivity test (no connection endpoints available)"
+        # Validate PROJECT_REF is set before proceeding
+        if [ -z "$PROJECT_REF" ] || [ "$PROJECT_REF" = "" ]; then
+            echo "⚠️  SKIP: Database connectivity test (project reference not configured)"
+            log_warning "  PROJECT_REF is empty - cannot generate connection endpoints"
             TESTS_TOTAL=$((TESTS_TOTAL - 1))
-            continue
-        fi
-
-        success=false
-        failure_messages=()
-
-        for attempt in "${attempts[@]}"; do
-            IFS='|' read -r host port db_user label <<< "$attempt"
-            if run_db_connection_attempt "$host" "$port" "$db_user"; then
-                TESTS_PASSED=$((TESTS_PASSED + 1))
-                echo "✅ PASS: Database connectivity (${label})"
-                success=true
-                break
-            else
-                failure_messages+=("❌ FAIL: Database connectivity (${label})")
+        else
+            if [ "$VERBOSE" = "true" ]; then
+                log_info "  Pooler Region: ${pooler_region:-(using default: aws-1-us-east-2)}"
+                log_info "  Pooler Port: $pooler_port"
+                log_info "  Project Ref: $PROJECT_REF"
             fi
-        done
 
-        if ! $success; then
-            TESTS_FAILED=$((TESTS_FAILED + 1))
-            printf '%s\n' "${failure_messages[@]}"
+            # Warn if pooler region is not set (optional but recommended)
+            if [ -z "$POOLER_REGION" ] || [ "$POOLER_REGION" = "" ]; then
+                if [ "$VERBOSE" = "true" ]; then
+                    log_info "  Note: SUPABASE_${ENV_PREFIX}_POOLER_REGION not set, using default"
+                    log_info "    You can set this in .env.local for more accurate connections"
+                fi
+            fi
+
+            TESTS_TOTAL=$((TESTS_TOTAL + 1))
+
+            attempts=()
+            # Capture output from function, handling any potential errors
+            set +e  # Temporarily disable exit on error for this section
+            # Test the function call first to ensure it works
+            test_output=$(get_supabase_connection_endpoints "$PROJECT_REF" "$pooler_region" "$pooler_port" 2>&1)
+            func_exit_code=$?
+            set -e  # Re-enable exit on error
+            
+            if [ ${func_exit_code:-1} -ne 0 ] || [ -z "$test_output" ]; then
+                log_warning "  Function get_supabase_connection_endpoints returned no output or failed"
+                if [ "$VERBOSE" = "true" ]; then
+                    log_info "  Function exit code: $func_exit_code"
+                    log_info "  Output: $test_output"
+                fi
+            else
+                # Parse the output
+                while IFS='|' read -r host port user label; do
+                    [ -z "$host" ] && continue
+                    attempts+=("$host|$port|$user|$label")
+                done <<< "$test_output"
+            fi
+            
+            # Debug output if verbose
+            if [ "$VERBOSE" = "true" ]; then
+                log_info "  Generated ${#attempts[@]} connection endpoint(s)"
+                for attempt in "${attempts[@]}"; do
+                    IFS='|' read -r host port user label <<< "$attempt"
+                    log_info "    - $label: $host:$port"
+                done
+            fi
+
+            if [ ${#attempts[@]} -eq 0 ]; then
+                echo "⚠️  SKIP: Database connectivity test (no connection endpoints available)"
+                log_warning "  Unable to generate connection endpoints for project: $PROJECT_REF"
+                log_info "  Tip: Set SUPABASE_${ENV_PREFIX}_POOLER_REGION in .env.local if using a custom region"
+                TESTS_TOTAL=$((TESTS_TOTAL - 1))
+                # No continue needed - just let execution fall through
+            else
+                success=false
+                failure_messages=()
+
+                for attempt in "${attempts[@]}"; do
+                    IFS='|' read -r host port db_user label <<< "$attempt"
+                    if run_db_connection_attempt "$host" "$port" "$db_user"; then
+                        TESTS_PASSED=$((TESTS_PASSED + 1))
+                        echo "✅ PASS: Database connectivity (${label})"
+                        success=true
+                        break
+                    else
+                        failure_messages+=("❌ FAIL: Database connectivity (${label})")
+                    fi
+                done
+
+                if ! $success; then
+                    TESTS_FAILED=$((TESTS_FAILED + 1))
+                    printf '%s\n' "${failure_messages[@]}"
+                    log_warning "  Database connectivity failed for all connection attempts"
+                    log_info "  Common causes:"
+                    log_info "    - Incorrect database password (check SUPABASE_${ENV_PREFIX}_DB_PASSWORD)"
+                    log_info "    - Network restrictions (check Supabase Dashboard → Settings → Database → Network Restrictions)"
+                    log_info "    - Wrong pooler region (current: ${pooler_region:-aws-1-us-east-2})"
+                    log_info "    - Database is paused or suspended"
+                    log_info "  Tip: Run with --verbose to see detailed error messages"
+                fi
+                unset attempts failure_messages success
+            fi
         fi
-        unset attempts failure_messages success
     else
         echo "⚠️  SKIP: Database connectivity test (project reference not configured)"
     fi
