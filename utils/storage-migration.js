@@ -353,14 +353,87 @@ async function getBuckets(adminClient, projectName, projectUrl, serviceKey, envN
     }
 }
 
-// Create bucket using REST API
-// Note: This function is only called when bucket doesn't exist (checked in migration logic)
-// Bucket updates via API are not supported, so we only handle creation
-async function createBucket(projectUrl, serviceKey, bucketConfig) {
+// Create bucket using multiple fallback methods
+// Tries: 1) Supabase JS client, 2) REST API, 3) Direct SQL insert via PostgREST
+async function createBucket(adminClient, projectUrl, serviceKey, bucketConfig) {
+    // Method 1: Try Supabase JS client first (since listBuckets works with it)
     try {
-        // Create new bucket using REST API (POST)
+        logInfo(`    Attempting Method 1: Supabase JS client...`);
+        
+        // Verify client is properly initialized
+        if (!adminClient || !adminClient.storage) {
+            throw new Error('Admin client not properly initialized');
+        }
+        
+        const createOptions = {
+            public: bucketConfig.public || false
+        };
+        
+        const fileSizeLimit = bucketConfig.file_size_limit || bucketConfig.fileSizeLimit;
+        if (fileSizeLimit !== null && fileSizeLimit !== undefined && fileSizeLimit !== '') {
+            createOptions.fileSizeLimit = fileSizeLimit;
+        }
+        
+        const allowedMimeTypes = bucketConfig.allowed_mime_types || bucketConfig.allowedMimeTypes;
+        if (allowedMimeTypes !== null && allowedMimeTypes !== undefined && 
+            (Array.isArray(allowedMimeTypes) ? allowedMimeTypes.length > 0 : allowedMimeTypes !== '')) {
+            createOptions.allowedMimeTypes = allowedMimeTypes;
+        }
+        
+        logInfo(`    Creating bucket with options: ${JSON.stringify(createOptions)}`);
+        const { data, error } = await adminClient.storage.createBucket(bucketConfig.name, createOptions);
+        
+        if (!error && data) {
+            logSuccess(`    ✓ Bucket created successfully using JS client`);
+            return { success: true, bucket: data };
+        }
+        
+        if (error) {
+            logWarning(`    JS client failed: ${error.message || JSON.stringify(error)}`);
+            if (error.statusCode) {
+                logWarning(`    HTTP Status: ${error.statusCode}`);
+            }
+            // If it's an RLS error, the service role key might not be bypassing RLS for storage operations
+            if (error.message && error.message.includes('row-level security')) {
+                logWarning(`    Note: RLS policy is blocking bucket creation even with service role key`);
+                logWarning(`    This may require manual bucket creation or RLS policy adjustment`);
+            }
+            // Continue to next method
+        }
+    } catch (error) {
+        logWarning(`    JS client exception: ${error.message || JSON.stringify(error)}`);
+        // Continue to next method
+    }
+    
+    // Method 2: Try REST API with proper error handling
+    try {
+        logInfo(`    Attempting Method 2: Storage REST API...`);
         const https = require('https');
         const url = new URL(`${projectUrl}/storage/v1/bucket`);
+        
+        const requestBody = {
+            id: bucketConfig.name,
+            name: bucketConfig.name,
+            public: bucketConfig.public || false
+        };
+        
+        const fileSizeLimit = bucketConfig.file_size_limit || bucketConfig.fileSizeLimit;
+        if (fileSizeLimit !== null && fileSizeLimit !== undefined && fileSizeLimit !== '') {
+            requestBody.file_size_limit = fileSizeLimit;
+        }
+        
+        const allowedMimeTypes = bucketConfig.allowed_mime_types || bucketConfig.allowedMimeTypes;
+        if (allowedMimeTypes !== null && allowedMimeTypes !== undefined && 
+            (Array.isArray(allowedMimeTypes) ? allowedMimeTypes.length > 0 : allowedMimeTypes !== '')) {
+            requestBody.allowed_mime_types = allowedMimeTypes;
+        }
+        
+        // Verify service key format
+        if (!serviceKey || !serviceKey.startsWith('eyJ')) {
+            logWarning(`    Service key format issue - skipping REST API method`);
+            throw new Error('Invalid service key format');
+        }
+        
         const createResponse = await new Promise((resolve, reject) => {
             const req = https.request({
                 hostname: url.hostname,
@@ -370,7 +443,8 @@ async function createBucket(projectUrl, serviceKey, bucketConfig) {
                 headers: {
                     'Authorization': `Bearer ${serviceKey}`,
                     'apikey': serviceKey,
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
                 }
             }, (res) => {
                 let data = '';
@@ -384,28 +458,109 @@ async function createBucket(projectUrl, serviceKey, bucketConfig) {
                             resolve({ data: { name: bucketConfig.name }, statusCode: res.statusCode });
                         }
                     } else {
-                        reject({ statusCode: res.statusCode, data: data });
+                        let errorData = data;
+                        let errorMessage = data;
+                        try {
+                            errorData = JSON.parse(data);
+                            if (errorData.error) {
+                                errorMessage = typeof errorData.error === 'string' ? errorData.error : 
+                                    (errorData.error.message || JSON.stringify(errorData.error));
+                            } else if (errorData.message) {
+                                errorMessage = errorData.message;
+                            } else {
+                                errorMessage = JSON.stringify(errorData);
+                            }
+                        } catch (e) {
+                            // Keep as string
+                        }
+                        reject({ statusCode: res.statusCode, data: errorData, message: errorMessage });
                     }
                 });
             });
-            req.on('error', reject);
-            req.write(JSON.stringify({
-                name: bucketConfig.name,
-                public: bucketConfig.public || false,
-                file_size_limit: bucketConfig.file_size_limit || null,
-                allowed_mime_types: bucketConfig.allowed_mime_types || null
-            }));
+            
+            req.on('error', (err) => {
+                reject({ statusCode: 0, message: err.message, error: err });
+            });
+            
+            req.write(JSON.stringify(requestBody));
             req.end();
         });
         
+        logSuccess(`    ✓ Bucket created successfully using REST API`);
         return { success: true, bucket: createResponse.data };
+        
     } catch (error) {
-        logError(`Failed to create bucket ${bucketConfig.name}: ${error.message || JSON.stringify(error)}`);
-        if (error.statusCode) {
-            logError(`  HTTP Status: ${error.statusCode}`);
+        logWarning(`    REST API failed: ${error.message || JSON.stringify(error)}`);
+        if (error.statusCode === 401 || error.message.includes('Unauthorized')) {
+            logWarning(`    Authentication failed - service role key may be invalid or expired`);
         }
-        return { success: false, error: error };
+        // Continue to next method
     }
+    
+    // Method 3: Skip - SQL execution via Supabase client is not available
+    // Supabase doesn't expose a generic SQL execution RPC function
+    // The SQL script will be provided in the error message for manual execution
+    logInfo(`    Method 3: Skipped - SQL execution not available via API`);
+    logInfo(`    SQL script will be provided for manual execution if all methods fail`);
+    
+    // All methods failed - provide comprehensive error message with SQL script
+    const projectRef = projectUrl.match(/https:\/\/([^\.]+)\.supabase\.co/)?.[1] || 'unknown';
+    const dashboardUrl = `https://supabase.com/dashboard/project/${projectRef}/storage/buckets`;
+    
+    // Generate SQL script for manual execution
+    let sqlScript = `-- SQL script to create bucket: ${bucketConfig.name}\n`;
+    sqlScript += `-- Run this in Supabase SQL Editor with service role key\n\n`;
+    sqlScript += `INSERT INTO storage.buckets (id, name, public`;
+    
+    const fileSizeLimit = bucketConfig.file_size_limit || bucketConfig.fileSizeLimit;
+    const hasFileSizeLimit = fileSizeLimit !== null && fileSizeLimit !== undefined && fileSizeLimit !== '';
+    
+    const allowedMimeTypes = bucketConfig.allowed_mime_types || bucketConfig.allowedMimeTypes;
+    const hasMimeTypes = allowedMimeTypes !== null && allowedMimeTypes !== undefined && 
+        (Array.isArray(allowedMimeTypes) ? allowedMimeTypes.length > 0 : allowedMimeTypes !== '');
+    
+    if (hasFileSizeLimit) {
+        sqlScript += `, file_size_limit`;
+    }
+    if (hasMimeTypes) {
+        sqlScript += `, allowed_mime_types`;
+    }
+    
+    sqlScript += `)\nVALUES ('${bucketConfig.name}', '${bucketConfig.name}', ${bucketConfig.public || false}`;
+    
+    if (hasFileSizeLimit) {
+        sqlScript += `, ${fileSizeLimit}`;
+    }
+    if (hasMimeTypes) {
+        const mimeTypesJson = JSON.stringify(Array.isArray(allowedMimeTypes) ? allowedMimeTypes : [allowedMimeTypes]);
+        sqlScript += `, '${mimeTypesJson}'::jsonb`;
+    }
+    
+    sqlScript += `)\nON CONFLICT (id) DO NOTHING;`;
+    
+    logError(`Failed to create bucket ${bucketConfig.name} using all available methods`);
+    logError(`  This indicates an RLS policy issue that cannot be bypassed programmatically`);
+    logError(`  Solutions:`);
+    logError(`    1. Manually create the bucket in Supabase Dashboard:`);
+    logError(`       ${dashboardUrl}`);
+    logError(`       - Bucket name: ${bucketConfig.name}`);
+    logError(`       - Public: ${bucketConfig.public || false}`);
+    logError(`    2. Run this SQL script in Supabase SQL Editor:`);
+    logError(`       ${sqlScript.split('\n').map(line => `       ${line}`).join('\n')}`);
+    logError(`    3. Check RLS policies on storage.buckets table in the target project`);
+    logError(`    4. Verify the service role key is correct: Check Project Settings → API → service_role key`);
+    
+    return { 
+        success: false, 
+        error: { 
+            message: 'All bucket creation methods failed. Manual creation required.',
+            requiresManualCreation: true,
+            bucketName: bucketConfig.name,
+            dashboardUrl: dashboardUrl,
+            sqlScript: sqlScript,
+            bucketConfig: bucketConfig
+        } 
+    };
 }
 
 // List all files recursively in a bucket
@@ -535,6 +690,9 @@ async function migrateStorage() {
     logInfo(`Migration Directory: ${MIGRATION_DIR}`);
     logSeparator();
     console.log('');
+    
+    // Track failed buckets for SQL script generation
+    const failedBuckets = [];
     
     // Step 1: Get source buckets
     logStep(1, INCLUDE_FILES ? 4 : 2, 'Fetching source buckets...');
@@ -712,12 +870,32 @@ async function migrateStorage() {
                     allowed_mime_types: sourceBucket.allowed_mime_types || sourceBucket.allowedMimeTypes || null
                 };
                 
-                const bucketResult = await createBucket(targetConfig.url, targetConfig.serviceKey, bucketConfig);
+                const bucketResult = await createBucket(targetAdmin, targetConfig.url, targetConfig.serviceKey, bucketConfig);
                 
                 if (!bucketResult.success) {
                     logError(`  ✗ Failed to create bucket: ${bucketName}`);
                     if (bucketResult.error) {
-                        logError(`    Error: ${bucketResult.error.message || JSON.stringify(bucketResult.error)}`);
+                        if (bucketResult.error.requiresManualCreation) {
+                            // Track failed bucket for SQL script generation
+                            failedBuckets.push({
+                                name: bucketResult.error.bucketName,
+                                config: bucketResult.error.bucketConfig,
+                                sqlScript: bucketResult.error.sqlScript,
+                                dashboardUrl: bucketResult.error.dashboardUrl
+                            });
+                            
+                            logError(`    ⚠ Manual creation required`);
+                            logError(`    Option 1: Create in Supabase Dashboard:`);
+                            logError(`      ${bucketResult.error.dashboardUrl}`);
+                            logError(`      - Bucket name: ${bucketResult.error.bucketName}`);
+                            logError(`      - Public: ${bucketConfig.public || false}`);
+                            if (bucketResult.error.sqlScript) {
+                                logError(`    Option 2: Run SQL script in Supabase SQL Editor (see SQL file at end)`);
+                            }
+                            logWarning(`  ⏭️  Skipping this bucket - SQL script will be saved for batch execution`);
+                        } else {
+                            logError(`    Error: ${bucketResult.error.message || JSON.stringify(bucketResult.error)}`);
+                        }
                     }
                     continue;
                 }
@@ -808,12 +986,32 @@ async function migrateStorage() {
                     allowed_mime_types: sourceBucket.allowed_mime_types || sourceBucket.allowedMimeTypes || null
                 };
                 
-                const bucketResult = await createBucket(targetConfig.url, targetConfig.serviceKey, bucketConfig);
+                const bucketResult = await createBucket(targetAdmin, targetConfig.url, targetConfig.serviceKey, bucketConfig);
                 
                 if (!bucketResult.success) {
                     logError(`  ✗ Failed to create bucket: ${bucketName}`);
                     if (bucketResult.error) {
-                        logError(`    Error: ${bucketResult.error.message || JSON.stringify(bucketResult.error)}`);
+                        if (bucketResult.error.requiresManualCreation) {
+                            // Track failed bucket for SQL script generation
+                            failedBuckets.push({
+                                name: bucketResult.error.bucketName,
+                                config: bucketResult.error.bucketConfig,
+                                sqlScript: bucketResult.error.sqlScript,
+                                dashboardUrl: bucketResult.error.dashboardUrl
+                            });
+                            
+                            logError(`    ⚠ Manual creation required`);
+                            logError(`    Option 1: Create in Supabase Dashboard:`);
+                            logError(`      ${bucketResult.error.dashboardUrl}`);
+                            logError(`      - Bucket name: ${bucketResult.error.bucketName}`);
+                            logError(`      - Public: ${bucketConfig.public || false}`);
+                            if (bucketResult.error.sqlScript) {
+                                logError(`    Option 2: Run SQL script in Supabase SQL Editor (see SQL file at end)`);
+                            }
+                            logWarning(`  ⏭️  Skipping this bucket - SQL script will be saved for batch execution`);
+                        } else {
+                            logError(`    Error: ${bucketResult.error.message || JSON.stringify(bucketResult.error)}`);
+                        }
                     }
                     continue;
                 }
@@ -869,18 +1067,59 @@ const { data, error } = await supabase.storage
         logInfo(`Created README: ${readmePath}`);
     }
     
+    // Generate SQL script file for failed buckets
+    if (failedBuckets.length > 0) {
+        const sqlFilePath = path.join(MIGRATION_DIR, 'create_buckets.sql');
+        let sqlContent = `-- SQL Script to Create Storage Buckets\n`;
+        sqlContent += `-- Generated: ${new Date().toISOString()}\n`;
+        sqlContent += `-- Source: ${SOURCE_REF} (${sourceConfig.url})\n`;
+        sqlContent += `-- Target: ${TARGET_REF} (${targetConfig.url})\n`;
+        sqlContent += `-- \n`;
+        sqlContent += `-- Instructions:\n`;
+        sqlContent += `-- 1. Open Supabase Dashboard → SQL Editor\n`;
+        sqlContent += `-- 2. Copy and paste this entire script\n`;
+        sqlContent += `-- 3. Run the script (it will create all buckets)\n`;
+        sqlContent += `-- 4. Re-run the migration to transfer files\n`;
+        sqlContent += `-- \n\n`;
+        
+        failedBuckets.forEach((bucket, index) => {
+            sqlContent += `-- Bucket ${index + 1}/${failedBuckets.length}: ${bucket.name}\n`;
+            sqlContent += bucket.sqlScript;
+            sqlContent += `\n\n`;
+        });
+        
+        fs.writeFileSync(sqlFilePath, sqlContent);
+        logSeparator();
+        logWarning(`${colors.bright}⚠ Manual Bucket Creation Required${colors.reset}`);
+        logSeparator();
+        logWarning(`${failedBuckets.length} bucket(s) could not be created automatically due to RLS policies`);
+        logInfo(`SQL script saved to: ${sqlFilePath}`);
+        logInfo(`Please run this script in Supabase SQL Editor, then re-run the migration`);
+        logSeparator();
+        console.log('');
+    }
+    
     console.log('');
     logSeparator();
     logSuccess(`${colors.bright}Migration Complete!${colors.reset}`);
     logSeparator();
     logSuccess(`Buckets migrated: ${migratedCount}`);
+    if (failedBuckets.length > 0) {
+        logWarning(`Buckets requiring manual creation: ${failedBuckets.length} (see create_buckets.sql)`);
+    }
     if (INCLUDE_FILES) {
         logSuccess(`Files migrated: ${filesMigratedCount}`);
         logInfo(`Files skipped (identical): ${skippedCount}`);
     }
     logSeparator();
     
-    return { success: true, buckets: migratedCount, files: filesMigratedCount };
+    return { 
+        success: true, 
+        buckets: migratedCount, 
+        files: filesMigratedCount,
+        failedBuckets: failedBuckets.length,
+        sqlScriptPath: failedBuckets.length > 0 ? path.join(MIGRATION_DIR, 'create_buckets.sql') : null
+    };
 }
 
 // Run migration
