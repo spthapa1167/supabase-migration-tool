@@ -1533,6 +1533,394 @@ fi
 
 supabase unlink --yes 2>/dev/null || true
 
+# Step 5: Verify and retry policies/roles if needed
+if [ "$RESTORE_SUCCESS" = "true" ]; then
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Step 5: Verifying Policies and Roles"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info ""
+    
+    log_info "Verifying RLS policies and roles migration..."
+    log_to_file "$LOG_FILE" "Verifying RLS policies and roles migration"
+    
+    # Function to count policies in a database
+    count_policies() {
+        local ref=$1
+        local password=$2
+        local pooler_region=$3
+        local pooler_port=$4
+        
+        local query="SELECT COUNT(*) FROM pg_policies WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND schemaname NOT LIKE 'pg_toast%';"
+        run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" 2>/dev/null | tr -d '[:space:]' || echo "0"
+    }
+    
+    # Function to count roles in a database (excluding system roles)
+    count_roles() {
+        local ref=$1
+        local password=$2
+        local pooler_region=$3
+        local pooler_port=$4
+        
+        local query="SELECT COUNT(*) FROM pg_roles WHERE rolname NOT IN ('postgres', 'pg_database_owner', 'pg_read_all_data', 'pg_write_all_data', 'pg_monitor', 'pg_read_all_settings', 'pg_read_all_stats', 'pg_stat_scan_tables', 'pg_read_server_files', 'pg_write_server_files', 'pg_execute_server_program', 'pg_signal_backend', 'pg_checkpoint', 'pg_use_reserved_connections', 'pg_create_subscription', 'pg_replication', 'authenticator', 'anon', 'authenticated', 'service_role', 'supabase_admin', 'supabase_auth_admin', 'supabase_storage_admin', 'supabase_functions_admin', 'supabase_realtime_admin', 'supabase_replication_admin', 'supabase_read_only_user', 'dashboard_user') AND rolname NOT LIKE 'pg_%' AND rolname NOT LIKE 'rds_%';"
+        run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" 2>/dev/null | tr -d '[:space:]' || echo "0"
+    }
+    
+    # Get policy and role counts from source
+    log_info "Counting policies and roles in source database..."
+    SOURCE_POLICY_COUNT=$(count_policies "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
+    SOURCE_ROLE_COUNT=$(count_roles "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
+    
+    log_info "  Source policies: $SOURCE_POLICY_COUNT"
+    log_info "  Source roles: $SOURCE_ROLE_COUNT"
+    log_to_file "$LOG_FILE" "Source policies: $SOURCE_POLICY_COUNT, Source roles: $SOURCE_ROLE_COUNT"
+    
+    # Get policy and role counts from target
+    log_info "Counting policies and roles in target database..."
+    TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    TARGET_ROLE_COUNT=$(count_roles "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    
+    log_info "  Target policies: $TARGET_POLICY_COUNT"
+    log_info "  Target roles: $TARGET_ROLE_COUNT"
+    log_to_file "$LOG_FILE" "Target policies: $TARGET_POLICY_COUNT, Target roles: $TARGET_ROLE_COUNT"
+    
+    # Check if policies match
+    POLICY_MISMATCH=false
+    ROLE_MISMATCH=false
+    
+    if [ "$SOURCE_POLICY_COUNT" != "$TARGET_POLICY_COUNT" ]; then
+        POLICY_MISMATCH=true
+        POLICY_DIFF=$((SOURCE_POLICY_COUNT - TARGET_POLICY_COUNT))
+        if [ "$POLICY_DIFF" -gt 0 ]; then
+            log_warning "⚠ Policy count mismatch: Target has $POLICY_DIFF fewer policy(ies) than source"
+            log_warning "  Source: $SOURCE_POLICY_COUNT policies, Target: $TARGET_POLICY_COUNT policies"
+            log_to_file "$LOG_FILE" "WARNING: Policy count mismatch - $POLICY_DIFF policies missing"
+        else
+            log_warning "⚠ Policy count mismatch: Target has $((POLICY_DIFF * -1)) more policy(ies) than source"
+            log_to_file "$LOG_FILE" "WARNING: Policy count mismatch - target has more policies than source"
+        fi
+    else
+        log_success "✓ Policy counts match: $TARGET_POLICY_COUNT policies"
+    fi
+    
+    if [ "$SOURCE_ROLE_COUNT" != "$TARGET_ROLE_COUNT" ]; then
+        ROLE_MISMATCH=true
+        ROLE_DIFF=$((SOURCE_ROLE_COUNT - TARGET_ROLE_COUNT))
+        if [ "$ROLE_DIFF" -gt 0 ]; then
+            log_warning "⚠ Role count mismatch: Target has $ROLE_DIFF fewer role(s) than source"
+            log_warning "  Source: $SOURCE_ROLE_COUNT roles, Target: $TARGET_ROLE_COUNT roles"
+            log_to_file "$LOG_FILE" "WARNING: Role count mismatch - $ROLE_DIFF roles missing"
+        else
+            log_warning "⚠ Role count mismatch: Target has $((ROLE_DIFF * -1)) more role(s) than source"
+            log_to_file "$LOG_FILE" "WARNING: Role count mismatch - target has more roles than source"
+        fi
+    else
+        log_success "✓ Role counts match: $TARGET_ROLE_COUNT roles"
+    fi
+    
+    ###########################################################################
+    # Detailed gap analysis: compare policies and tables by name, not just count
+    ###########################################################################
+    log_info "Performing detailed comparison of policies, tables, and RLS settings..."
+    log_to_file "$LOG_FILE" "Performing detailed comparison of policies and tables"
+
+    # Function to get policy list with table names (schemaname.tablename|policyname)
+    get_policy_list() {
+        local ref=$1
+        local password=$2
+        local pooler_region=$3
+        local pooler_port=$4
+
+        local query="SELECT schemaname || '.' || tablename || '|' || policyname FROM pg_policies WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND schemaname NOT LIKE 'pg_toast%' ORDER BY schemaname, tablename, policyname;"
+        run_psql_query_with_fallback \"$ref\" \"$password\" \"$pooler_region\" \"$pooler_port\" \"$query\" 2>/dev/null || echo \"\"
+    }
+
+    # Function to get tables with RLS enabled
+    get_rls_enabled_tables() {
+        local ref=$1
+        local password=$2
+        local pooler_region=$3
+        local pooler_port=$4
+
+        local query=\"SELECT schemaname || '.' || tablename FROM pg_tables t JOIN pg_class c ON c.relname = t.tablename JOIN pg_namespace n ON n.nspname = t.schemaname AND n.oid = c.relnamespace WHERE t.schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND t.schemaname NOT LIKE 'pg_toast%' AND c.relrowsecurity = true ORDER BY schemaname, tablename;\"
+        run_psql_query_with_fallback \"$ref\" \"$password\" \"$pooler_region\" \"$pooler_port\" \"$query\" 2>/dev/null || echo \"\"
+    }
+
+    # Function to get all tables
+    get_table_list() {
+        local ref=$1
+        local password=$2
+        local pooler_region=$3
+        local pooler_port=$4
+
+        local query=\"SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND schemaname NOT LIKE 'pg_toast%' ORDER BY schemaname, tablename;\"
+        run_psql_query_with_fallback \"$ref\" \"$password\" \"$pooler_region\" \"$pooler_port\" \"$query\" 2>/dev/null || echo \"\"
+    }
+
+    # Get detailed lists from source and target
+    log_info \"Getting detailed policy and table lists from source...\"
+    SOURCE_POLICY_LIST=$(get_policy_list \"$SOURCE_REF\" \"$SOURCE_PASSWORD\" \"$SOURCE_POOLER_REGION\" \"$SOURCE_POOLER_PORT\")
+    SOURCE_RLS_TABLES=$(get_rls_enabled_tables \"$SOURCE_REF\" \"$SOURCE_PASSWORD\" \"$SOURCE_POOLER_REGION\" \"$SOURCE_POOLER_PORT\")
+    SOURCE_TABLE_LIST=$(get_table_list \"$SOURCE_REF\" \"$SOURCE_PASSWORD\" \"$SOURCE_POOLER_REGION\" \"$SOURCE_POOLER_PORT\")
+
+    log_info \"Getting detailed policy and table lists from target...\"
+    TARGET_POLICY_LIST=$(get_policy_list \"$TARGET_REF\" \"$TARGET_PASSWORD\" \"$TARGET_POOLER_REGION\" \"$TARGET_POOLER_PORT\")
+    TARGET_RLS_TABLES=$(get_rls_enabled_tables \"$TARGET_REF\" \"$TARGET_PASSWORD\" \"$TARGET_POOLER_REGION\" \"$TARGET_POOLER_PORT\")
+    TARGET_TABLE_LIST=$(get_table_list \"$TARGET_REF\" \"$TARGET_PASSWORD\" \"$TARGET_POOLER_REGION\" \"$TARGET_POOLER_PORT\")
+
+    # Find missing policies (by name and table)
+    MISSING_POLICIES=\"\"
+    while IFS='|' read -r table_policy; do
+        [ -z \"$table_policy\" ] && continue
+        if ! echo \"$TARGET_POLICY_LIST\" | grep -Fxq \"$table_policy\"; then
+            MISSING_POLICIES=\"${MISSING_POLICIES}${MISSING_POLICIES:+$'\\n'}$table_policy\"
+        fi
+    done <<< \"$SOURCE_POLICY_LIST\"
+
+    # Find missing RLS-enabled tables
+    MISSING_RLS_TABLES=\"\"
+    while IFS= read -r table; do
+        [ -z \"$table\" ] && continue
+        if ! echo \"$TARGET_RLS_TABLES\" | grep -Fxq \"$table\"; then
+            MISSING_RLS_TABLES=\"${MISSING_RLS_TABLES}${MISSING_RLS_TABLES:+$'\\n'}$table\"
+        fi
+    done <<< \"$SOURCE_RLS_TABLES\"
+
+    # Find missing tables
+    MISSING_TABLES=\"\"
+    while IFS= read -r table; do
+        [ -z \"$table\" ] && continue
+        if ! echo \"$TARGET_TABLE_LIST\" | grep -Fxq \"$table\"; then
+            MISSING_TABLES=\"${MISSING_TABLES}${MISSING_TABLES:+$'\\n'}$table\"
+        fi
+    done <<< \"$SOURCE_TABLE_LIST\"
+
+    # Report gaps
+    if [ -n \"$MISSING_POLICIES\" ]; then
+        MISSING_POLICY_COUNT=$(echo \"$MISSING_POLICIES\" | grep -c . || echo \"0\")
+        POLICY_MISMATCH=true
+        log_warning \"⚠ Found $MISSING_POLICY_COUNT missing policy(ies) by name!\"
+        log_warning \"  Missing policies:\"
+        echo \"$MISSING_POLICIES\" | while IFS='|' read -r table_name policy_name; do
+            log_warning \"    - Table: $table_name, Policy: $policy_name\"
+        done
+        log_to_file \"$LOG_FILE\" \"WARNING: $MISSING_POLICY_COUNT policies missing by name\"
+
+        MISSING_POLICIES_FILE=\"$MIGRATION_DIR/missing_policies.txt\"
+        echo \"$MISSING_POLICIES\" > \"$MISSING_POLICIES_FILE\"
+        log_info \"  Missing policies saved to: $MISSING_POLICIES_FILE\"
+    fi
+
+    if [ -n \"$MISSING_RLS_TABLES\" ]; then
+        MISSING_RLS_COUNT=$(echo \"$MISSING_RLS_TABLES\" | grep -c . || echo \"0\")
+        log_warning \"⚠ Found $MISSING_RLS_COUNT table(s) missing RLS enabled!\"
+        log_warning \"  Tables missing RLS:\"
+        echo \"$MISSING_RLS_TABLES\" | while read -r table; do
+            log_warning \"    - $table\"
+        done
+        log_to_file \"$LOG_FILE\" \"WARNING: $MISSING_RLS_COUNT tables missing RLS\"
+
+        MISSING_RLS_FILE=\"$MIGRATION_DIR/missing_rls_tables.txt\"
+        echo \"$MISSING_RLS_TABLES\" > \"$MISSING_RLS_FILE\"
+        log_info \"  Missing RLS tables saved to: $MISSING_RLS_FILE\"
+    fi
+
+    if [ -n \"$MISSING_TABLES\" ]; then
+        MISSING_TABLE_COUNT=$(echo \"$MISSING_TABLES\" | grep -c . || echo \"0\")
+        log_warning \"⚠ Found $MISSING_TABLE_COUNT missing table(s)!\"
+        log_warning \"  Missing tables:\"
+        echo \"$MISSING_TABLES\" | while read -r table; do
+            log_warning \"    - $table\"
+        done
+        log_to_file \"$LOG_FILE\" \"WARNING: $MISSING_TABLE_COUNT tables missing\"
+
+        MISSING_TABLES_FILE=\"$MIGRATION_DIR/missing_tables.txt\"
+        echo \"$MISSING_TABLES\" > \"$MISSING_TABLES_FILE\"
+        log_info \"  Missing tables saved to: $MISSING_TABLES_FILE\"
+    fi
+
+    # If gaps found, trigger retry logic even if counts matched
+    if [ -n \"$MISSING_POLICIES\" ] || [ -n \"$MISSING_RLS_TABLES\" ] || [ -n \"$MISSING_TABLES\" ]; then
+        POLICY_MISMATCH=true
+        log_warning \"⚠ Gaps detected - will attempt to fix even though counts matched\"
+    fi
+
+    if [ -z \"$MISSING_POLICIES\" ] && [ -z \"$MISSING_RLS_TABLES\" ] && [ -z \"$MISSING_TABLES\" ]; then
+        log_success \"✓ All policies, RLS settings, and tables match by name\"
+    fi
+    
+    # If there's a mismatch, try to extract and re-apply policies/roles
+    if [ "$POLICY_MISMATCH" = "true" ] || [ "$ROLE_MISMATCH" = "true" ]; then
+        log_info "Attempting to fix policy/role mismatches by re-applying from source..."
+        log_to_file "$LOG_FILE" "Attempting to fix policy/role mismatches"
+        
+        # Extract policies and roles from source dump (if available) or create new dump
+        if [ -f "$DUMP_FILE" ] && [ -s "$DUMP_FILE" ]; then
+            log_info "Extracting policies and roles from existing source dump..."
+            POLICIES_ROLES_SQL="$MIGRATION_DIR/policies_roles_fix.sql"
+            
+            # Convert dump to SQL and extract policies/roles
+            if pg_restore -f "$POLICIES_ROLES_SQL" --schema-only "$DUMP_FILE" 2>/dev/null; then
+                # Extract CREATE POLICY statements
+                POLICY_SQL="$MIGRATION_DIR/policies_only_fix.sql"
+                {
+                    grep -E "^CREATE POLICY|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY|^ALTER TABLE.*DISABLE ROW LEVEL SECURITY" "$POLICIES_ROLES_SQL" 2>/dev/null || true
+                    # Also extract multi-line policies using awk
+                    awk '/^CREATE POLICY/,/;/ {print}' "$POLICIES_ROLES_SQL" 2>/dev/null || true
+                } | sort -u > "$POLICY_SQL" 2>/dev/null || true
+                
+                # Extract CREATE ROLE and GRANT statements
+                ROLE_SQL="$MIGRATION_DIR/roles_only_fix.sql"
+                {
+                    grep -E "^CREATE ROLE|^ALTER ROLE|^GRANT|^REVOKE" "$POLICIES_ROLES_SQL" 2>/dev/null || true
+                    # Also extract multi-line role statements
+                    awk '/^CREATE ROLE/,/;/ {print}' "$POLICIES_ROLES_SQL" 2>/dev/null || true
+                    awk '/^GRANT/,/;/ {print}' "$POLICIES_ROLES_SQL" 2>/dev/null || true
+                } | sort -u > "$ROLE_SQL" 2>/dev/null || true
+                
+                # Apply policies with retry logic
+                if [ -f "$POLICY_SQL" ] && [ -s "$POLICY_SQL" ]; then
+                    POLICY_COUNT_IN_FILE=$(grep -c "^CREATE POLICY" "$POLICY_SQL" 2>/dev/null || echo "0")
+                    log_info "Found $POLICY_COUNT_IN_FILE policy definition(s) to re-apply..."
+                    
+                    MAX_RETRIES=3
+                    RETRY_COUNT=0
+                    POLICY_APPLY_SUCCESS=false
+                    
+                    while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$POLICY_APPLY_SUCCESS" != "true" ]; do
+                        RETRY_COUNT=$((RETRY_COUNT + 1))
+                        log_info "Attempting to apply policies (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+                        
+                        # Apply policies with error handling
+                        if run_psql_script_with_fallback "Policy re-application (attempt $RETRY_COUNT)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$POLICY_SQL"; then
+                            # Verify policies were applied
+                            sleep 2  # Give database time to update
+                            NEW_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                            
+                            if [ "$NEW_TARGET_POLICY_COUNT" -ge "$TARGET_POLICY_COUNT" ]; then
+                                if [ "$NEW_TARGET_POLICY_COUNT" = "$SOURCE_POLICY_COUNT" ]; then
+                                    POLICY_APPLY_SUCCESS=true
+                                    log_success "✓ All policies re-applied successfully"
+                                    log_info "  Target now has: $NEW_TARGET_POLICY_COUNT policies (matches source)"
+                                    TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+                                elif [ "$NEW_TARGET_POLICY_COUNT" -gt "$TARGET_POLICY_COUNT" ]; then
+                                    log_info "Policy count increased to $NEW_TARGET_POLICY_COUNT (was $TARGET_POLICY_COUNT), continuing..."
+                                    TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+                                    # Continue to next retry if not at max
+                                    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                                        continue
+                                    fi
+                                fi
+                            else
+                                log_warning "Policy count did not increase after re-application (still $NEW_TARGET_POLICY_COUNT)"
+                            fi
+                        else
+                            log_warning "Policy re-application attempt $RETRY_COUNT failed"
+                        fi
+                    done
+                    
+                    if [ "$POLICY_APPLY_SUCCESS" != "true" ]; then
+                        log_warning "⚠ Failed to re-apply all policies after $MAX_RETRIES attempts"
+                        log_warning "  Some policies may need manual review. Check: $POLICY_SQL"
+                        log_to_file "$LOG_FILE" "WARNING: Policy re-application failed after $MAX_RETRIES attempts"
+                    fi
+                fi
+                
+                # Apply roles with retry logic
+                if [ -f "$ROLE_SQL" ] && [ -s "$ROLE_SQL" ]; then
+                    ROLE_COUNT_IN_FILE=$(grep -c "^CREATE ROLE\|^ALTER ROLE\|^GRANT" "$ROLE_SQL" 2>/dev/null || echo "0")
+                    log_info "Found $ROLE_COUNT_IN_FILE role definition(s) to re-apply..."
+                    
+                    MAX_RETRIES=3
+                    RETRY_COUNT=0
+                    ROLE_APPLY_SUCCESS=false
+                    
+                    while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$ROLE_APPLY_SUCCESS" != "true" ]; do
+                        RETRY_COUNT=$((RETRY_COUNT + 1))
+                        log_info "Attempting to apply roles (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+                        
+                        # Apply roles with error handling
+                        if run_psql_script_with_fallback "Role re-application (attempt $RETRY_COUNT)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$ROLE_SQL"; then
+                            # Verify roles were applied
+                            sleep 2  # Give database time to update
+                            NEW_TARGET_ROLE_COUNT=$(count_roles "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                            
+                            if [ "$NEW_TARGET_ROLE_COUNT" -ge "$TARGET_ROLE_COUNT" ]; then
+                                if [ "$NEW_TARGET_ROLE_COUNT" = "$SOURCE_ROLE_COUNT" ]; then
+                                    ROLE_APPLY_SUCCESS=true
+                                    log_success "✓ All roles re-applied successfully"
+                                    log_info "  Target now has: $NEW_TARGET_ROLE_COUNT roles (matches source)"
+                                    TARGET_ROLE_COUNT=$NEW_TARGET_ROLE_COUNT
+                                elif [ "$NEW_TARGET_ROLE_COUNT" -gt "$TARGET_ROLE_COUNT" ]; then
+                                    log_info "Role count increased to $NEW_TARGET_ROLE_COUNT (was $TARGET_ROLE_COUNT), continuing..."
+                                    TARGET_ROLE_COUNT=$NEW_TARGET_ROLE_COUNT
+                                    # Continue to next retry if not at max
+                                    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                                        continue
+                                    fi
+                                fi
+                            else
+                                log_warning "Role count did not increase after re-application (still $NEW_TARGET_ROLE_COUNT)"
+                            fi
+                        else
+                            log_warning "Role re-application attempt $RETRY_COUNT failed"
+                        fi
+                    done
+                    
+                    if [ "$ROLE_APPLY_SUCCESS" != "true" ]; then
+                        log_warning "⚠ Failed to re-apply all roles after $MAX_RETRIES attempts"
+                        log_warning "  Some roles may need manual review. Check: $ROLE_SQL"
+                        log_to_file "$LOG_FILE" "WARNING: Role re-application failed after $MAX_RETRIES attempts"
+                    fi
+                fi
+            else
+                log_warning "Failed to extract policies/roles SQL from dump"
+            fi
+        else
+            log_warning "Source dump file not available for policy/role extraction"
+        fi
+        
+        # Final verification
+        log_info "Performing final verification of policies and roles..."
+        FINAL_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+        FINAL_TARGET_ROLE_COUNT=$(count_roles "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+        
+        if [ "$FINAL_TARGET_POLICY_COUNT" = "$SOURCE_POLICY_COUNT" ]; then
+            log_success "✅ All policies successfully migrated: $FINAL_TARGET_POLICY_COUNT policies"
+            log_to_file "$LOG_FILE" "SUCCESS: All policies migrated - $FINAL_TARGET_POLICY_COUNT policies"
+        else
+            FINAL_POLICY_DIFF=$((SOURCE_POLICY_COUNT - FINAL_TARGET_POLICY_COUNT))
+            if [ "$FINAL_POLICY_DIFF" -gt 0 ]; then
+                log_warning "⚠ Still missing $FINAL_POLICY_DIFF policy(ies) after retry attempts"
+                log_warning "  Source: $SOURCE_POLICY_COUNT, Target: $FINAL_TARGET_POLICY_COUNT"
+                if [ -f "$POLICY_SQL" ]; then
+                    log_warning "  Review the policy SQL file for manual application: $POLICY_SQL"
+                fi
+                log_to_file "$LOG_FILE" "WARNING: $FINAL_POLICY_DIFF policies still missing after retry"
+            fi
+        fi
+        
+        if [ "$FINAL_TARGET_ROLE_COUNT" = "$SOURCE_ROLE_COUNT" ]; then
+            log_success "✅ All roles successfully migrated: $FINAL_TARGET_ROLE_COUNT roles"
+            log_to_file "$LOG_FILE" "SUCCESS: All roles migrated - $FINAL_TARGET_ROLE_COUNT roles"
+        else
+            FINAL_ROLE_DIFF=$((SOURCE_ROLE_COUNT - FINAL_TARGET_ROLE_COUNT))
+            if [ "$FINAL_ROLE_DIFF" -gt 0 ]; then
+                log_warning "⚠ Still missing $FINAL_ROLE_DIFF role(s) after retry attempts"
+                log_warning "  Source: $SOURCE_ROLE_COUNT, Target: $FINAL_TARGET_ROLE_COUNT"
+                if [ -f "$ROLE_SQL" ]; then
+                    log_warning "  Review the role SQL file for manual application: $ROLE_SQL"
+                fi
+                log_to_file "$LOG_FILE" "WARNING: $FINAL_ROLE_DIFF roles still missing after retry"
+            fi
+        fi
+    else
+        log_success "✅ Policy and role counts match - no retry needed"
+        log_to_file "$LOG_FILE" "SUCCESS: All policies and roles migrated correctly"
+    fi
+    
+    echo ""
+fi
+
 # Generate HTML report
 if [ "$RESTORE_SUCCESS" = "true" ]; then
     STATUS="success"
