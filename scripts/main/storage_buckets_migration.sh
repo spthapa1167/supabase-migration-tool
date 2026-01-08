@@ -22,7 +22,7 @@ MIGRATION_DIR=${3:-""}
 # Usage
 usage() {
     cat << EOF
-Usage: $0 <source_env> <target_env> [migration_dir] [--include-files|--exclude-files]
+Usage: $0 <source_env> <target_env> [migration_dir] [--include-files|--exclude-files] [--force-all]
 
 Migrates storage buckets (configuration + files) from source to target using delta comparison
 
@@ -34,6 +34,10 @@ Default Behavior:
 With --files flag:
   Migrates ALL buckets with their files. Creates missing buckets and transfers all files.
 
+With --force-all flag:
+  Migrates ALL buckets even if they already exist in target (for configuration sync).
+  Useful when you want to ensure all bucket configurations match source exactly.
+
 Arguments:
   source_env     Source environment (prod, test, dev, backup)
   target_env     Target environment (prod, test, dev, backup)
@@ -41,6 +45,7 @@ Arguments:
   --file, --files  Include file migration (migrates buckets + files)
   --include-files  Include file migration (same as --file/--files)
   --exclude-files  Exclude file migration (default, migrates bucket config only)
+  --force-all, --force, --all-buckets, --migrate-all  Migrate ALL buckets (even if they exist in target)
   --increment      Prefer incremental/delta operations (default: enabled)
 
 Examples:
@@ -89,6 +94,7 @@ fi
 # Default: bucket configuration only (no files)
 INCLUDE_FILES="false"
 INCREMENTAL_MODE="false"
+FORCE_ALL_BUCKETS="false"  # If true, migrate all buckets even if they exist in target
 AUTO_CONFIRM_COMPONENT="${AUTO_CONFIRM:-false}"
 SKIP_COMPONENT_CONFIRM="${SKIP_COMPONENT_CONFIRM:-false}"
 
@@ -106,6 +112,9 @@ for arg in "$@"; do
             ;;
         --increment|--incremental)
             INCREMENTAL_MODE="true"
+            ;;
+        --force|--force-all|--all-buckets|--migrate-all)
+            FORCE_ALL_BUCKETS="true"
             ;;
         --auto-confirm|--yes|-y)
             AUTO_CONFIRM_COMPONENT="true"
@@ -218,6 +227,7 @@ fi
 # Migrate buckets with delta comparison and file migration using Node.js utility
 # Default behavior: Only migrate NEW bucket names (incremental - buckets that exist in source but not in target)
 # With --files: Migrate ALL buckets with files
+# With --force-all: Migrate ALL buckets even if they exist in target (configuration sync)
 if [ "$INCLUDE_FILES" = "true" ]; then
     log_info "Migrating storage buckets (ALL buckets + files)..."
     INCLUDE_FILES_FLAG="--include-files"
@@ -226,23 +236,29 @@ else
     INCLUDE_FILES_FLAG="--exclude-files"
 fi
 
+if [ "$FORCE_ALL_BUCKETS" = "true" ]; then
+    log_info "Force mode enabled: Will migrate ALL buckets (even if they exist in target)"
+    FORCE_FLAG="--force-all"
+else
+    FORCE_FLAG=""
+fi
+
 MIGRATION_SUCCESS=false
 log_info "Running Node.js storage migration utility..."
 log_info "  Script: $STORAGE_UTIL"
 log_info "  Source: $SOURCE_REF"
 log_info "  Target: $TARGET_REF"
 log_info "  Files: $INCLUDE_FILES_FLAG"
+[ -n "$FORCE_FLAG" ] && log_info "  Force: $FORCE_FLAG"
 log_info ""
 
 # Run Node.js utility and capture output
 # Use PIPESTATUS to properly capture exit code when using pipes
 set +o pipefail  # Temporarily disable pipefail to check exit code manually
-if node "$STORAGE_UTIL" \
-    "$SOURCE_REF" \
-    "$TARGET_REF" \
-    "$MIGRATION_DIR" \
-    "$INCLUDE_FILES_FLAG" \
-    2>&1 | tee -a "$LOG_FILE"; then
+STORAGE_ARGS=("$SOURCE_REF" "$TARGET_REF" "$MIGRATION_DIR" "$INCLUDE_FILES_FLAG")
+[ -n "$FORCE_FLAG" ] && STORAGE_ARGS+=("$FORCE_FLAG")
+
+if node "$STORAGE_UTIL" "${STORAGE_ARGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
     NODE_EXIT_CODE=${PIPESTATUS[0]}
     if [ "$NODE_EXIT_CODE" -eq 0 ]; then
         MIGRATION_SUCCESS=true

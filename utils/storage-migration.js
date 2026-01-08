@@ -94,6 +94,7 @@ const SOURCE_REF = process.argv[2];
 const TARGET_REF = process.argv[3];
 const MIGRATION_DIR = process.argv[4];
 const INCLUDE_FILES = process.argv[5] !== '--exclude-files';
+const FORCE_ALL_BUCKETS = process.argv.includes('--force-all') || process.argv.includes('--force') || process.argv.includes('--all-buckets') || process.argv.includes('--migrate-all');
 
 // Get Supabase URLs and keys from environment
 function getSupabaseConfig(projectRef) {
@@ -781,11 +782,17 @@ async function migrateStorage() {
                 logInfo(`    Continuing with file migration only...`);
             }
             
-            // If files are not included, skip this bucket (it already exists)
-            if (!INCLUDE_FILES) {
+            // If files are not included AND force flag is not set, skip this bucket (it already exists)
+            if (!INCLUDE_FILES && !FORCE_ALL_BUCKETS) {
                 logInfo(`  ⏭️  Skipping bucket (already exists in target, and file migration not requested)`);
+                logInfo(`      Use --force-all to migrate all buckets regardless of existence`);
                 console.log('');
                 continue;
+            }
+            
+            // If force flag is set, we'll still process the bucket (for configuration sync)
+            if (FORCE_ALL_BUCKETS && !INCLUDE_FILES) {
+                logInfo(`  🔄 Force mode: Processing bucket for configuration sync (files not included)`);
             }
         } else {
             bucketNeedsCreation = true;
@@ -1019,8 +1026,12 @@ async function migrateStorage() {
                 migratedCount++;
                 logSuccess(`  ✓ New bucket created successfully (bucket name only, no files)`);
             } else {
-                // Bucket already exists - skip in default mode (no files)
-                logInfo(`  ⏭️  Bucket already exists in target - skipping (use --files to migrate files)`);
+                // Bucket already exists - skip in default mode (no files) unless force flag is set
+                if (!FORCE_ALL_BUCKETS) {
+                    logInfo(`  ⏭️  Bucket already exists in target - skipping (use --files to migrate files or --force-all to sync all buckets)`);
+                } else {
+                    logInfo(`  🔄 Force mode: Bucket exists but will be processed for configuration sync`);
+                }
             }
             console.log('');
         }

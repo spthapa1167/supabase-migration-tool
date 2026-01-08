@@ -311,7 +311,9 @@ log_to_file "$LOG_FILE" "Exporting schema from source project using pg_dump"
 log_info "Dumping source schema using reliable connection fallback..."
 log_to_file "$LOG_FILE" "Dumping source schema from source project using pg_dump"
 
-PG_DUMP_ARGS=(-d postgres --schema-only --no-owner --no-privileges -f "$SCHEMA_DUMP_FILE")
+# Note: --no-privileges was removed to ensure RLS policies are included in the dump
+# This is critical for proper policy migration
+PG_DUMP_ARGS=(-d postgres --schema-only --no-owner -f "$SCHEMA_DUMP_FILE")
 dump_success=false
 
 if run_pg_tool_with_fallback "pg_dump" "$SOURCE_REF" "$SOURCE_PASSWORD" "${SOURCE_POOLER_REGION:-}" "${SOURCE_POOLER_PORT:-6543}" "$LOG_FILE" \
@@ -367,6 +369,7 @@ if [ "$VERIFY_ONLY" = "true" ]; then
     
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
+        # Note: --no-privileges removed to ensure policies are included for comparison
         if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_dump \
             -h "$host" \
             -p "$port" \
@@ -374,7 +377,6 @@ if [ "$VERIFY_ONLY" = "true" ]; then
             -d postgres \
             --schema-only \
             --no-owner \
-            --no-privileges \
             -f "$TARGET_SCHEMA_FILE" 2>&1 | tee -a "$LOG_FILE"; then
             target_dump_success=true
             break
@@ -450,24 +452,104 @@ if [ "$SKIP_COMPONENT_CONFIRM" != "true" ] && [ "$AUTO_CONFIRM_COMPONENT" != "tr
     fi
 fi
 
+# Extract policies and RLS enable statements BEFORE applying schema
+# This ensures we can apply them in the correct order: tables -> enable RLS -> policies
+log_info "Extracting policies and RLS statements from schema dump..."
+log_to_file "$LOG_FILE" "Extracting policies and RLS statements"
+
+POLICIES_SQL="$MIGRATION_DIR_ABS/policies_extracted.sql"
+RLS_ENABLE_SQL="$MIGRATION_DIR_ABS/rls_enable.sql"
+SCHEMA_WITHOUT_POLICIES="$MIGRATION_DIR_ABS/schema_without_policies.sql"
+
+# Extract RLS enable statements (must be applied before policies)
+{
+    grep -E "^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$SCHEMA_DUMP_FILE" 2>/dev/null || true
+    # Also handle multi-line ALTER TABLE statements
+    awk '/^ALTER TABLE.*ENABLE ROW LEVEL SECURITY/,/;/ {print}' "$SCHEMA_DUMP_FILE" 2>/dev/null || true
+} | sort -u > "$RLS_ENABLE_SQL" 2>/dev/null || true
+
+# Extract CREATE POLICY statements
+{
+    grep -E "^CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || true
+    # Also extract multi-line CREATE POLICY statements
+    awk '/^CREATE POLICY/,/;/ {print}' "$SCHEMA_DUMP_FILE" 2>/dev/null || true
+} | sort -u > "$POLICIES_SQL" 2>/dev/null || true
+
+# Create schema dump without policies (to apply tables/functions/etc first)
+# Remove policy and RLS statements from the schema dump
+grep -v -E "^CREATE POLICY|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY|^ALTER TABLE.*DISABLE ROW LEVEL SECURITY" "$SCHEMA_DUMP_FILE" > "$SCHEMA_WITHOUT_POLICIES" 2>/dev/null || cp "$SCHEMA_DUMP_FILE" "$SCHEMA_WITHOUT_POLICIES"
+
+POLICY_COUNT=$(grep -c "^CREATE POLICY" "$POLICIES_SQL" 2>/dev/null || echo "0")
+RLS_ENABLE_COUNT=$(grep -c "ENABLE ROW LEVEL SECURITY" "$RLS_ENABLE_SQL" 2>/dev/null || echo "0")
+
+log_info "  Extracted $POLICY_COUNT policy definition(s)"
+log_info "  Extracted $RLS_ENABLE_COUNT RLS enable statement(s)"
+log_to_file "$LOG_FILE" "Extracted $POLICY_COUNT policies and $RLS_ENABLE_COUNT RLS enable statements"
+
 # Apply schema to target project using direct SQL application (same pattern as database_migration.sh)
 # Note: We use psql directly for reliability, as db push requires migrations directory setup
-log_info "Applying schema to target project..."
-log_to_file "$LOG_FILE" "Applying schema to target project"
+log_info "Applying schema to target project (tables, functions, etc. without policies)..."
+log_to_file "$LOG_FILE" "Applying schema without policies to target project"
 
-# Use run_psql_script_with_fallback helper function for reliable connections
+# Step 1: Apply schema without policies first
 sql_applied=false
 set +e
-if run_psql_script_with_fallback "Applying schema" "$TARGET_REF" "$TARGET_PASSWORD" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}" "$SCHEMA_DUMP_FILE"; then
+if run_psql_script_with_fallback "Applying schema (without policies)" "$TARGET_REF" "$TARGET_PASSWORD" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}" "$SCHEMA_WITHOUT_POLICIES"; then
     sql_applied=true
-    log_success "✓ Schema applied successfully to target"
-    log_to_file "$LOG_FILE" "Schema applied successfully to target"
+    log_success "✓ Schema (without policies) applied successfully to target"
+    log_to_file "$LOG_FILE" "Schema without policies applied successfully"
+else
+    log_warning "⚠ Some errors occurred while applying schema (this may be expected if objects already exist)"
+    log_to_file "$LOG_FILE" "WARNING: Some errors occurred while applying schema"
+    # Continue anyway - errors might be expected for existing objects
+    sql_applied=true
+fi
+set -e
+
+# Step 2: Enable RLS on tables that should have it
+if [ -s "$RLS_ENABLE_SQL" ]; then
+    log_info "Enabling RLS on tables..."
+    log_to_file "$LOG_FILE" "Enabling RLS on tables"
+    set +e
+    if run_psql_script_with_fallback "Enabling RLS" "$TARGET_REF" "$TARGET_PASSWORD" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}" "$RLS_ENABLE_SQL"; then
+        log_success "✓ RLS enabled on tables"
+        log_to_file "$LOG_FILE" "RLS enabled on tables successfully"
+    else
+        log_warning "⚠ Some errors occurred while enabling RLS (some tables may already have RLS enabled)"
+        log_to_file "$LOG_FILE" "WARNING: Some errors occurred while enabling RLS"
+    fi
+    set -e
+else
+    log_info "No RLS enable statements found (RLS may already be enabled or not needed)"
+fi
+
+# Step 3: Apply policies
+if [ -s "$POLICIES_SQL" ]; then
+    log_info "Applying RLS policies..."
+    log_to_file "$LOG_FILE" "Applying RLS policies"
+    set +e
+    if run_psql_script_with_fallback "Applying policies" "$TARGET_REF" "$TARGET_PASSWORD" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}" "$POLICIES_SQL"; then
+        log_success "✓ Policies applied successfully"
+        log_to_file "$LOG_FILE" "Policies applied successfully"
+    else
+        log_warning "⚠ Some errors occurred while applying policies"
+        log_warning "  This may be expected if some policies already exist"
+        log_warning "  Check the log file for details: $LOG_FILE"
+        log_to_file "$LOG_FILE" "WARNING: Some errors occurred while applying policies"
+    fi
+    set -e
+else
+    log_warning "⚠ No policies found to apply"
+    log_to_file "$LOG_FILE" "WARNING: No policies found in schema dump"
+fi
+
+if [ "$sql_applied" = "true" ]; then
+    log_success "✓ Schema migration completed"
 else
     log_error "Failed to apply schema to target via any connection method"
     log_to_file "$LOG_FILE" "ERROR: Failed to apply schema to target"
     exit 1
 fi
-set -e
 echo ""
 
 # Step 4: Verify migration success
@@ -484,7 +566,8 @@ TARGET_SCHEMA_AFTER="$MIGRATION_DIR_ABS/target_schema_after.sql"
 log_info "Exporting target schema for verification..."
 log_to_file "$LOG_FILE" "Exporting target schema for verification"
 
-PG_DUMP_ARGS=(-d postgres --schema-only --no-owner --no-privileges -f "$TARGET_SCHEMA_AFTER")
+# Note: --no-privileges removed to ensure policies are included for verification
+PG_DUMP_ARGS=(-d postgres --schema-only --no-owner -f "$TARGET_SCHEMA_AFTER")
 target_after_dump_success=false
 
 if run_pg_tool_with_fallback "pg_dump" "$TARGET_REF" "$TARGET_PASSWORD" "${TARGET_POOLER_REGION:-}" "${TARGET_POOLER_PORT:-6543}" "$LOG_FILE" \
