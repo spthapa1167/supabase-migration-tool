@@ -224,22 +224,25 @@ parse_args() {
                 INCLUDE_SECRETS=true
                 shift
                 ;;
-            --increment|--incremental)
-                INCREMENTAL_MODE=true
-                shift
-                ;;
             --data)
                 INCLUDE_DATA=true
-                # Automatically enable incremental mode for data migration by default
-                # This ensures existing target data is preserved and only new/delta data is added
-                # Will be disabled if --replace-data is also specified
-                INCREMENTAL_MODE=true
+                shift
+                ;;
+            # New flags: explicit control of schema vs data increment behavior at orchestrator level
+            --increment-schema)
+                INCREMENTAL_MODE=true  # keep existing var for compatibility; used only to pass flag down
+                SCHEMA_INCREMENT_MODE=true
+                shift
+                ;;
+            --increment|--incremental|--increment-data)
+                INCREMENTAL_MODE=true  # keep existing var for compatibility; used only to pass data increment flag down
+                DATA_INCREMENT_MODE=true
                 shift
                 ;;
             --replace-data|--force-data-replace)
                 REPLACE_TARGET_DATA=true
-                # Disable incremental mode when replace-data is specified (they are mutually exclusive)
-                INCREMENTAL_MODE=false
+                # Replace-data implies we don't want incremental data behavior
+                DATA_INCREMENT_MODE=false
                 shift
                 ;;
             --users)
@@ -1575,14 +1578,10 @@ perform_migration() {
         log_info "Migrating database data..."
         local db_migration_args=("$source" "$target" "$migration_dir" "--data")
         
-        # Automatically enable incremental mode for data migration unless replace-data is specified
-        # This ensures existing target data is preserved and only new/delta data is added
+        # Data incremental mode: pass explicit flag to component unless replace-data is specified
         if [ "$REPLACE_TARGET_DATA" != "true" ]; then
-            INCREMENTAL_MODE=true
-            db_migration_args+=("--increment")
-            log_info "Incremental mode enabled: existing target data will be preserved, only new/delta data will be added"
-        elif [ "$INCREMENTAL_MODE" = "true" ]; then
-            db_migration_args+=("--increment")
+            db_migration_args+=("--increment-data")
+            log_info "Data incremental mode enabled: only new/delta data will be added; existing rows preserved"
         fi
         if [ "$INCLUDE_USERS" = "true" ]; then
             db_migration_args+=("--users")
@@ -1654,6 +1653,10 @@ perform_migration() {
     else
         log_info "Migrating storage buckets (configuration only - no files)..."
     fi
+    # Always use --force-all to ensure all buckets are migrated (not just new ones)
+    # This ensures bucket configurations match source exactly
+    storage_migration_args+=("--force-all")
+    log_info "Force mode enabled: All buckets will be migrated (even if they exist in target)"
     
     # Call storage_buckets_migration.sh component script
     if [ "$AUTO_CONFIRM" = "true" ]; then
