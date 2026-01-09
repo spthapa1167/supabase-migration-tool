@@ -488,6 +488,9 @@ async function handlePublicTableSync(event) {
             statusEl.classList.add('text-success-600');
         }
 
+        // Show success notification
+        showNotification('success', `Table "${tableName}" synced successfully`, `Schema synced from ${sourceEnv} to ${targetEnv}`);
+
         setTimeout(() => {
             runPublicTableComparison();
         }, 400);
@@ -497,6 +500,9 @@ async function handlePublicTableSync(event) {
             statusEl.classList.remove('text-neutral-500', 'text-success-600');
             statusEl.classList.add('text-error-600');
         }
+        
+        // Show error notification
+        showNotification('error', `Sync failed: ${tableName}`, error.message || 'Failed to sync table schema');
     } finally {
         setSyncButtonLoading(button, false);
     }
@@ -3908,3 +3914,154 @@ async function loadManualContent(containerId, sourcePath) {
         throw error;
     }
 }
+
+// ============================================================================
+// Notification System
+// ============================================================================
+
+let notifications = [];
+const MAX_NOTIFICATIONS = 50;
+
+function showNotification(type, title, message, duration = 5000) {
+    const id = Date.now() + Math.random();
+    const notification = {
+        id,
+        type, // 'success', 'error', 'warning', 'info'
+        title,
+        message,
+        timestamp: new Date(),
+        read: false
+    };
+    
+    notifications.unshift(notification);
+    if (notifications.length > MAX_NOTIFICATIONS) {
+        notifications = notifications.slice(0, MAX_NOTIFICATIONS);
+    }
+    
+    updateNotificationUI();
+    
+    // Auto-remove after duration (only for success/info)
+    if ((type === 'success' || type === 'info') && duration > 0) {
+        setTimeout(() => {
+            removeNotification(id);
+        }, duration);
+    }
+}
+
+function removeNotification(id) {
+    notifications = notifications.filter(n => n.id !== id);
+    updateNotificationUI();
+}
+
+function clearAllNotifications() {
+    notifications = [];
+    updateNotificationUI();
+}
+
+function markNotificationAsRead(id) {
+    const notification = notifications.find(n => n.id === id);
+    if (notification) {
+        notification.read = true;
+        updateNotificationUI();
+    }
+}
+
+function toggleNotificationPanel() {
+    const panel = document.getElementById('notificationPanel');
+    if (panel) {
+        panel.classList.toggle('hidden');
+        
+        // Mark all as read when opening
+        if (!panel.classList.contains('hidden')) {
+            notifications.forEach(n => n.read = true);
+            updateNotificationUI();
+        }
+    }
+}
+
+function updateNotificationUI() {
+    const badge = document.getElementById('notificationBadge');
+    const countEl = document.getElementById('notificationCount');
+    const listEl = document.getElementById('notificationList');
+    
+    if (!badge || !countEl || !listEl) return;
+    
+    const unreadCount = notifications.filter(n => !n.read).length;
+    
+    // Update badge
+    if (unreadCount > 0) {
+        badge.classList.remove('hidden');
+        countEl.textContent = unreadCount > 99 ? '99+' : unreadCount.toString();
+    } else {
+        badge.classList.add('hidden');
+    }
+    
+    // Update list
+    if (notifications.length === 0) {
+        listEl.innerHTML = '<div class="p-4 text-sm text-neutral-500 text-center">No notifications</div>';
+        return;
+    }
+    
+    const typeColors = {
+        success: { bg: 'bg-success-50', border: 'border-success-200', icon: 'text-success-600', title: 'text-success-900' },
+        error: { bg: 'bg-error-50', border: 'border-error-200', icon: 'text-error-600', title: 'text-error-900' },
+        warning: { bg: 'bg-warning-50', border: 'border-warning-200', icon: 'text-warning-600', title: 'text-warning-900' },
+        info: { bg: 'bg-primary-50', border: 'border-primary-200', icon: 'text-primary-600', title: 'text-primary-900' }
+    };
+    
+    const typeIcons = {
+        success: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />',
+        error: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />',
+        warning: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />',
+        info: '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />'
+    };
+    
+    listEl.innerHTML = notifications.map(notif => {
+        const colors = typeColors[notif.type] || typeColors.info;
+        const icon = typeIcons[notif.type] || typeIcons.info;
+        const timeAgo = getTimeAgo(notif.timestamp);
+        const unreadClass = notif.read ? '' : 'font-semibold';
+        
+        return `
+            <div class="p-4 ${colors.bg} ${colors.border} border-l-4 hover:bg-opacity-80 transition-colors ${notif.read ? 'opacity-75' : ''}" data-notification-id="${notif.id}">
+                <div class="flex items-start space-x-3">
+                    <div class="flex-shrink-0 mt-0.5">
+                        <svg class="w-5 h-5 ${colors.icon}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            ${icon}
+                        </svg>
+                    </div>
+                    <div class="flex-1 min-w-0">
+                        <p class="text-sm ${colors.title} ${unreadClass}">${escapeHtml(notif.title)}</p>
+                        ${notif.message ? `<p class="text-xs text-neutral-600 mt-1">${escapeHtml(notif.message)}</p>` : ''}
+                        <p class="text-xs text-neutral-400 mt-1">${timeAgo}</p>
+                    </div>
+                    <button onclick="removeNotification(${notif.id})" class="flex-shrink-0 text-neutral-400 hover:text-neutral-600">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function getTimeAgo(date) {
+    const seconds = Math.floor((new Date() - date) / 1000);
+    if (seconds < 60) return 'Just now';
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+}
+
+// Close notification panel when clicking outside
+document.addEventListener('click', (e) => {
+    const panel = document.getElementById('notificationPanel');
+    const bell = document.getElementById('notificationBell');
+    if (panel && !panel.contains(e.target) && !bell?.contains(e.target)) {
+        panel.classList.add('hidden');
+    }
+});
