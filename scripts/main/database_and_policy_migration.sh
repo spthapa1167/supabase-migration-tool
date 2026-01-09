@@ -1671,6 +1671,196 @@ fi
 # Log success
 log_to_file "$LOG_FILE" "Schema application completed successfully: sql_applied=$sql_applied"
 
+# Step 3.5: Detect and Apply Schema Differences (New Columns, Modified Columns, etc.)
+# This step runs after schema application to catch any schema changes that pg_dump might have missed
+# pg_dump creates full table definitions, not ALTER TABLE statements, so we need to detect and apply them manually
+# ALWAYS RUN: Schema differences must be detected and applied to ensure new columns are migrated
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Step 3.5/4: Detecting and Applying Schema Differences"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
+
+log_info "Detecting schema differences (new columns, modified columns, etc.)..."
+log_to_file "$LOG_FILE" "Detecting schema differences between source and target"
+
+# Function to extract column information from a database
+extract_columns_info() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local output_file=$5
+    
+    local query="
+        SELECT 
+            table_schema || '|' || 
+            table_name || '|' || 
+            column_name || '|' || 
+            data_type || '|' || 
+            COALESCE(format_type(a.atttypid, a.atttypmod), data_type) || '|' ||
+            is_nullable || '|' || 
+            COALESCE(column_default, '') || '|' ||
+            ordinal_position
+        FROM information_schema.columns c
+        LEFT JOIN pg_catalog.pg_attribute a
+            ON a.attrelid = (table_schema || '.' || table_name)::regclass
+           AND a.attname = c.column_name
+           AND a.attnum > 0
+           AND a.attisdropped = false
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND table_schema NOT LIKE 'pg_toast%'
+          AND table_schema != 'storage'
+          AND table_schema != 'auth'
+        ORDER BY table_schema, table_name, ordinal_position;
+    "
+    
+    run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" > "$output_file" 2>/dev/null || echo ""
+}
+
+# Extract column information from source and target
+SOURCE_COLUMNS_FILE="$MIGRATION_DIR_ABS/source_columns.txt"
+TARGET_COLUMNS_FILE="$MIGRATION_DIR_ABS/target_columns.txt"
+SCHEMA_DIFF_SQL="$MIGRATION_DIR_ABS/schema_differences.sql"
+
+log_info "Extracting column information from source..."
+extract_columns_info "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$SOURCE_COLUMNS_FILE"
+
+log_info "Extracting column information from target..."
+extract_columns_info "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$TARGET_COLUMNS_FILE"
+
+if [ -s "$SOURCE_COLUMNS_FILE" ] && [ -s "$TARGET_COLUMNS_FILE" ]; then
+    log_info "Comparing schemas to find differences..."
+    
+    # Generate ALTER TABLE statements for schema differences using Python
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "")
+    if [ -n "$PYTHON_BIN" ]; then
+        PYTHON_OUTPUT=$("$PYTHON_BIN" - "$SOURCE_COLUMNS_FILE" "$TARGET_COLUMNS_FILE" "$SCHEMA_DIFF_SQL" <<'PYTHON_SCRIPT'
+import sys
+from collections import defaultdict
+
+source_file = sys.argv[1]
+target_file = sys.argv[2]
+output_file = sys.argv[3]
+
+# Parse column information
+def parse_columns(file_path):
+    columns = defaultdict(dict)  # {schema.table: {column_name: {info}}}
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('|')
+            if len(parts) >= 8:
+                schema, table, column, data_type, formatted_type, is_nullable, default, position = parts[:8]
+                key = f"{schema}.{table}"
+                columns[key][column] = {
+                    'data_type': data_type,
+                    'formatted_type': formatted_type or data_type,
+                    'is_nullable': is_nullable,
+                    'default': default,
+                    'position': int(position) if position.isdigit() else 999
+                }
+    return columns
+
+source_cols = parse_columns(source_file)
+target_cols = parse_columns(target_file)
+
+alter_statements = []
+
+# Find new columns (in source but not in target)
+for table_key, source_table_cols in source_cols.items():
+    target_table_cols = target_cols.get(table_key, {})
+    schema, table = table_key.split('.', 1)
+    
+    for col_name, col_info in source_table_cols.items():
+        if col_name not in target_table_cols:
+            # New column - add it
+            stmt = f'ALTER TABLE "{schema}"."{table}" ADD COLUMN "{col_name}" {col_info["formatted_type"]}'
+            if col_info['default']:
+                stmt += f' DEFAULT {col_info["default"]}'
+            if col_info['is_nullable'].upper() == 'NO':
+                stmt += ' NOT NULL'
+            alter_statements.append(stmt + ';')
+    
+    # Find modified columns (type, nullable, default changes)
+    for col_name, source_col_info in source_table_cols.items():
+        if col_name in target_table_cols:
+            target_col_info = target_table_cols[col_name]
+            schema, table = table_key.split('.', 1)
+            
+            # Check for type changes
+            if source_col_info['formatted_type'] != target_col_info['formatted_type']:
+                new_type = source_col_info['formatted_type']
+                alter_statements.append(f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col_name}" TYPE {new_type} USING "{col_name}"::{new_type};')
+            
+            # Check for nullable changes
+            if source_col_info['is_nullable'] != target_col_info['is_nullable']:
+                if source_col_info['is_nullable'].upper() == 'NO':
+                    alter_statements.append(f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col_name}" SET NOT NULL;')
+                else:
+                    alter_statements.append(f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col_name}" DROP NOT NULL;')
+            
+            # Check for default changes
+            if source_col_info['default'] != target_col_info['default']:
+                if source_col_info['default']:
+                    alter_statements.append(f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col_name}" SET DEFAULT {source_col_info["default"]};')
+                else:
+                    alter_statements.append(f'ALTER TABLE "{schema}"."{table}" ALTER COLUMN "{col_name}" DROP DEFAULT;')
+
+# Write ALTER statements to file
+with open(output_file, 'w') as f:
+    for stmt in alter_statements:
+        f.write(stmt + '\n')
+
+print(f"Generated {len(alter_statements)} ALTER TABLE statement(s)")
+PYTHON_SCRIPT
+)
+        
+        SCHEMA_DIFF_COUNT=$(echo "$PYTHON_OUTPUT" | grep -oE "[0-9]+" | head -1 || echo "0")
+        
+        if [ "$SCHEMA_DIFF_COUNT" -gt 0 ] && [ -s "$SCHEMA_DIFF_SQL" ]; then
+            ACTUAL_COUNT=$(grep -c "^ALTER TABLE" "$SCHEMA_DIFF_SQL" 2>/dev/null || echo "0")
+            log_info "Found $ACTUAL_COUNT schema difference(s) to apply"
+            log_to_file "$LOG_FILE" "Found $ACTUAL_COUNT schema differences"
+            
+            # Show what will be changed
+            log_info "Schema changes to apply:"
+            grep "^ALTER TABLE" "$SCHEMA_DIFF_SQL" | head -10 | while read -r line; do
+                log_info "  - $line"
+            done
+            if [ "$ACTUAL_COUNT" -gt 10 ]; then
+                log_info "  ... and $((ACTUAL_COUNT - 10)) more"
+            fi
+            
+            # Apply schema differences
+            log_info "Applying schema differences to target..."
+            set +e
+            if run_psql_script_with_fallback "Applying schema differences" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$SCHEMA_DIFF_SQL"; then
+                log_success "✓ Schema differences applied successfully"
+                log_to_file "$LOG_FILE" "SUCCESS: Schema differences applied"
+            else
+                log_warning "⚠ Some errors occurred while applying schema differences"
+                log_warning "  Review the SQL file: $SCHEMA_DIFF_SQL"
+                log_to_file "$LOG_FILE" "WARNING: Some schema differences may not have been applied"
+            fi
+            set -e
+        else
+            log_success "✓ No schema differences found - source and target schemas match"
+            log_to_file "$LOG_FILE" "No schema differences detected"
+        fi
+    else
+        log_warning "⚠ Python not found - cannot detect schema differences automatically"
+        log_warning "  Please manually verify schema differences between source and target"
+        log_to_file "$LOG_FILE" "WARNING: Python not found, schema difference detection skipped"
+    fi
+else
+    log_warning "⚠ Could not extract column information - schema difference detection skipped"
+    log_to_file "$LOG_FILE" "WARNING: Could not extract column information"
+fi
+
+log_info ""
+
 # If data migration was requested, provide guidance
 if [ "$INCLUDE_DATA" = "true" ]; then
     echo ""

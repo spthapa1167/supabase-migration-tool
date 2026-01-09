@@ -84,7 +84,7 @@ BACKUP_TARGET=false
 INCLUDE_DATA=false   # Default: false  - don't migrate database row data by default
 INCLUDE_FILES=false  # Default: false  - don't migrate bucket files by default
 INCLUDE_USERS=false  # Default: false  - don't migrate auth.users / identities unless --users is specified
-INCLUDE_SECRETS=false # Default: false - don't migrate secrets unless --secret is specified
+INCLUDE_SECRETS=true  # Default: true  - always migrate secrets (new keys only, with blank values) to ensure parity
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
 INCREMENTAL_MODE=false     # Default: false - full sync for data unless --increment is provided
 SKIP_EDGE_FUNCTIONS=false  # Default: false - migrate edge functions unless --skipEdge is specified
@@ -125,7 +125,8 @@ Options:
                           Without this flag, data migration automatically runs in incremental mode.
   --users                 Include authentication users/identities migration (default: disabled; auth users are NOT copied unless this is set)
   --files                 Include storage bucket files migration (default: disabled)
-  --secret                Include secrets migration (default: disabled; secrets are NOT migrated unless this is set)
+  --secret                Include secrets migration (default: enabled; use --no-secrets to skip)
+  --no-secrets           Skip secrets migration (secrets are migrated by default)
   --skipEdge              Skip edge functions migration (default: edge functions are migrated)
   --env-file <file>       Environment file (default: .env.local)
   --dry-run               Preview migration without executing
@@ -146,14 +147,14 @@ Default Behavior:
   - Policies & Roles: roles, user_roles, and RLS policies are synchronized to match source
   - Storage: Bucket configurations only (no files)
   - Edge Functions: Migrated
-  - Secrets: NOT migrated by default (use --secret to add new secret keys incrementally)
+  - Secrets: Migrated by default (new keys only, with blank values; use --no-secrets to skip)
 
   Use --data to include database row migration (automatically runs in incremental mode by default).
   Use --data --replace-data for a full data REPLACE (target table data is truncated/replaced by source).
   Incremental mode preserves existing target data and only adds new/delta data from source.
   Use --files to include storage bucket file migration.
   Use --users to copy auth users/identities so login state matches source.
-  Use --secret to migrate secrets (adds new secret keys incrementally; existing secrets in target are never modified or removed).
+  Secrets are migrated by default (adds new secret keys incrementally; existing secrets in target are never modified or removed). Use --no-secrets to skip.
   Use --full for a complete migration (schema + data + users + files + secrets + edge functions).
 
 Examples:
@@ -255,6 +256,10 @@ parse_args() {
                 ;;
             --secret|--secrets)
                 INCLUDE_SECRETS=true
+                shift
+                ;;
+            --no-secrets)
+                INCLUDE_SECRETS=false
                 shift
                 ;;
             --skipEdge|--skip-edge|--skip-edge-functions)
@@ -1733,7 +1738,9 @@ perform_migration() {
         fi
     fi
     
-    # Step 4: Migrate secrets (only if --secret flag is provided)
+    # Step 4: Migrate secrets (runs by default to ensure new secrets are migrated)
+    # Secrets migration only creates new keys that don't exist in target, with blank values
+    # Existing secrets in target are never modified or removed
     if [ "$INCLUDE_SECRETS" = "true" ]; then
         log_info "Migrating secrets..."
         # Call secrets_migration.sh component script
@@ -1765,7 +1772,7 @@ perform_migration() {
             fi
         fi
     else
-        log_info "Secrets migration skipped (use --secret to migrate secrets)"
+        log_info "Secrets migration skipped (use --secret to enable, or remove --no-secrets flag)"
         SKIPPED_COMPONENTS+=("secrets")
     fi
 

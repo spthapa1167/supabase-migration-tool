@@ -1551,11 +1551,12 @@ supabase unlink --yes 2>/dev/null || true
 # Step 4: Detect and Apply Schema Differences (New Columns, Modified Columns, etc.)
 # This step runs after restore to catch any schema changes that pg_restore might have missed
 # pg_restore doesn't generate ALTER TABLE statements, so we need to detect and apply them manually
-if [ "$RESTORE_SUCCESS" = "true" ] || [ "$SCHEMA_CLEAN_MODE" = "false" ]; then
-    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_info "  Step 4: Detecting and Applying Schema Differences"
-    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    log_info ""
+# ALWAYS RUN: Schema differences must be detected and applied regardless of restore success status
+# This ensures new columns and schema changes are always migrated, even if restore had warnings
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Step 4: Detecting and Applying Schema Differences"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
     
     log_info "Detecting schema differences (new columns, modified columns, etc.)..."
     log_to_file "$LOG_FILE" "Detecting schema differences between source and target"
@@ -1737,7 +1738,6 @@ PYTHON_SCRIPT
     fi
     
     log_info ""
-fi
 
 # Step 4a: Migrate Storage RLS Policies (ALWAYS RUN - independent of restore success)
 # Storage schema is excluded from main migration, so we need to migrate RLS policies separately
