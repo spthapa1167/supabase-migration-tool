@@ -3,7 +3,14 @@
 # Secrets Migration Component Script
 # Migrates secret keys (names only) from source to target with blank values
 # Only creates new keys if they don't exist in target
+# 
+# CRITICAL SAFETY POLICY:
+# =======================
 # NEVER modifies or overwrites existing secrets in target - they are preserved unchanged
+# Existing secret keys and values in target are NEVER touched, updated, or impacted
+# Only NEW secret keys from source are added (with blank/placeholder values)
+# Multiple safety checks prevent any overwrite of existing secrets
+#
 # Skips secrets starting with 'SUPABASE' (reserved)
 
 set -euo pipefail
@@ -140,6 +147,15 @@ log_success "Found $target_secret_count existing secret(s) in target project"
 source_secret_names=$(jq -r '.[].name' "$SOURCE_SECRETS_FILE" 2>/dev/null || echo "")
 target_secret_names=$(jq -r '.[].name' "$TARGET_SECRETS_FILE" 2>/dev/null || echo "")
 
+# CRITICAL: Store initial target secrets list as a read-only reference
+# This is used to verify we never overwrite existing secrets
+INITIAL_TARGET_SECRETS_FILE="$TEMP_DIR/initial_target_secrets.json"
+cp "$TARGET_SECRETS_FILE" "$INITIAL_TARGET_SECRETS_FILE" 2>/dev/null || echo "[]" > "$INITIAL_TARGET_SECRETS_FILE"
+INITIAL_TARGET_SECRET_NAMES=$(jq -r '.[].name' "$INITIAL_TARGET_SECRETS_FILE" 2>/dev/null || echo "")
+
+log_info "✓ Initial target secrets list stored for verification (will not be modified)"
+log_to_file "$LOG_FILE" "Initial target secrets list stored: $target_secret_count secrets"
+
 # Step 3: Migrate secrets to target
 log_info "Step 3/3: Migrating secrets to target project..."
 log_info ""
@@ -199,15 +215,18 @@ for secret_name in $source_secret_names; do
     fi
     
     if [ "$exists_in_target" = "true" ]; then
-        log_info "  ⏭️  Skipping: $secret_name (already exists in target)"
+        log_info "  ⏭️  Skipping: $secret_name (already exists in target - value preserved)"
+        log_info "    ✓ Existing secret value will NOT be modified"
         skipped_existing=$((skipped_existing + 1))
         continue
     fi
     
     # CRITICAL SAFETY CHECK: Verify secret doesn't exist right before setting
     # This prevents overwriting existing secrets even if cached list was stale
+    # This is a mandatory check - we NEVER overwrite existing secrets
     if check_secret_exists_fresh "$secret_name"; then
         log_warning "  ⚠️  Skipping: $secret_name (exists in target - preventing overwrite)"
+        log_warning "    ✓ Existing secret value will be preserved unchanged"
         skipped_existing=$((skipped_existing + 1))
         continue
     fi
@@ -220,22 +239,45 @@ for secret_name in $source_secret_names; do
     secret_created=false
     
     # Function to set secret via CLI (Management API doesn't support creating secrets)
+    # CRITICAL: This function will NEVER overwrite existing secrets - it always checks first
     set_secret_via_cli() {
         local secret_value=$1
         local cli_output
         
         # FINAL SAFETY CHECK: Verify secret still doesn't exist before setting
         # This prevents race conditions where secret was added between checks
+        # CRITICAL: This check is MANDATORY - we NEVER overwrite existing secrets
         if check_secret_exists_fresh "$secret_name"; then
             log_warning "    ⚠️  Secret now exists - aborting to prevent overwrite"
+            log_warning "    ⚠️  Existing secret value will be preserved unchanged"
             return 2  # Special exit code for "exists"
         fi
         
+        # DOUBLE-CHECK: One more API call right before setting to be absolutely sure
+        # This is the final gate before calling the CLI command
+        local final_check_output
+        final_check_output=$(curl -s -H "Authorization: Bearer $TARGET_ACCESS_TOKEN" \
+            "https://api.supabase.com/v1/projects/${TARGET_REF}/secrets" 2>/dev/null)
+        
+        if [ $? -eq 0 ] && echo "$final_check_output" | jq empty 2>/dev/null; then
+            local final_check_names
+            final_check_names=$(echo "$final_check_output" | jq -r '.[].name' 2>/dev/null || echo "")
+            if [ -n "$final_check_names" ]; then
+                if echo "$final_check_names" | grep -qFx "$secret_name" 2>/dev/null; then
+                    log_warning "    ⚠️  Secret exists (final check) - aborting to prevent overwrite"
+                    log_warning "    ⚠️  Existing secret value will be preserved unchanged"
+                    return 2  # Special exit code for "exists"
+                fi
+            fi
+        fi
+        
+        # Only proceed if secret definitely doesn't exist
         # Try to set secret using Supabase CLI with access token
         # Export access token for CLI to use
         export SUPABASE_ACCESS_TOKEN="$TARGET_ACCESS_TOKEN"
         
         # Try to set secret using Supabase CLI
+        # NOTE: This will only be called if secret doesn't exist (verified above)
         cli_output=$(supabase secrets set "${secret_name}=${secret_value}" --project-ref "$TARGET_REF" 2>&1)
         local exit_code=$?
         
@@ -247,9 +289,34 @@ for secret_name in $source_secret_names; do
             echo "CLI Output for $secret_name: $cli_output" >> "$LOG_FILE" 2>/dev/null || true
         fi
         
-        if [ $exit_code -eq 0 ]; then
-            return 0
+        # CRITICAL POST-SET VERIFICATION: Check if we accidentally overwrote an existing secret
+        # Compare against initial target secrets list to ensure we didn't overwrite anything
+        if [ -n "$INITIAL_TARGET_SECRET_NAMES" ]; then
+            if echo "$INITIAL_TARGET_SECRET_NAMES" | grep -qFx "$secret_name" 2>/dev/null; then
+                # This secret existed in the initial target list - we should NOT have set it!
+                log_error "    ✗ CRITICAL ERROR: Secret $secret_name existed in target but was set anyway!"
+                log_error "    ✗ This should never happen - all checks should have prevented this"
+                log_error "    ✗ The existing secret value may have been overwritten"
+                log_to_file "$LOG_FILE" "ERROR: Secret $secret_name was overwritten despite safety checks"
+                return 3  # Special exit code for "overwrote existing secret"
+            fi
+        fi
+        
+        # After setting, verify the secret was created (not overwritten)
+        # If secret already existed, the CLI might have overwritten it (we want to detect this)
+        sleep 1  # Brief pause to allow API to update
+        if check_secret_exists_fresh "$secret_name"; then
+            # Secret exists - check if it was just created or if it existed before
+            # We can't tell the difference, but if we got here, it means our checks passed
+            # So we assume it was created successfully
+            if [ $exit_code -eq 0 ]; then
+                return 0
+            else
+                return 1
+            fi
         else
+            # Secret doesn't exist after setting - this is an error
+            log_warning "    ⚠️  Secret was not created - may have failed silently"
             return 1
         fi
     }
@@ -266,6 +333,13 @@ for secret_name in $source_secret_names; do
         # Secret exists - skip to prevent overwrite
         log_warning "    ⏭️  Skipped: $secret_name (exists in target - prevented overwrite)"
         skipped_existing=$((skipped_existing + 1))
+    elif [ $cli_exit_code -eq 3 ]; then
+        # CRITICAL: We accidentally overwrote an existing secret
+        log_error "    ✗ CRITICAL: Secret $secret_name was overwritten - this should never happen!"
+        log_error "    ✗ Existing secret value may have been lost"
+        failed_count=$((failed_count + 1))
+        # Don't try placeholder - we already made an error
+        continue
     else
         # Try with placeholder if blank doesn't work
         log_info "    Blank value failed, trying placeholder..."
@@ -280,6 +354,11 @@ for secret_name in $source_secret_names; do
             # Secret exists - skip to prevent overwrite
             log_warning "    ⏭️  Skipped: $secret_name (exists in target - prevented overwrite)"
             skipped_existing=$((skipped_existing + 1))
+        elif [ $cli_exit_code -eq 3 ]; then
+            # CRITICAL: We accidentally overwrote an existing secret
+            log_error "    ✗ CRITICAL: Secret $secret_name was overwritten - this should never happen!"
+            log_error "    ✗ Existing secret value may have been lost"
+            failed_count=$((failed_count + 1))
         else
             log_error "    ✗ Failed: $secret_name"
             # Show error details if available
@@ -326,6 +405,12 @@ if [ "$failed_count" -gt 0 ]; then
     exit 1
 fi
 
+log_info ""
 log_success "✅ Secrets migration completed successfully"
+log_info ""
+log_success "✓ IMPORTANT: All existing secret keys and values in target were preserved unchanged"
+log_success "✓ Only new secret keys from source were added (with blank/placeholder values)"
+log_success "✓ No existing secrets were modified, updated, or impacted"
+log_info ""
 exit 0
 

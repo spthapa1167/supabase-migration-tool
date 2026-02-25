@@ -467,6 +467,10 @@ async function handlePublicTableSync(event) {
     }
 
     try {
+        // Create abort controller for timeout (browser compatibility)
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 100000); // 100 seconds
+        
         const response = await fetch('/api/schema/public-table-sync', {
             method: 'POST',
             headers: getAuthHeaders(),
@@ -475,10 +479,17 @@ async function handlePublicTableSync(event) {
                 targetEnv,
                 tableName,
                 schemaName
-            })
+            }),
+            signal: controller.signal
         });
+        
+        clearTimeout(timeoutId);
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) {
+            // Check for timeout status
+            if (response.status === 504 || payload.timeout) {
+                throw new Error(payload.error || payload.details || 'Sync operation timed out');
+            }
             throw new Error(payload.error || 'Failed to sync table schema');
         }
 
@@ -495,14 +506,23 @@ async function handlePublicTableSync(event) {
             runPublicTableComparison();
         }, 400);
     } catch (error) {
+        let errorMessage = error.message || 'Failed to sync table schema';
+        let errorTitle = `Sync failed: ${tableName}`;
+        
+        // Check if it's a timeout error (fetch abort or server timeout)
+        if (error.name === 'AbortError' || (error.message && (error.message.includes('timeout') || error.message.includes('timed out')))) {
+            errorTitle = `Sync timeout: ${tableName}`;
+            errorMessage = 'The sync operation timed out after 100 seconds. This may indicate a database connection issue or network problem. Please check your connection and try again.';
+        }
+        
         if (statusEl) {
-            statusEl.textContent = error.message || 'Failed to sync schema.';
+            statusEl.textContent = errorMessage;
             statusEl.classList.remove('text-neutral-500', 'text-success-600');
             statusEl.classList.add('text-error-600');
         }
         
-        // Show error notification
-        showNotification('error', `Sync failed: ${tableName}`, error.message || 'Failed to sync table schema');
+        // Show error notification with timeout indicator
+        showNotification('error', errorTitle, errorMessage);
     } finally {
         setSyncButtonLoading(button, false);
     }

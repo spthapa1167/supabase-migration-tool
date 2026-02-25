@@ -88,6 +88,7 @@ INCLUDE_SECRETS=true  # Default: true  - always migrate secrets (new keys only, 
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
 INCREMENTAL_MODE=false     # Default: false - full sync for data unless --increment is provided
 SKIP_EDGE_FUNCTIONS=false  # Default: false - migrate edge functions unless --skipEdge is specified
+SKIP_DATABASE_DATA_IN_MAIN=false  # When true (e.g. --clone), main migration skips database data; caller does it separately
 
 # Colors
 RED='\033[0;31m'
@@ -260,6 +261,11 @@ parse_args() {
                 ;;
             --no-secrets)
                 INCLUDE_SECRETS=false
+                shift
+                ;;
+            --clone)
+                # Used by supabase_clone.sh: skip database data in main migration; clone does it via migrate_all_table_data
+                SKIP_DATABASE_DATA_IN_MAIN=true
                 shift
                 ;;
             --skipEdge|--skip-edge|--skip-edge-functions)
@@ -1572,10 +1578,14 @@ perform_migration() {
         fi
     fi
     
-    # Step 1b: Migrate database data (if requested)
-    # This is separate from schema migration and only runs if --data flag is set
+    # Step 1b: Migrate database data (if requested and not skipped for clone mode)
+    # When --clone is used, supabase_clone.sh does data via migrate_all_table_data.sh in its Step 2
     local migrate_data=false
-    if [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
+    if [ "$SKIP_DATABASE_DATA_IN_MAIN" = "true" ]; then
+        log_info "Database data migration skipped in main migration (clone mode - clone script will run migrate_all_table_data)"
+        SKIPPED_COMPONENTS+=("database data")
+        log_to_file "$LOG_FILE" "Database data migration: SKIPPED (clone mode - handled by clone Step 2)"
+    elif [ "$INCLUDE_DATA" = "true" ] || [ "$MODE" = "full" ]; then
         migrate_data=true
     fi
     
@@ -1641,7 +1651,7 @@ perform_migration() {
                 log_to_file "$LOG_FILE" "Database data migration: FAILED (exit code: $db_data_exit_code)"
             fi
         fi
-    else
+    elif [ "$migrate_data" != "true" ] && [ "$SKIP_DATABASE_DATA_IN_MAIN" != "true" ]; then
         log_info "Database data migration skipped (use --data to migrate data)"
         SKIPPED_COMPONENTS+=("database data")
     fi

@@ -144,24 +144,28 @@ FROM column_data;"
     endpoints=$(get_supabase_connection_endpoints "$ref" "$region" "$port")
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
-        if PGPASSWORD="$password" PGSSLMODE=require psql \
+        # Add connection timeout (10 seconds) and statement timeout (30 seconds)
+        if PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 psql \
             -h "$host" \
             -p "$port" \
             -U "$user" \
             -d postgres \
             -t -A -F '' --no-align --quiet \
+            -v statement_timeout=30000 \
             -c "$query" >"$output" 2>/dev/null; then
             return 0
         fi
     done <<<"$endpoints"
 
     local direct_host="db.${ref}.supabase.co"
-    if PGPASSWORD="$password" PGSSLMODE=require psql \
+    # Add connection timeout (10 seconds) and statement timeout (30 seconds)
+    if PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 psql \
         -h "$direct_host" \
         -p 5432 \
         -U "postgres" \
         -d postgres \
         -t -A -F '' --no-align --quiet \
+        -v statement_timeout=30000 \
         -c "$query" >"$output" 2>/dev/null; then
         return 0
     fi
@@ -187,12 +191,14 @@ table_exists() {
     endpoints=$(get_supabase_connection_endpoints "$ref" "$region" "$port")
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
-        result=$(PGPASSWORD="$password" PGSSLMODE=require psql \
+        # Add connection timeout (10 seconds) and statement timeout (30 seconds)
+        result=$(PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 psql \
             -h "$host" \
             -p "$port" \
             -U "$user" \
             -d postgres \
             -t -A -F '' --no-align --quiet \
+            -v statement_timeout=30000 \
             -c "$query" 2>/dev/null | tr -d '[:space:]')
         if [ "$result" = "t" ] || [ "$result" = "f" ]; then
             [ "$result" = "t" ] && return 0 || return 1
@@ -200,12 +206,14 @@ table_exists() {
     done <<<"$endpoints"
 
     local direct_host="db.${ref}.supabase.co"
-    result=$(PGPASSWORD="$password" PGSSLMODE=require psql \
+    # Add connection timeout (10 seconds) and statement timeout (30 seconds)
+    result=$(PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 psql \
         -h "$direct_host" \
         -p 5432 \
         -U "postgres" \
         -d postgres \
         -t -A -F '' --no-align --quiet \
+        -v statement_timeout=30000 \
         -c "$query" 2>/dev/null | tr -d '[:space:]')
 
     [ "$result" = "t" ] && return 0 || return 1
@@ -449,12 +457,14 @@ apply_sql_file() {
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         log_info "${description} via ${label} (${host}:${port})"
-        if PGPASSWORD="$password" PGSSLMODE=require psql \
+        # Add connection timeout (10 seconds) and statement timeout (60 seconds for ALTER TABLE)
+        if PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 psql \
             -h "$host" \
             -p "$port" \
             -U "$user" \
             -d postgres \
             -v ON_ERROR_STOP=on \
+            -v statement_timeout=60000 \
             -f "$sql_file" >>"$PROJECT_ROOT/logs/sync_table_schema.log" 2>&1; then
             return 0
         fi
@@ -462,12 +472,14 @@ apply_sql_file() {
 
     local direct_host="db.${ref}.supabase.co"
     log_info "${description} via direct host (${direct_host}:5432)"
-    if PGPASSWORD="$password" PGSSLMODE=require psql \
+    # Add connection timeout (10 seconds) and statement timeout (60 seconds for ALTER TABLE)
+    if PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 psql \
         -h "$direct_host" \
         -p 5432 \
         -U "postgres" \
         -d postgres \
         -v ON_ERROR_STOP=on \
+        -v statement_timeout=60000 \
         -f "$sql_file" >>"$PROJECT_ROOT/logs/sync_table_schema.log" 2>&1; then
         return 0
     fi
@@ -491,7 +503,8 @@ dump_table_schema() {
     while IFS='|' read -r host port user label; do
         [ -z "$host" ] && continue
         log_info "Dumping definition via ${label} (${host}:${port})"
-        if PGPASSWORD="$password" PGSSLMODE=require pg_dump \
+        # Add connection timeout (10 seconds) for pg_dump
+        if PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 pg_dump \
             -h "$host" \
             -p "$port" \
             -U "$user" \
@@ -502,7 +515,8 @@ dump_table_schema() {
 
     local direct_host="db.${ref}.supabase.co"
     log_info "Dumping definition via direct host (${direct_host}:5432)"
-    if PGPASSWORD="$password" PGSSLMODE=require pg_dump \
+    # Add connection timeout (10 seconds) for pg_dump
+    if PGPASSWORD="$password" PGSSLMODE=require PGCONNECT_TIMEOUT=10 pg_dump \
         -h "$direct_host" \
         -p 5432 \
         -U "postgres" \

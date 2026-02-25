@@ -65,6 +65,15 @@ For constraints that might be missed or modified:
 - NOT NULL constraints: Detected and applied via `ALTER TABLE ... ALTER COLUMN ... SET/DROP NOT NULL`
 - Default values: Detected and applied via `ALTER TABLE ... ALTER COLUMN ... SET/DROP DEFAULT`
 
+### Method 3: Missing Constraints Sync (Step 4.1)
+For **new or updated tables** where the target may be missing constraints present in source:
+- **Step 4.1** runs after schema differences (Step 4) and before Storage RLS (Step 4a).
+- Extracts full constraint definitions from source and target using `pg_constraint` and `pg_get_constraintdef()`.
+- Compares by `schema.table.constraint_name` and generates `ALTER TABLE ... ADD CONSTRAINT ...` for any constraint in source that is missing in target.
+- Applies PRIMARY KEY, UNIQUE, and CHECK first; FOREIGN KEY constraints are applied last so referenced tables exist.
+- Only applies constraints on tables that exist in target (skips still-missing tables).
+- Ensures newly added tables or newly updated tables have their constraints in sync with source without manual scripts.
+
 ## Verification
 
 ### Step 6: Comprehensive Verification
