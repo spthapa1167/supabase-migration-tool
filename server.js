@@ -81,6 +81,11 @@ function executeScript(scriptPath, args = [], options = {}) {
     return new Promise((resolve, reject) => {
         const fullPath = path.join(PROJECT_ROOT, scriptPath);
         
+        // Default timeout: 5 minutes (300000ms), can be overridden in options
+        const timeoutMs = options.timeout || 300000; // 5 minutes default
+        let timeoutId = null;
+        let resolved = false;
+        
         // Check if script exists
         fs.access(fullPath, fs.constants.F_OK)
             .then(() => {
@@ -100,6 +105,39 @@ function executeScript(scriptPath, args = [], options = {}) {
                     status: 'running',
                     logs: [] // Store logs for streaming
                 };
+
+                // Set timeout
+                timeoutId = setTimeout(() => {
+                    if (!resolved) {
+                        resolved = true;
+                        output.status = 'timeout';
+                        output.error = `Script execution timed out after ${timeoutMs / 1000} seconds`;
+                        output.stderr += `\n[ERROR] Script execution timed out after ${timeoutMs / 1000} seconds\n`;
+                        
+                        // Kill the process
+                        if (child && !child.killed) {
+                            try {
+                                child.kill('SIGTERM');
+                                // Force kill after 5 seconds if still running
+                                setTimeout(() => {
+                                    if (!child.killed) {
+                                        child.kill('SIGKILL');
+                                    }
+                                }, 5000);
+                            } catch (e) {
+                                console.error('Error killing process:', e);
+                            }
+                        }
+                        
+                        // Emit timeout
+                        if (options.sseCallback) {
+                            options.sseCallback({ type: 'timeout', error: output.error });
+                        }
+                        
+                        activeProcesses.delete(processId);
+                        reject(output);
+                    }
+                }, timeoutMs);
 
                 // Handle stdout
                 child.stdout.on('data', (data) => {
@@ -126,6 +164,13 @@ function executeScript(scriptPath, args = [], options = {}) {
                 });
 
                 child.on('close', (code) => {
+                    if (resolved) return; // Already handled by timeout
+                    resolved = true;
+                    
+                    if (timeoutId) {
+                        clearTimeout(timeoutId);
+                    }
+                    
                     output.exitCode = code;
                     output.status = code === 0 ? 'completed' : 'failed';
                     
@@ -139,6 +184,13 @@ function executeScript(scriptPath, args = [], options = {}) {
                 });
 
                 child.on('error', (error) => {
+                    if (resolved) return; // Already handled by timeout
+                    resolved = true;
+                    
+                    if (timeoutId) {
+                        clearTimeout(timeoutId);
+                    }
+                    
                     output.status = 'error';
                     output.error = error.message;
                     
@@ -154,6 +206,9 @@ function executeScript(scriptPath, args = [], options = {}) {
                 activeProcesses.set(processId, { child, output });
             })
             .catch(() => {
+                if (timeoutId) {
+                    clearTimeout(timeoutId);
+                }
                 reject({ error: `Script not found: ${scriptPath}` });
             });
     });
@@ -1327,20 +1382,56 @@ app.post('/api/schema/public-table-sync', async (req, res) => {
         return res.status(400).json({ error: 'Source and target environments must be different' });
     }
 
+    // Set a longer timeout for sync operations (2 minutes)
+    // This is separate from the script timeout to handle network issues
+    req.setTimeout(120000); // 2 minutes
+
     try {
         const args = [sourceEnv, targetEnv, tableName];
         if (schemaName && schemaName !== 'public') {
             args.push(`--schema=${schemaName}`);
         }
-        const result = await executeScript('scripts/components/sync_table_schema.sh', args);
+        
+        // Use a 90-second timeout for sync operations (should be fast)
+        const result = await executeScript('scripts/components/sync_table_schema.sh', args, {
+            timeout: 90000 // 90 seconds
+        });
+        
+        if (result.status === 'timeout') {
+            const errorMsg = result.error || `Sync operation timed out after 90 seconds for table ${tableName}`;
+            console.error(`[SYNC TIMEOUT] ${errorMsg}`);
+            console.error(`[SYNC TIMEOUT] stdout: ${result.stdout.substring(0, 500)}`);
+            console.error(`[SYNC TIMEOUT] stderr: ${result.stderr.substring(0, 500)}`);
+            return res.status(504).json({ 
+                error: errorMsg,
+                timeout: true,
+                details: 'The sync operation took too long. This may indicate a database connection issue or network problem.'
+            });
+        }
+        
         if (result.exitCode !== 0) {
-            const message = result.stderr?.trim() || 'Public table sync failed';
+            const message = result.stderr?.trim() || result.error || 'Public table sync failed';
+            console.error(`[SYNC ERROR] Table: ${tableName}, Exit Code: ${result.exitCode}`);
+            console.error(`[SYNC ERROR] stderr: ${result.stderr}`);
             return res.status(500).json({ error: message });
         }
+        
         const payload = buildPublicTableSyncPayload(stripAnsi(result.stdout || ''));
         res.json(payload);
     } catch (error) {
-        res.status(500).json({ error: error.error || error.message || 'Unable to sync table schema' });
+        console.error(`[SYNC EXCEPTION] Table: ${tableName}`, error);
+        const errorMessage = error.error || error.message || 'Unable to sync table schema';
+        
+        // Check if it's a timeout
+        if (error.status === 'timeout' || errorMessage.includes('timeout')) {
+            return res.status(504).json({ 
+                error: errorMessage,
+                timeout: true,
+                details: 'The sync operation timed out. Please check database connectivity and try again.'
+            });
+        }
+        
+        res.status(500).json({ error: errorMessage });
     }
 });
 

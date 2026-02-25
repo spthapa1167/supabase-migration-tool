@@ -3,6 +3,9 @@
 # Migrates edge functions from source to target using delta comparison
 # Uses Node.js utility for edge function migration
 # Can be used independently or as part of a complete migration
+#
+# IMPORTANT: This script does NOT touch target secrets. It never runs
+# "supabase secrets set". Target secret keys and values remain unchanged.
 
 set -euo pipefail
 
@@ -206,6 +209,20 @@ else
         DOCKER_AVAILABLE=false
     else
         log_error "Supabase CLI requires Docker for edge function download/deploy. Install Docker or set SKIP_DOCKER_CHECK=true to skip."
+        exit 1
+    fi
+fi
+
+# Ensure Docker daemon is running (not just installed)
+if [ "$DOCKER_AVAILABLE" = "true" ] && [ "${SKIP_DOCKER_CHECK:-false}" != "true" ]; then
+    if ! docker ps >/dev/null 2>&1; then
+        log_error "Docker is not running - required for edge function download/deploy."
+        log_info "Please start Docker and run this script again."
+        case "$(uname -s)" in
+            Darwin) log_info "  macOS: open -a Docker";;
+            Linux)  log_info "  Linux: sudo systemctl start docker";;
+            *)      log_info "  Windows: Start Docker Desktop from the Start menu";;
+        esac
         exit 1
     fi
 fi

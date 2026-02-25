@@ -3,9 +3,14 @@
  * Supabase Edge Functions Migration Utility
  * Migrates edge functions from source to target project
  * Uses Supabase CLI for downloading and deploying functions
- * 
+ *
+ * CRITICAL: This script NEVER touches target project secrets. It does not run
+ * "supabase secrets set". Deploy uses minimal env only (no .env.local). Any .env
+ * files in the deploy directory are removed before deploy. Existing target secret
+ * keys and values are never modified.
+ *
  * Usage: node utils/edge-functions-migration.js <source_ref> <target_ref> <migration_dir> [options]
- * 
+ *
  * Options:
  *   --functions=<name1,name2,...>  Migrate only specified functions
  *   --filter-file=<path>            Read function names from file (one per line)
@@ -798,6 +803,44 @@ function checkDocker() {
     }
 }
 
+// Ensure Docker is running before edge function download/deploy. On macOS, attempt to start Docker Desktop.
+async function ensureDockerRunning() {
+    if (checkDocker()) {
+        return;
+    }
+    const isMac = process.platform === 'darwin';
+    if (isMac) {
+        logInfo('Docker is not running. Attempting to start Docker Desktop...');
+        try {
+            execSync('open -a Docker', { stdio: 'pipe', timeout: 5000 });
+        } catch (e) {
+            logWarning('Could not launch Docker Desktop (open -a Docker failed).');
+        }
+        const maxWaitMs = 90000; // 90 seconds
+        const pollIntervalMs = 3000;
+        for (let waited = 0; waited < maxWaitMs; waited += pollIntervalMs) {
+            logInfo(`Waiting for Docker to be ready... (${waited / 1000}s)`);
+            try {
+                execSync('docker ps', { stdio: 'pipe', timeout: 10000 });
+                logSuccess('Docker is running.');
+                return;
+            } catch (e) {
+                // continue waiting
+            }
+            await new Promise((r) => setTimeout(r, pollIntervalMs));
+        }
+    }
+    logError('Docker is not running - required for edge function download and deploy.');
+    logInfo('Please start Docker Desktop and run this migration again.');
+    if (isMac) {
+        logInfo('  macOS: Open Docker from Applications, or run: open -a Docker');
+    } else {
+        logInfo('  Linux: start the Docker daemon (e.g. sudo systemctl start docker)');
+        logInfo('  Windows: Start Docker Desktop from the Start menu');
+    }
+    throw new Error('Docker is not running');
+}
+
 // Link project using Supabase CLI
 function linkProject(projectRef, dbPassword, accessToken = null) {
     try {
@@ -1341,6 +1384,41 @@ async function deleteEdgeFunction(functionName, targetRef, dbPassword, accessTok
     }
 }
 
+// CRITICAL: Edge functions migration NEVER touches target secrets.
+// We do not run "supabase secrets set". We pass minimal env to deploy so .env.local
+// and other secrets are never sent to the CLI (which could otherwise push them to the project).
+
+// Build minimal env for "supabase functions deploy" so no secrets from .env.local are passed.
+// Only auth and safe system vars are included; target project secrets are never modified.
+function getMinimalDeployEnv(accessToken) {
+    const safe = {};
+    const copy = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TERM', 'SHELL', 'NODE_ENV', 'TMPDIR', 'TEMP', 'TMP'];
+    copy.forEach(k => {
+        if (process.env[k] !== undefined) safe[k] = process.env[k];
+    });
+    if (accessToken) safe.SUPABASE_ACCESS_TOKEN = accessToken;
+    return safe;
+}
+
+// Remove any .env or .env.* files under dir so Supabase CLI never pushes them to target project.
+function removeEnvFilesFromDeployDir(dir) {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+            removeEnvFilesFromDeployDir(full);
+        } else if (e.name === '.env' || (e.name.startsWith('.env.') && e.name.length > 4)) {
+            try {
+                fs.unlinkSync(full);
+                logInfo(`    Removed ${path.relative(dir, full)} from deploy dir (to avoid touching target secrets)`);
+            } catch (err) {
+                logWarning(`    Could not remove ${full}: ${err.message}`);
+            }
+        }
+    }
+}
+
 // Deploy edge function using Supabase CLI
 // Note: No retry logic - failures are added to retry list for manual retry
 async function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, sourceRef = null, sourceDbPassword = null, targetAccessToken = null) {
@@ -1644,6 +1722,9 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
         // Change to supabase directory and link
         process.chdir(supabaseConfigDir);
         
+        // CRITICAL: Remove any .env files so Supabase CLI never pushes them to target (never touch target secrets)
+        removeEnvFilesFromDeployDir(supabaseConfigDir);
+        
         try {
             // Link to target project (in supabase directory) - optional, might already be linked
             logInfo(`    Linking to target project...`);
@@ -1686,11 +1767,8 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
             try {
                 // Wrap deploy in retry logic for rate limiting
                 await retryWithBackoff(async () => {
-                    // Prepare environment with access token if provided
-                    const env = { ...process.env };
-                    if (targetAccessToken) {
-                        env.SUPABASE_ACCESS_TOKEN = targetAccessToken;
-                    }
+                    // Use minimal env only (no .env.local / secrets) so we never touch target project secrets
+                    const env = getMinimalDeployEnv(targetAccessToken);
                     
                     const deployProcess = spawn('supabase', ['functions', 'deploy', functionName], {
                         cwd: supabaseConfigDir,
@@ -1893,7 +1971,10 @@ async function migrateEdgeFunctions() {
     logInfo(`Migration Directory: ${MIGRATION_DIR}`);
     logSeparator();
     console.log('');
-    
+
+    // Ensure Docker is running (required for CLI download/deploy). On macOS, try to start Docker Desktop.
+    await ensureDockerRunning();
+
     // Step 1: Get source edge functions
     logStep(1, 4, 'Fetching source edge functions...');
     let sourceFunctions = [];

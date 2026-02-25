@@ -4,6 +4,13 @@
 # Can be used independently or as part of a complete migration
 # Default: Only migrates secret keys with blank/placeholder values
 # Use --values flag to attempt migrating secret values (may require manual input)
+#
+# CRITICAL SAFETY POLICY:
+# =======================
+# NEVER modifies or overwrites existing secrets in target - they are preserved unchanged
+# Existing secret keys and values in target are NEVER touched, updated, or impacted
+# Only NEW secret keys from source are added (with blank/placeholder values)
+# Multiple safety checks prevent any overwrite of existing secrets
 
 set -euo pipefail
 
@@ -265,6 +272,19 @@ if [ -f "$TARGET_SECRETS_FILE" ] && jq empty "$TARGET_SECRETS_FILE" 2>/dev/null;
     target_secret_names=$(jq -r '.[].name' "$TARGET_SECRETS_FILE" 2>/dev/null || echo "")
 fi
 
+# CRITICAL: Store initial target secrets list as a read-only reference
+# This is used to verify we never overwrite existing secrets
+INITIAL_TARGET_SECRETS_FILE="$MIGRATION_DIR/initial_target_secrets.json"
+if [ -f "$TARGET_SECRETS_FILE" ] && jq empty "$TARGET_SECRETS_FILE" 2>/dev/null; then
+    cp "$TARGET_SECRETS_FILE" "$INITIAL_TARGET_SECRETS_FILE" 2>/dev/null || echo "[]" > "$INITIAL_TARGET_SECRETS_FILE"
+else
+    echo "[]" > "$INITIAL_TARGET_SECRETS_FILE"
+fi
+INITIAL_TARGET_SECRET_NAMES=$(jq -r '.[].name' "$INITIAL_TARGET_SECRETS_FILE" 2>/dev/null || echo "")
+
+log_info "✓ Initial target secrets list stored for verification (will not be modified)"
+log_to_file "$LOG_FILE" "Initial target secrets list stored for verification"
+
 # Determine which secrets need migration (delta)
 secrets_to_migrate=""
 skipped_count=0
@@ -316,7 +336,8 @@ for secret_name in $source_secret_names; do
     fi
     
     if [ "$exists_in_target" = "true" ]; then
-        log_info "  ⏭️  Skipping: $secret_name (already exists in target)"
+        log_info "  ⏭️  Skipping: $secret_name (already exists in target - value preserved)"
+        log_info "    ✓ Existing secret value will NOT be modified"
         skipped_count=$((skipped_count + 1))
         continue
     fi
@@ -356,17 +377,66 @@ for secret_name in $source_secret_names; do
     
     # FINAL SAFETY CHECK: Verify secret still doesn't exist before setting
     # This prevents race conditions where secret was added between checks
+    # CRITICAL: We NEVER overwrite existing secrets - always check first
     if check_secret_exists_fresh "$secret_name"; then
         log_warning "    ⚠️  Skipping: $secret_name (exists in target - prevented overwrite)"
+        log_warning "    ⚠️  Existing secret value will be preserved unchanged"
         skipped_count=$((skipped_count + 1))
         echo ""
         continue
     fi
     
+    # DOUBLE-CHECK: One more API call right before setting to be absolutely sure
+    # This is the final gate before calling the CLI command
+    local final_check_output
+    final_check_output=$(curl -s -H "Authorization: Bearer $ACCESS_TOKEN_FOR_WRITE" \
+        "https://api.supabase.com/v1/projects/${TARGET_REF}/secrets" 2>/dev/null)
+    
+    if [ $? -eq 0 ] && echo "$final_check_output" | jq empty 2>/dev/null; then
+        local final_check_names
+        final_check_names=$(echo "$final_check_output" | jq -r '.[].name' 2>/dev/null || echo "")
+        if [ -n "$final_check_names" ]; then
+            if echo "$final_check_names" | grep -qFx "$secret_name" 2>/dev/null; then
+                log_warning "    ⚠️  Skipping: $secret_name (exists in target - final check prevented overwrite)"
+                log_warning "    ⚠️  Existing secret value will be preserved unchanged"
+                skipped_count=$((skipped_count + 1))
+                echo ""
+                continue
+            fi
+        fi
+    fi
+    
+    # CRITICAL PRE-SET VERIFICATION: Final check against initial target secrets list
+    # This is the absolute last check before calling the CLI command
+    if [ -n "$INITIAL_TARGET_SECRET_NAMES" ]; then
+        if echo "$INITIAL_TARGET_SECRET_NAMES" | grep -qFx "$secret_name" 2>/dev/null; then
+            log_error "    ✗ CRITICAL: Secret $secret_name exists in initial target list - aborting to prevent overwrite"
+            log_error "    ✗ Existing secret value will be preserved unchanged"
+            skipped_count=$((skipped_count + 1))
+            echo ""
+            continue
+        fi
+    fi
+    
+    # Only proceed if secret definitely doesn't exist (verified by all checks above)
     # Use PIPESTATUS to properly capture exit code when using pipes
     set +o pipefail  # Temporarily disable pipefail to check exit code manually
     if supabase secrets set "${secret_name}=" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
         SECRET_EXIT_CODE=${PIPESTATUS[0]}
+        
+        # CRITICAL POST-SET VERIFICATION: Check if we accidentally overwrote an existing secret
+        if [ -n "$INITIAL_TARGET_SECRET_NAMES" ]; then
+            if echo "$INITIAL_TARGET_SECRET_NAMES" | grep -qFx "$secret_name" 2>/dev/null; then
+                log_error "    ✗ CRITICAL ERROR: Secret $secret_name existed in target but was set anyway!"
+                log_error "    ✗ This should never happen - all checks should have prevented this"
+                log_error "    ✗ The existing secret value may have been overwritten"
+                log_to_file "$LOG_FILE" "ERROR: Secret $secret_name was overwritten despite safety checks"
+                failed_count=$((failed_count + 1))
+                echo ""
+                continue
+            fi
+        fi
+        
         if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
             log_success "    ✓ Migrated: $secret_name (blank value - UPDATE REQUIRED)"
             migrated_count=$((migrated_count + 1))
@@ -375,6 +445,20 @@ for secret_name in $source_secret_names; do
             log_info "    Blank value failed, trying placeholder..."
             if supabase secrets set "${secret_name}=PLACEHOLDER_UPDATE_REQUIRED" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
                 SECRET_EXIT_CODE=${PIPESTATUS[0]}
+                
+                # CRITICAL POST-SET VERIFICATION for placeholder too
+                if [ -n "$INITIAL_TARGET_SECRET_NAMES" ]; then
+                    if echo "$INITIAL_TARGET_SECRET_NAMES" | grep -qFx "$secret_name" 2>/dev/null; then
+                        log_error "    ✗ CRITICAL ERROR: Secret $secret_name existed in target but was set anyway!"
+                        log_error "    ✗ This should never happen - all checks should have prevented this"
+                        log_error "    ✗ The existing secret value may have been overwritten"
+                        log_to_file "$LOG_FILE" "ERROR: Secret $secret_name was overwritten despite safety checks"
+                        failed_count=$((failed_count + 1))
+                        echo ""
+                        continue
+                    fi
+                fi
+                
                 if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
                     log_success "    ✓ Migrated: $secret_name (placeholder - UPDATE REQUIRED)"
                     migrated_count=$((migrated_count + 1))
@@ -394,6 +478,20 @@ for secret_name in $source_secret_names; do
         log_info "    Blank value failed, trying placeholder..."
         if supabase secrets set "${secret_name}=PLACEHOLDER_UPDATE_REQUIRED" --project-ref "$TARGET_REF" 2>&1 | tee -a "$LOG_FILE"; then
             SECRET_EXIT_CODE=${PIPESTATUS[0]}
+            
+            # CRITICAL POST-SET VERIFICATION for placeholder too
+            if [ -n "$INITIAL_TARGET_SECRET_NAMES" ]; then
+                if echo "$INITIAL_TARGET_SECRET_NAMES" | grep -qFx "$secret_name" 2>/dev/null; then
+                    log_error "    ✗ CRITICAL ERROR: Secret $secret_name existed in target but was set anyway!"
+                    log_error "    ✗ This should never happen - all checks should have prevented this"
+                    log_error "    ✗ The existing secret value may have been overwritten"
+                    log_to_file "$LOG_FILE" "ERROR: Secret $secret_name was overwritten despite safety checks"
+                    failed_count=$((failed_count + 1))
+                    echo ""
+                    continue
+                fi
+            fi
+            
             if [ "$SECRET_EXIT_CODE" -eq 0 ]; then
                 log_success "    ✓ Migrated: $secret_name (placeholder - UPDATE REQUIRED)"
                 migrated_count=$((migrated_count + 1))
@@ -612,6 +710,12 @@ generate_migration_html_report \
     ""
 
 log_info "HTML report generated: $MIGRATION_DIR/result.html"
+
+log_info ""
+log_success "✓ IMPORTANT: All existing secret keys and values in target were preserved unchanged"
+log_success "✓ Only new secret keys from source were added (with blank/placeholder values)"
+log_success "✓ No existing secrets were modified, updated, or impacted"
+log_info ""
 
 if [ "$overall_success" = "true" ]; then
     echo "$MIGRATION_DIR"  # Return migration directory for use by other scripts

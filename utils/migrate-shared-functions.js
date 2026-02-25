@@ -458,14 +458,38 @@ function bundleSharedFiles(functionDir, sharedDir) {
     return true;
 }
 
+// Do not pass .env.local or any secrets to deploy - never touch target project secrets
+function getMinimalDeployEnv(accessToken) {
+    const safe = {};
+    const copy = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TERM', 'SHELL', 'NODE_ENV', 'TMPDIR', 'TEMP', 'TMP'];
+    copy.forEach(k => {
+        if (process.env[k] !== undefined) safe[k] = process.env[k];
+    });
+    if (accessToken) safe.SUPABASE_ACCESS_TOKEN = accessToken;
+    return safe;
+}
+
+function removeEnvFilesFromDeployDir(dir) {
+    if (!fs.existsSync(dir)) return;
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+            removeEnvFilesFromDeployDir(full);
+        } else if (e.name === '.env' || (e.name.startsWith('.env.') && e.name.length > 4)) {
+            try {
+                fs.unlinkSync(full);
+                logInfo(`    Removed ${path.relative(dir, full)} from deploy dir (to avoid touching target secrets)`);
+            } catch (err) {
+                logWarning(`    Could not remove ${full}: ${err.message}`);
+            }
+        }
+    }
+}
+
 // Deploy function with shared files
 async function deployFunctionWithShared(functionName, functionDir, targetRef, dbPassword, targetAccessToken = null) {
-    // Prepare environment with access token if provided
-    const env = { ...process.env };
-    if (targetAccessToken) {
-        env.SUPABASE_ACCESS_TOKEN = targetAccessToken;
-    }
-    
+    const env = getMinimalDeployEnv(targetAccessToken);
     const originalCwd = process.cwd();
     const functionsParentDir = path.dirname(functionDir);
     const supabaseDir = path.join(functionsParentDir, 'supabase', 'functions');
@@ -585,11 +609,13 @@ async function deployFunctionWithShared(functionName, functionDir, targetRef, db
 
         process.chdir(configDir);
 
+        removeEnvFilesFromDeployDir(configDir);
+
         if (!linkProject(targetRef, dbPassword, targetAccessToken)) {
             throw new Error('Failed to link to target project');
         }
 
-        // Deploy
+        // Deploy (minimal env - never touch target secrets)
         logInfo(`    Deploying ${functionName}...`);
         const deployProcess = spawn('supabase', ['functions', 'deploy', functionName], {
             cwd: configDir,

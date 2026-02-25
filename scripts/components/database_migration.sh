@@ -326,7 +326,8 @@ Migrates database schema (and optionally data and auth users) from source to tar
 
 Default Behavior:
   - Schema: Clean sync (drop/recreate changed objects) for parity unless --increment-schema is provided.
-  - Data: Not migrated unless --data is provided. With --data, default is delta/append unless --replace-data is provided.
+  - Data: Not migrated unless --data is provided. With --data, default is delta/append (existing target rows preserved)
+    unless --replace-data is provided. Delta mode never drops target tables; source data is merged with ON CONFLICT DO NOTHING.
   - Auth: Use --users to include auth users/identities.
 
 Arguments:
@@ -740,7 +741,16 @@ if [ "$INCLUDE_DATA" = "true" ]; then
 else
     log_info "Step 3/3: Restoring schema dump to target..."
 fi
-# Schema restore strategy (clean by default unless explicitly disabled)
+# CRITICAL: Never use --clean when migrating data in delta/incremental mode (--data without --replace-data).
+# Using --clean would DROP all tables then recreate them empty, wiping existing target data before we merge source data.
+if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
+    if [ "$SCHEMA_CLEAN_MODE" = "true" ]; then
+        log_info "Data delta mode: disabling schema --clean to preserve existing target data (tables will not be dropped)."
+        log_to_file "$LOG_FILE" "Schema clean disabled for data delta mode - preserving target data"
+        SCHEMA_CLEAN_MODE=false
+    fi
+fi
+# Schema restore strategy (clean by default unless explicitly disabled or data-delta mode)
 if [ "$SCHEMA_CLEAN_MODE" = "true" ]; then
     RESTORE_ARGS+=(--clean --if-exists)
 else
@@ -749,6 +759,10 @@ fi
 
 DUPLICATE_ALLOWED=false
 if [ "$DATA_INCREMENTAL_MODE" = "true" ]; then
+    DUPLICATE_ALLOWED=true
+fi
+# When migrating data in delta mode (no replace), duplicate keys mean "existing row preserved" - treat as success
+if [ "$INCLUDE_DATA" = "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
     DUPLICATE_ALLOWED=true
 fi
 
@@ -792,6 +806,20 @@ if [ "$INCLUDE_DATA" != "true" ] && [ "$REPLACE_TARGET_DATA" != "true" ]; then
     else
         log_warning "Unable to capture target schema snapshot before migration."
         TARGET_SCHEMA_BEFORE_FILE=""
+    fi
+fi
+
+# CRITICAL: Never run schema restore with --clean when we have no target data backup to restore.
+# That would wipe all target tables and leave them empty with no way to recover.
+if [ "$INCLUDE_DATA" != "true" ] && [ "$SCHEMA_CLEAN_MODE" = "true" ]; then
+    if [ -z "$TARGET_DATA_BACKUP" ] || [ ! -f "$TARGET_DATA_BACKUP" ] || [ ! -s "$TARGET_DATA_BACKUP" ]; then
+        log_error "Aborting: schema restore would use --clean (drop tables) but target data backup is missing or empty."
+        log_error "Refusing to wipe target database without a valid backup. Either:"
+        log_error "  1. Fix target connectivity and re-run so backup can be created, or"
+        log_error "  2. Use --increment-schema to run without --clean (non-destructive schema sync), or"
+        log_error "  3. If target data is disposable, use --data --replace-data to explicitly replace target data."
+        log_to_file "$LOG_FILE" "ABORT: No target data backup available for schema-only --clean restore"
+        exit 1
     fi
 fi
 
@@ -1043,7 +1071,12 @@ fi
 
 # Restore preserved data if applicable
 if [ "$RESTORE_SUCCESS" = "true" ] && [ "$INCLUDE_DATA" = "true" ]; then
-    log_info "Step 3b/3: Applying data changes from source dump..."
+    if [ "$REPLACE_TARGET_DATA" = "true" ]; then
+        log_info "Step 3b/3: Applying data from source (replace mode - target table data replaced by source)..."
+    else
+        log_info "Step 3b/3: Applying data from source (delta mode - existing target rows preserved, source data merged)..."
+        log_to_file "$LOG_FILE" "Data restore: delta mode - preserving existing target data, merging source data"
+    fi
     
     DATA_RESTORE_ARGS=(--verbose --no-owner --data-only -d postgres)
     for schema in "${PROTECTED_SCHEMAS[@]}"; do
@@ -1548,6 +1581,270 @@ fi
 
 supabase unlink --yes 2>/dev/null || true
 
+# Step 3.5: Detect and Create Missing Tables
+# This step runs after pg_restore to catch any tables that exist in source but not in target
+# pg_restore with --clean only recreates existing tables, it doesn't create new ones
+# ALWAYS RUN: Missing tables must be detected and created before schema difference detection
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Step 3.5: Detecting and Creating Missing Tables"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
+
+log_info "Detecting missing tables (tables in source but not in target)..."
+log_to_file "$LOG_FILE" "Detecting missing tables between source and target"
+
+# Function to get list of all tables from a database (all schemas except system schemas)
+get_table_list() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local output_file=$5
+    
+    local query="
+        SELECT 
+            table_schema || '.' || table_name
+        FROM information_schema.tables
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND table_schema NOT LIKE 'pg_toast%'
+          AND table_schema != 'storage'
+          AND table_schema != 'auth'
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_schema, table_name;
+    "
+    
+    run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" > "$output_file" 2>/dev/null || echo ""
+}
+
+# Function to check if a table has RLS policies in source
+table_has_policies() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local schema=$5
+    local table=$6
+    
+    local query="
+        SELECT COUNT(*)
+        FROM pg_policy pol
+        JOIN pg_class c ON c.oid = pol.polrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = '$schema'
+          AND c.relname = '$table';
+    "
+    
+    local count=$(run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" 2>/dev/null | tr -d '[:space:]' || echo "0")
+    [ "$count" -gt 0 ] && return 0 || return 1
+}
+
+# Function to create a missing table from source
+create_missing_table() {
+    local schema_table=$1
+    local schema=$(echo "$schema_table" | cut -d'.' -f1)
+    local table=$(echo "$schema_table" | cut -d'.' -f2)
+    
+    log_info "Creating missing table: $schema_table"
+    log_to_file "$LOG_FILE" "Creating missing table: $schema_table"
+    
+    # Create temporary dump file for this specific table
+    local table_dump=$(mktemp)
+    local table_sql=$(mktemp)
+    
+    # Dump table schema from source
+    local dump_success=false
+    
+    # Try pooler connection first
+    local endpoints
+    endpoints=$(get_supabase_connection_endpoints "$SOURCE_REF" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        log_info "  Dumping table schema from source via ${label} (${host}:${port})"
+        if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require pg_dump \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            --schema-only \
+            --no-owner \
+            --no-privileges \
+            --table="${schema}.${table}" \
+            -Fc \
+            -f "$table_dump" \
+            >>"$LOG_FILE" 2>&1; then
+            dump_success=true
+            break
+        fi
+    done <<<"$endpoints"
+    
+    # If pooler failed, try direct connection
+    if [ "$dump_success" = "false" ]; then
+        local direct_host="db.${SOURCE_REF}.supabase.co"
+        log_info "  Dumping table schema from source via direct connection (${direct_host}:5432)"
+        if PGPASSWORD="$SOURCE_PASSWORD" PGSSLMODE=require pg_dump \
+            -h "$direct_host" \
+            -p 5432 \
+            -U "postgres" \
+            -d postgres \
+            --schema-only \
+            --no-owner \
+            --no-privileges \
+            --table="${schema}.${table}" \
+            -Fc \
+            -f "$table_dump" \
+            >>"$LOG_FILE" 2>&1; then
+            dump_success=true
+        fi
+    fi
+    
+    if [ "$dump_success" = "false" ] || [ ! -s "$table_dump" ]; then
+        log_warning "  ⚠ Failed to dump table schema from source: $schema_table"
+        log_to_file "$LOG_FILE" "WARNING: Failed to dump table $schema_table from source"
+        rm -f "$table_dump" "$table_sql"
+        return 1
+    fi
+    
+    # Convert dump to SQL for easier inspection
+    if ! pg_restore -f "$table_sql" --schema-only "$table_dump" 2>/dev/null; then
+        log_warning "  ⚠ Failed to convert dump to SQL for: $schema_table"
+        log_to_file "$LOG_FILE" "WARNING: Failed to convert dump to SQL for $schema_table"
+        rm -f "$table_dump" "$table_sql"
+        return 1
+    fi
+    
+    # Restore table to target
+    log_info "  Restoring table to target: $schema_table"
+    local restore_success=false
+    
+    # Try pooler connection first
+    endpoints=$(get_supabase_connection_endpoints "$TARGET_REF" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            --no-owner \
+            --no-privileges \
+            --if-exists \
+            "$table_dump" \
+            >>"$LOG_FILE" 2>&1; then
+            restore_success=true
+            break
+        fi
+    done <<<"$endpoints"
+    
+    # If pooler failed, try direct connection
+    if [ "$restore_success" = "false" ]; then
+        local direct_host="db.${TARGET_REF}.supabase.co"
+        if PGPASSWORD="$TARGET_PASSWORD" PGSSLMODE=require pg_restore \
+            -h "$direct_host" \
+            -p 5432 \
+            -U "postgres" \
+            -d postgres \
+            --no-owner \
+            --no-privileges \
+            --if-exists \
+            "$table_dump" \
+            >>"$LOG_FILE" 2>&1; then
+            restore_success=true
+        fi
+    fi
+    
+    if [ "$restore_success" = "true" ]; then
+        log_success "  ✓ Table created successfully: $schema_table"
+        log_to_file "$LOG_FILE" "SUCCESS: Table $schema_table created"
+        
+        # Check if table has policies in source and enable RLS if needed
+        if table_has_policies "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$schema" "$table"; then
+            log_info "  Enabling RLS on table (has policies in source): $schema_table"
+            local enable_rls_sql="ALTER TABLE \"$schema\".\"$table\" ENABLE ROW LEVEL SECURITY;"
+            if run_psql_command_with_fallback "Enabling RLS on $schema_table" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$enable_rls_sql"; then
+                log_success "  ✓ RLS enabled on: $schema_table"
+                log_to_file "$LOG_FILE" "RLS enabled on $schema_table"
+            else
+                log_warning "  ⚠ Failed to enable RLS on: $schema_table"
+                log_to_file "$LOG_FILE" "WARNING: Failed to enable RLS on $schema_table"
+            fi
+        fi
+        
+        rm -f "$table_dump" "$table_sql"
+        return 0
+    else
+        log_error "  ✗ Failed to restore table to target: $schema_table"
+        log_to_file "$LOG_FILE" "ERROR: Failed to restore table $schema_table to target"
+        rm -f "$table_dump" "$table_sql"
+        return 1
+    fi
+}
+
+# Get table lists from source and target
+SOURCE_TABLES_FILE="$MIGRATION_DIR/source_tables.txt"
+TARGET_TABLES_FILE="$MIGRATION_DIR/target_tables.txt"
+
+log_info "Extracting table list from source..."
+get_table_list "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$SOURCE_TABLES_FILE"
+
+log_info "Extracting table list from target..."
+get_table_list "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$TARGET_TABLES_FILE"
+
+# Find missing tables
+MISSING_TABLES=""
+if [ -s "$SOURCE_TABLES_FILE" ] && [ -s "$TARGET_TABLES_FILE" ]; then
+    while IFS= read -r source_table; do
+        [ -z "$source_table" ] && continue
+        if ! grep -Fxq "$source_table" "$TARGET_TABLES_FILE" 2>/dev/null; then
+            MISSING_TABLES="${MISSING_TABLES}${MISSING_TABLES:+$'\n'}$source_table"
+        fi
+    done < "$SOURCE_TABLES_FILE"
+elif [ -s "$SOURCE_TABLES_FILE" ]; then
+    # If target file is empty, all source tables are missing
+    MISSING_TABLES=$(cat "$SOURCE_TABLES_FILE")
+fi
+
+if [ -n "$MISSING_TABLES" ]; then
+    MISSING_COUNT=$(echo "$MISSING_TABLES" | grep -c . || echo "0")
+    log_info "Found $MISSING_COUNT missing table(s) in target"
+    log_to_file "$LOG_FILE" "Found $MISSING_COUNT missing tables"
+    
+    log_info "Missing tables:"
+    echo "$MISSING_TABLES" | while read -r table; do
+        [ -z "$table" ] && continue
+        log_info "  - $table"
+    done
+    
+    # Create missing tables
+    log_info ""
+    log_info "Creating missing tables..."
+    CREATED_COUNT=0
+    FAILED_COUNT=0
+    
+    while IFS= read -r missing_table; do
+        [ -z "$missing_table" ] && continue
+        if create_missing_table "$missing_table"; then
+            CREATED_COUNT=$((CREATED_COUNT + 1))
+        else
+            FAILED_COUNT=$((FAILED_COUNT + 1))
+        fi
+    done <<< "$MISSING_TABLES"
+    
+    log_info ""
+    if [ "$CREATED_COUNT" -gt 0 ]; then
+        log_success "✓ Successfully created $CREATED_COUNT table(s)"
+        log_to_file "$LOG_FILE" "SUCCESS: Created $CREATED_COUNT missing tables"
+    fi
+    if [ "$FAILED_COUNT" -gt 0 ]; then
+        log_warning "⚠ Failed to create $FAILED_COUNT table(s)"
+        log_to_file "$LOG_FILE" "WARNING: Failed to create $FAILED_COUNT tables"
+    fi
+else
+    log_success "✓ No missing tables found - all source tables exist in target"
+    log_to_file "$LOG_FILE" "No missing tables detected"
+fi
+
+log_info ""
+
 # Step 4: Detect and Apply Schema Differences (New Columns, Modified Columns, etc.)
 # This step runs after restore to catch any schema changes that pg_restore might have missed
 # pg_restore doesn't generate ALTER TABLE statements, so we need to detect and apply them manually
@@ -1599,6 +1896,44 @@ log_info ""
     SOURCE_COLUMNS_FILE="$MIGRATION_DIR/source_columns.txt"
     TARGET_COLUMNS_FILE="$MIGRATION_DIR/target_columns.txt"
     SCHEMA_DIFF_SQL="$MIGRATION_DIR/schema_differences.sql"
+    
+    # First, verify all source tables exist in target before column comparison
+    log_info "Verifying all source tables exist in target..."
+    log_to_file "$LOG_FILE" "Verifying source tables exist in target before column comparison"
+    
+    # Get current table lists (after Step 3.5 may have created missing tables)
+    CURRENT_SOURCE_TABLES_FILE="$MIGRATION_DIR/source_tables_current.txt"
+    CURRENT_TARGET_TABLES_FILE="$MIGRATION_DIR/target_tables_current.txt"
+    
+    get_table_list "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$CURRENT_SOURCE_TABLES_FILE"
+    get_table_list "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$CURRENT_TARGET_TABLES_FILE"
+    
+    # Check for any still-missing tables
+    STILL_MISSING_TABLES=""
+    if [ -s "$CURRENT_SOURCE_TABLES_FILE" ] && [ -s "$CURRENT_TARGET_TABLES_FILE" ]; then
+        while IFS= read -r source_table; do
+            [ -z "$source_table" ] && continue
+            if ! grep -Fxq "$source_table" "$CURRENT_TARGET_TABLES_FILE" 2>/dev/null; then
+                STILL_MISSING_TABLES="${STILL_MISSING_TABLES}${STILL_MISSING_TABLES:+$'\n'}$source_table"
+            fi
+        done < "$CURRENT_SOURCE_TABLES_FILE"
+    elif [ -s "$CURRENT_SOURCE_TABLES_FILE" ]; then
+        STILL_MISSING_TABLES=$(cat "$CURRENT_SOURCE_TABLES_FILE")
+    fi
+    
+    if [ -n "$STILL_MISSING_TABLES" ]; then
+        STILL_MISSING_COUNT=$(echo "$STILL_MISSING_TABLES" | grep -c . || echo "0")
+        log_warning "⚠ Found $STILL_MISSING_COUNT table(s) still missing in target - skipping column comparison for these tables"
+        log_warning "  Missing tables:"
+        echo "$STILL_MISSING_TABLES" | while read -r table; do
+            [ -z "$table" ] && continue
+            log_warning "    - $table"
+        done
+        log_to_file "$LOG_FILE" "WARNING: $STILL_MISSING_COUNT tables still missing, skipping column comparison"
+    else
+        log_success "✓ All source tables exist in target - proceeding with column comparison"
+        log_to_file "$LOG_FILE" "All source tables verified in target"
+    fi
     
     log_info "Extracting column information from source..."
     extract_columns_info "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$SOURCE_COLUMNS_FILE"
@@ -1702,27 +2037,74 @@ PYTHON_SCRIPT
                 log_info "Found $ACTUAL_COUNT schema difference(s) to apply"
                 log_to_file "$LOG_FILE" "Found $ACTUAL_COUNT schema differences"
                 
-                # Show what will be changed
-                log_info "Schema changes to apply:"
-                grep "^ALTER TABLE" "$SCHEMA_DIFF_SQL" | head -10 | while read -r line; do
-                    log_info "  - $line"
-                done
-                if [ "$ACTUAL_COUNT" -gt 10 ]; then
-                    log_info "  ... and $((ACTUAL_COUNT - 10)) more"
+                # Filter out ALTER TABLE statements for missing tables (if any still exist)
+                if [ -n "$STILL_MISSING_TABLES" ]; then
+                    FILTERED_SCHEMA_DIFF_SQL="$MIGRATION_DIR/schema_differences_filtered.sql"
+                    > "$FILTERED_SCHEMA_DIFF_SQL"
+                    while IFS= read -r line; do
+                        [ -z "$line" ] && continue
+                        # Check if this ALTER TABLE is for a missing table
+                        skip_line=false
+                        if echo "$line" | grep -q "^ALTER TABLE"; then
+                            # Extract schema.table from ALTER TABLE statement
+                            table_match=$(echo "$line" | sed -n 's/.*ALTER TABLE "\([^"]*\)"\."\([^"]*\)".*/\1.\2/p')
+                            if [ -n "$table_match" ]; then
+                                if echo "$STILL_MISSING_TABLES" | grep -Fxq "$table_match" 2>/dev/null; then
+                                    skip_line=true
+                                fi
+                            fi
+                        fi
+                        if [ "$skip_line" = "false" ]; then
+                            echo "$line" >> "$FILTERED_SCHEMA_DIFF_SQL"
+                        fi
+                    done < "$SCHEMA_DIFF_SQL"
+                    
+                    FILTERED_COUNT=$(grep -c "^ALTER TABLE" "$FILTERED_SCHEMA_DIFF_SQL" 2>/dev/null || echo "0")
+                    if [ "$FILTERED_COUNT" -lt "$ACTUAL_COUNT" ]; then
+                        log_info "Filtered out $((ACTUAL_COUNT - FILTERED_COUNT)) ALTER TABLE statement(s) for missing tables"
+                        SCHEMA_DIFF_SQL="$FILTERED_SCHEMA_DIFF_SQL"
+                        ACTUAL_COUNT=$FILTERED_COUNT
+                    fi
                 fi
                 
-                # Apply schema differences
-                log_info "Applying schema differences to target..."
-                set +e
-                if run_psql_script_with_fallback "Applying schema differences" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$SCHEMA_DIFF_SQL"; then
-                    log_success "✓ Schema differences applied successfully"
-                    log_to_file "$LOG_FILE" "SUCCESS: Schema differences applied"
+                if [ "$ACTUAL_COUNT" -gt 0 ]; then
+                    # Show what will be changed
+                    log_info "Schema changes to apply:"
+                    grep "^ALTER TABLE" "$SCHEMA_DIFF_SQL" | head -10 | while read -r line; do
+                        log_info "  - $line"
+                    done
+                    if [ "$ACTUAL_COUNT" -gt 10 ]; then
+                        log_info "  ... and $((ACTUAL_COUNT - 10)) more"
+                    fi
+                    
+                    # Apply schema differences with better error handling
+                    log_info "Applying schema differences to target..."
+                    set +e
+                    SCHEMA_DIFF_OUTPUT=$(mktemp)
+                    if run_psql_script_with_fallback "Applying schema differences" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$SCHEMA_DIFF_SQL" 2>"$SCHEMA_DIFF_OUTPUT"; then
+                        log_success "✓ Schema differences applied successfully"
+                        log_to_file "$LOG_FILE" "SUCCESS: Schema differences applied"
+                    else
+                        # Check for specific errors
+                        if [ -s "$SCHEMA_DIFF_OUTPUT" ]; then
+                            ERROR_COUNT=$(grep -ciE "error|failed" "$SCHEMA_DIFF_OUTPUT" 2>/dev/null | head -1 || echo "0")
+                            if [ "$ERROR_COUNT" -gt 0 ]; then
+                                log_warning "⚠ Some errors occurred while applying schema differences"
+                                log_warning "  First few errors:"
+                                grep -iE "error|failed" "$SCHEMA_DIFF_OUTPUT" 2>/dev/null | head -5 | while read -r error_line; do
+                                    [ -z "$error_line" ] && continue
+                                    log_warning "    - $error_line"
+                                done
+                            fi
+                        fi
+                        log_warning "  Review the SQL file: $SCHEMA_DIFF_SQL"
+                        log_to_file "$LOG_FILE" "WARNING: Some schema differences may not have been applied"
+                    fi
+                    rm -f "$SCHEMA_DIFF_OUTPUT"
+                    set -e
                 else
-                    log_warning "⚠ Some errors occurred while applying schema differences"
-                    log_warning "  Review the SQL file: $SCHEMA_DIFF_SQL"
-                    log_to_file "$LOG_FILE" "WARNING: Some schema differences may not have been applied"
+                    log_info "No schema differences to apply (all filtered out for missing tables)"
                 fi
-                set -e
             else
                 log_success "✓ No schema differences found - source and target schemas match"
                 log_to_file "$LOG_FILE" "No schema differences detected"
@@ -1737,7 +2119,235 @@ PYTHON_SCRIPT
         log_to_file "$LOG_FILE" "WARNING: Could not extract column information"
     fi
     
+    # CRITICAL: Re-verify all new columns were actually applied
+    # This ensures we catch any columns that failed to migrate
     log_info ""
+    log_info "Re-verifying all source columns exist in target after schema differences applied..."
+    log_to_file "$LOG_FILE" "Re-verifying all columns after schema differences applied"
+    
+    # Re-extract column information from both source and target to verify
+    VERIFY_SOURCE_COLUMNS="$MIGRATION_DIR/verify_source_columns.txt"
+    VERIFY_TARGET_COLUMNS="$MIGRATION_DIR/verify_target_columns.txt"
+    
+    extract_columns_info "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$VERIFY_SOURCE_COLUMNS"
+    extract_columns_info "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$VERIFY_TARGET_COLUMNS"
+    
+    if [ -s "$VERIFY_SOURCE_COLUMNS" ] && [ -s "$VERIFY_TARGET_COLUMNS" ]; then
+        # Find missing columns using Python
+        PYTHON_BIN=$(command -v python3 || command -v python || echo "")
+        if [ -n "$PYTHON_BIN" ]; then
+            MISSING_COLS_OUTPUT=$("$PYTHON_BIN" - "$VERIFY_SOURCE_COLUMNS" "$VERIFY_TARGET_COLUMNS" <<'PYTHON_VERIFY'
+import sys
+from collections import defaultdict
+
+source_file = sys.argv[1]
+target_file = sys.argv[2]
+
+def parse_columns(file_path):
+    columns = defaultdict(set)  # {schema.table: {column_names}}
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('|')
+            if len(parts) >= 3:
+                schema, table, column = parts[0], parts[1], parts[2]
+                key = f"{schema}.{table}"
+                columns[key].add(column)
+    return columns
+
+source_cols = parse_columns(source_file)
+target_cols = parse_columns(target_file)
+
+missing_cols = []
+for table_key, source_table_cols in source_cols.items():
+    target_table_cols = target_cols.get(table_key, set())
+    for col_name in source_table_cols:
+        if col_name not in target_table_cols:
+            missing_cols.append(f"{table_key}.{col_name}")
+
+if missing_cols:
+    print("\n".join(missing_cols))
+    sys.exit(1)
+else:
+    print("0")
+    sys.exit(0)
+PYTHON_VERIFY
+)
+            
+            MISSING_COLS_EXIT=$?
+            if [ $MISSING_COLS_EXIT -eq 1 ] && [ -n "$MISSING_COLS_OUTPUT" ]; then
+                MISSING_COLS_COUNT=$(echo "$MISSING_COLS_OUTPUT" | grep -c . || echo "0")
+                if [ "$MISSING_COLS_COUNT" -gt 0 ]; then
+                    log_warning "⚠ Found $MISSING_COLS_COUNT column(s) still missing in target after schema differences applied:"
+                    echo "$MISSING_COLS_OUTPUT" | while read -r missing_col; do
+                        [ -z "$missing_col" ] && continue
+                        log_warning "    - $missing_col"
+                    done
+                    log_to_file "$LOG_FILE" "WARNING: $MISSING_COLS_COUNT columns still missing after schema differences"
+                    
+                    # Try to apply missing columns one more time
+                    log_info "Attempting to apply missing columns again..."
+                    MISSING_COLS_SQL="$MIGRATION_DIR/missing_columns_retry.sql"
+                    > "$MISSING_COLS_SQL"
+                    
+                    echo "$MISSING_COLS_OUTPUT" | while IFS='.' read -r schema table column; do
+                        [ -z "$schema" ] || [ -z "$table" ] || [ -z "$column" ] && continue
+                        # Extract column definition from source
+                        COL_DEF=$(grep "^${schema}|${table}|${column}|" "$VERIFY_SOURCE_COLUMNS" | head -1)
+                        if [ -n "$COL_DEF" ]; then
+                            COL_PARTS=$(echo "$COL_DEF" | tr '|' '\n')
+                            # Get data type, nullable, default from COL_DEF
+                            # Format: schema|table|column|data_type|formatted_type|is_nullable|default|position
+                            FORMATTED_TYPE=$(echo "$COL_DEF" | cut -d'|' -f5)
+                            IS_NULLABLE=$(echo "$COL_DEF" | cut -d'|' -f6)
+                            DEFAULT_VAL=$(echo "$COL_DEF" | cut -d'|' -f7)
+                            
+                            STMT="ALTER TABLE \"${schema}\".\"${table}\" ADD COLUMN \"${column}\" ${FORMATTED_TYPE}"
+                            if [ -n "$DEFAULT_VAL" ] && [ "$DEFAULT_VAL" != "" ]; then
+                                STMT="${STMT} DEFAULT ${DEFAULT_VAL}"
+                            fi
+                            if [ "$IS_NULLABLE" = "NO" ]; then
+                                STMT="${STMT} NOT NULL"
+                            fi
+                            echo "${STMT};" >> "$MISSING_COLS_SQL"
+                        fi
+                    done
+                    
+                    if [ -s "$MISSING_COLS_SQL" ]; then
+                        set +e
+                        if run_psql_script_with_fallback "Retrying missing columns" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$MISSING_COLS_SQL"; then
+                            log_success "✓ Successfully applied missing columns on retry"
+                            log_to_file "$LOG_FILE" "SUCCESS: Missing columns applied on retry"
+                        else
+                            log_warning "⚠ Some columns may still be missing after retry"
+                            log_to_file "$LOG_FILE" "WARNING: Some columns still missing after retry"
+                        fi
+                        set -e
+                    fi
+                fi
+            else
+                log_success "✓ All source columns verified in target after schema differences applied"
+                log_to_file "$LOG_FILE" "SUCCESS: All columns verified after schema differences"
+            fi
+        fi
+    fi
+    
+    log_info ""
+
+# Step 4.1: Detect and Apply Missing Constraints (PRIMARY KEY, UNIQUE, CHECK, FOREIGN KEY)
+# New or updated tables may have constraints in source that are missing in target; sync them
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Step 4.1: Detecting and Applying Missing Constraints"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
+
+log_info "Extracting table constraints from source and target..."
+log_to_file "$LOG_FILE" "Extracting and comparing table constraints"
+
+# Extract full constraint definitions (PK, UNIQUE, CHECK, FK) using pg_constraint + pg_get_constraintdef
+extract_constraints_definitions() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local output_file=$5
+    # Output: schema TAB table TAB constraint_name TAB constraint_def (one line per constraint; newlines in def replaced by space)
+    local query="
+        SELECT n.nspname || E'\t' || c.relname || E'\t' || con.conname || E'\t' || REPLACE(pg_get_constraintdef(con.oid, true), E'\n', ' ')
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND n.nspname NOT LIKE 'pg_toast%'
+          AND n.nspname NOT IN ('storage', 'auth')
+          AND c.relkind = 'r'
+          AND con.contype IN ('p', 'u', 'c', 'f')
+        ORDER BY n.nspname, c.relname, con.conname;
+    "
+    run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" > "$output_file" 2>/dev/null || true
+}
+
+CONSTRAINTS_SOURCE_RAW="$MIGRATION_DIR/constraints_source_defs.txt"
+CONSTRAINTS_TARGET_RAW="$MIGRATION_DIR/constraints_target_defs.txt"
+MISSING_CONSTRAINTS_SQL="$MIGRATION_DIR/missing_constraints.sql"
+
+extract_constraints_definitions "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$CONSTRAINTS_SOURCE_RAW"
+extract_constraints_definitions "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$CONSTRAINTS_TARGET_RAW"
+
+# Build list of constraint keys (schema.table.constraint_name) in target
+TARGET_CONSTRAINT_KEYS="$MIGRATION_DIR/target_constraint_keys.txt"
+if [ -s "$CONSTRAINTS_TARGET_RAW" ]; then
+    while IFS=$'\t' read -r schema table name _rest; do
+        [ -z "$schema" ] && continue
+        echo "${schema}.${table}.${name}"
+    done < "$CONSTRAINTS_TARGET_RAW" | sort -u > "$TARGET_CONSTRAINT_KEYS"
+else
+    > "$TARGET_CONSTRAINT_KEYS"
+fi
+
+# Reuse target table list from Step 4 so we only add constraints on tables that exist in target
+TARGET_TABLES_FOR_CONSTRAINTS="${CURRENT_TARGET_TABLES_FILE:-$TARGET_TABLES_FILE}"
+if [ ! -s "$TARGET_TABLES_FOR_CONSTRAINTS" ]; then
+    get_table_list "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$MIGRATION_DIR/target_tables_for_constraints.txt"
+    TARGET_TABLES_FOR_CONSTRAINTS="$MIGRATION_DIR/target_tables_for_constraints.txt"
+fi
+
+# For each source constraint not in target, generate ALTER TABLE ADD CONSTRAINT (only for tables that exist in target)
+# Collect in temp file then sort so FOREIGN KEY constraints are applied last (they reference other tables)
+MISSING_CONSTRAINTS_TMP="$MIGRATION_DIR/missing_constraints_tmp.sql"
+> "$MISSING_CONSTRAINTS_TMP"
+MISSING_CONSTRAINT_COUNT=0
+if [ -s "$CONSTRAINTS_SOURCE_RAW" ] && [ -s "$TARGET_TABLES_FOR_CONSTRAINTS" ]; then
+    while IFS=$'\t' read -r schema table constraint_name constraint_def; do
+        [ -z "$schema" ] && continue
+        table_key="${schema}.${table}"
+        if ! grep -Fxq "$table_key" "$TARGET_TABLES_FOR_CONSTRAINTS" 2>/dev/null; then
+            continue
+        fi
+        key="${table_key}.${constraint_name}"
+        if ! grep -Fxq "$key" "$TARGET_CONSTRAINT_KEYS" 2>/dev/null; then
+            printf 'ALTER TABLE "%s"."%s" ADD CONSTRAINT "%s" %s;\n' "$schema" "$table" "$constraint_name" "$constraint_def" >> "$MISSING_CONSTRAINTS_TMP"
+            MISSING_CONSTRAINT_COUNT=$((MISSING_CONSTRAINT_COUNT + 1))
+        fi
+    done < "$CONSTRAINTS_SOURCE_RAW"
+fi
+# Order: non-FK first, then FOREIGN KEY (so referenced tables/constraints exist first)
+if [ -s "$MISSING_CONSTRAINTS_TMP" ]; then
+    grep -v "FOREIGN KEY" "$MISSING_CONSTRAINTS_TMP" > "$MISSING_CONSTRAINTS_SQL" 2>/dev/null || true
+    grep "FOREIGN KEY" "$MISSING_CONSTRAINTS_TMP" >> "$MISSING_CONSTRAINTS_SQL" 2>/dev/null || true
+fi
+
+if [ "$MISSING_CONSTRAINT_COUNT" -gt 0 ] && [ -s "$MISSING_CONSTRAINTS_SQL" ]; then
+    log_info "Found $MISSING_CONSTRAINT_COUNT constraint(s) in source missing from target"
+    log_to_file "$LOG_FILE" "Applying $MISSING_CONSTRAINT_COUNT missing constraints to target"
+    # Apply each statement separately so one failure doesn't skip the rest
+    APPLIED=0
+    FAILED=0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        if run_psql_command_with_fallback "Applying missing constraint" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$line"; then
+            APPLIED=$((APPLIED + 1))
+        else
+            FAILED=$((FAILED + 1))
+            log_warning "  Failed to apply: ${line:0:80}..."
+            log_to_file "$LOG_FILE" "WARNING: Failed to apply constraint: $line"
+        fi
+    done < "$MISSING_CONSTRAINTS_SQL"
+    if [ "$APPLIED" -gt 0 ]; then
+        log_success "✓ Applied $APPLIED missing constraint(s)"
+        log_to_file "$LOG_FILE" "SUCCESS: Applied $APPLIED missing constraints"
+    fi
+    if [ "$FAILED" -gt 0 ]; then
+        log_warning "⚠ $FAILED constraint(s) could not be applied (may need manual review)"
+        log_to_file "$LOG_FILE" "WARNING: $FAILED constraints could not be applied"
+    fi
+else
+    log_success "✓ No missing constraints detected - target constraints in sync with source"
+    log_to_file "$LOG_FILE" "No missing constraints to apply"
+fi
+echo ""
 
 # Step 4a: Migrate Storage RLS Policies (ALWAYS RUN - independent of restore success)
 # Storage schema is excluded from main migration, so we need to migrate RLS policies separately
@@ -2162,7 +2772,12 @@ else
 fi
 echo ""
 
-# Step 5: Verify and retry policies/roles if needed
+# Step 5: Extract and Apply RLS Policies (AFTER all schema changes complete)
+# CRITICAL: This step runs AFTER Step 4 (schema differences) to ensure policies for new columns are captured
+# Policies are extracted directly from source database to get the latest state including:
+# - Policies for newly created tables (from Step 3.5)
+# - Policies that reference newly added columns (from Step 4)
+# - All existing policies
 if [ "$RESTORE_SUCCESS" = "true" ]; then
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "  Step 5: Verifying Policies and Roles"
@@ -2172,22 +2787,22 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
     log_info "Verifying RLS policies and roles migration..."
     log_to_file "$LOG_FILE" "Verifying RLS policies and roles migration"
     
-    # Function to count policies in a database (ALL schemas, not just public)
+    # Function to count policies in a database (migratable schemas only - excludes protected/platform schemas)
+    # Must match schemas excluded from pg_dump (PROTECTED_SCHEMAS) so count is comparable and we only migrate policies we can apply
     count_policies() {
         local ref=$1
         local password=$2
         local pooler_region=$3
         local pooler_port=$4
         
-        # Count policies from ALL schemas (not just public) - use pg_policy directly
         local query="
-            SELECT COUNT(*) 
+            SELECT COUNT(*)
             FROM pg_policy pol
             JOIN pg_class c ON c.oid = pol.polrelid
             JOIN pg_namespace n ON n.oid = c.relnamespace
             WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
               AND n.nspname NOT LIKE 'pg_toast%'
-              AND n.nspname != 'storage';  -- Storage policies counted separately
+              AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor');
         "
         run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" 2>/dev/null | tr -d '[:space:]' || echo "0"
     }
@@ -2203,8 +2818,8 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
         run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" 2>/dev/null | tr -d '[:space:]' || echo "0"
     }
     
-    # Get policy and role counts from source
-    log_info "Counting policies and roles in source database..."
+    # Get policy and role counts from source (migratable schemas only - excludes auth, vault, storage, etc.)
+    log_info "Counting policies and roles in source database (migratable schemas only)..."
     SOURCE_POLICY_COUNT=$(count_policies "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
     SOURCE_ROLE_COUNT=$(count_roles "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT")
     
@@ -2268,16 +2883,16 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
         local pooler_region=$3
         local pooler_port=$4
 
-        local query="SELECT schemaname || '.' || tablename || '|' || policyname FROM pg_policies WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND schemaname NOT LIKE 'pg_toast%' ORDER BY schemaname, tablename, policyname;"
+        local query="SELECT schemaname || '.' || tablename || '|' || policyname FROM pg_policies WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND schemaname NOT LIKE 'pg_toast%' AND schemaname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor') ORDER BY schemaname, tablename, policyname;"
         run_psql_query_with_fallback \"$ref\" \"$password\" \"$pooler_region\" \"$pooler_port\" \"$query\" 2>/dev/null || echo \"\"
     }
 
         # Function to get tables with RLS enabled (ALL schemas)
-        get_rls_enabled_tables() {
-            local ref=$1
-            local password=$2
-            local pooler_region=$3
-            local pooler_port=$4
+    get_rls_enabled_tables() {
+        local ref=$1
+        local password=$2
+        local pooler_region=$3
+        local pooler_port=$4
 
             local query="
                 SELECT n.nspname || '.' || c.relname
@@ -2285,13 +2900,13 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                   AND n.nspname NOT LIKE 'pg_toast%'
-                  AND n.nspname != 'storage'
+                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
                   AND c.relrowsecurity = true
                   AND c.relkind = 'r'
                 ORDER BY n.nspname, c.relname;
             "
             run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" 2>/dev/null || echo ""
-        }
+    }
 
     # Function to get all tables
     get_table_list() {
@@ -2299,9 +2914,10 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
         local password=$2
         local pooler_region=$3
         local pooler_port=$4
+        local output_file=$5
 
-        local query=\"SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND schemaname NOT LIKE 'pg_toast%' ORDER BY schemaname, tablename;\"
-        run_psql_query_with_fallback \"$ref\" \"$password\" \"$pooler_region\" \"$pooler_port\" \"$query\" 2>/dev/null || echo \"\"
+        local query="SELECT schemaname || '.' || tablename FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND schemaname NOT LIKE 'pg_toast%' ORDER BY schemaname, tablename;"
+        run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" > "$output_file" 2>/dev/null || echo ""
     }
 
     # Get detailed lists from source and target
@@ -2346,7 +2962,7 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
     if [ -n \"$MISSING_POLICIES\" ]; then
         MISSING_POLICY_COUNT=$(echo \"$MISSING_POLICIES\" | grep -c . || echo \"0\")
         POLICY_MISMATCH=true
-        log_warning \"⚠ Found $MISSING_POLICY_COUNT missing policy(ies) by name!\"
+        log_warning \"⚠ Found $MISSING_POLICY_COUNT missing policies by name\"
         log_warning \"  Missing policies:\"
         echo \"$MISSING_POLICIES\" | while IFS='|' read -r table_name policy_name; do
             log_warning \"    - Table: $table_name, Policy: $policy_name\"
@@ -2360,7 +2976,7 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
 
     if [ -n \"$MISSING_RLS_TABLES\" ]; then
         MISSING_RLS_COUNT=$(echo \"$MISSING_RLS_TABLES\" | grep -c . || echo \"0\")
-        log_warning \"⚠ Found $MISSING_RLS_COUNT table(s) missing RLS enabled!\"
+        log_warning \"⚠ Found $MISSING_RLS_COUNT tables missing RLS enabled\"
         log_warning \"  Tables missing RLS:\"
         echo \"$MISSING_RLS_TABLES\" | while read -r table; do
             log_warning \"    - $table\"
@@ -2374,26 +2990,39 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
 
     if [ -n \"$MISSING_TABLES\" ]; then
         MISSING_TABLE_COUNT=$(echo \"$MISSING_TABLES\" | grep -c . || echo \"0\")
-        log_warning \"⚠ Found $MISSING_TABLE_COUNT missing table(s)!\"
-        log_warning \"  Missing tables:\"
+        log_error \"✗ Found $MISSING_TABLE_COUNT missing tables in target\"
+        log_error \"  These tables should have been created in Step 3.5\"
+        log_error \"  Missing tables:\"
         echo \"$MISSING_TABLES\" | while read -r table; do
-            log_warning \"    - $table\"
+            [ -z \"$table\" ] && continue
+            log_error \"    - $table\"
         done
-        log_to_file \"$LOG_FILE\" \"WARNING: $MISSING_TABLE_COUNT tables missing\"
+        log_to_file \"$LOG_FILE\" \"ERROR: $MISSING_TABLE_COUNT tables still missing after Step 3.5\"
 
         MISSING_TABLES_FILE=\"$MIGRATION_DIR/missing_tables.txt\"
         echo \"$MISSING_TABLES\" > \"$MISSING_TABLES_FILE\"
-        log_info \"  Missing tables saved to: $MISSING_TABLES_FILE\"
+        log_error \"  Missing tables saved to: $MISSING_TABLES_FILE\"
+        log_error \"  ACTION REQUIRED: These tables need to be created manually or migration needs to be re-run\"
+    else
+        log_success \"✓ All source tables exist in target - verified after Step 3.5\"
+        log_to_file \"$LOG_FILE\" \"SUCCESS: All source tables verified in target\"
     fi
 
     # If gaps found, trigger retry logic even if counts matched
+    # Note: Missing tables should have been created in Step 3.5, so this is a critical issue
     if [ -n \"$MISSING_POLICIES\" ] || [ -n \"$MISSING_RLS_TABLES\" ] || [ -n \"$MISSING_TABLES\" ]; then
         POLICY_MISMATCH=true
-        log_warning \"⚠ Gaps detected - will attempt to fix even though counts matched\"
+        if [ -n \"$MISSING_TABLES\" ]; then
+            log_error \"✗ CRITICAL: Missing tables detected - Step 3.5 should have created these\"
+            log_error \"  Will attempt to fix policies/RLS, but missing tables must be addressed\"
+        else
+            log_warning \"⚠ Gaps detected - will attempt to fix even though counts matched\"
+        fi
     fi
 
     if [ -z \"$MISSING_POLICIES\" ] && [ -z \"$MISSING_RLS_TABLES\" ] && [ -z \"$MISSING_TABLES\" ]; then
         log_success \"✓ All policies, RLS settings, and tables match by name\"
+        log_success \"✓ Complete schema parity achieved between source and target\"
     fi
     
     # If there's a mismatch, try to extract and re-apply policies/roles
@@ -2403,10 +3032,13 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
         
         # CRITICAL FIX: Extract policies directly from database (not just dump) to preserve roles correctly
         # Dump files may not preserve role information correctly, so we extract directly from pg_policy
+        # This includes policies for newly created tables from Step 3.5
         log_info "Extracting ALL policies directly from source database (to preserve roles)..."
-        log_to_file "$LOG_FILE" "Extracting all policies directly from database to preserve roles"
+        log_info "  This includes policies for all tables, including newly created ones from Step 3.5"
+        log_to_file "$LOG_FILE" "Extracting all policies directly from database to preserve roles (including newly created tables)"
         
         # Function to extract ALL policies directly from database with complete role information
+        # This function extracts policies for ALL tables including newly created ones
         extract_all_policies_from_db() {
             local ref=$1
             local password=$2
@@ -2449,7 +3081,7 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
                 LEFT JOIN pg_roles rol ON rol.oid = ANY(pol.polroles)
                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                   AND n.nspname NOT LIKE 'pg_toast%'
-                  AND n.nspname != 'storage'  -- Storage policies handled separately in Step 4a
+                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
                 GROUP BY pol.polname, n.nspname, c.relname, pol.polcmd, pol.polqual, pol.polrelid, pol.polwithcheck, pol.polroles
                 ORDER BY n.nspname, c.relname, pol.polname;
             "
@@ -2492,27 +3124,107 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
             
             # CRITICAL FIX: Enable RLS on ALL tables that have policies (not just those with RLS already enabled)
             # This ensures RLS is enabled before policies are applied
+            # This includes newly created tables from Step 3.5
             log_info "Ensuring RLS is enabled on ALL tables that have policies..."
-            log_to_file "$LOG_FILE" "Ensuring RLS is enabled on all tables with policies"
+            log_info "  This includes newly created tables from Step 3.5"
+            log_to_file "$LOG_FILE" "Ensuring RLS is enabled on all tables with policies (including newly created tables)"
             
             RLS_ENABLE_SQL="$MIGRATION_DIR/rls_enable_fix.sql"
             run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "
-                SELECT DISTINCT 'ALTER TABLE ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || 
+                SELECT DISTINCT 'ALTER TABLE ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) ||
                        ' ENABLE ROW LEVEL SECURITY;'
                 FROM pg_policy pol
                 JOIN pg_class c ON c.oid = pol.polrelid
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                   AND n.nspname NOT LIKE 'pg_toast%'
-                  AND n.nspname != 'storage'  -- Storage policies handled separately
-                  AND c.relkind = 'r'  -- Only tables, not views
+                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
+                  AND c.relkind = 'r'
                 ORDER BY n.nspname, c.relname;
             " > "$RLS_ENABLE_SQL" 2>/dev/null || echo ""
             
             if [ -s "$RLS_ENABLE_SQL" ]; then
                 RLS_ENABLE_COUNT=$(grep -c "ENABLE ROW LEVEL SECURITY" "$RLS_ENABLE_SQL" 2>/dev/null || echo "0")
                 log_info "Found $RLS_ENABLE_COUNT table(s) with policies that need RLS enabled"
-                log_to_file "$LOG_FILE" "Found $RLS_ENABLE_COUNT tables with policies that need RLS enabled"
+                log_info "  This includes newly created tables from Step 3.5"
+                log_to_file "$LOG_FILE" "Found $RLS_ENABLE_COUNT tables with policies that need RLS enabled (including newly created tables)"
+                
+                # Apply RLS enable statements to target (including newly created tables)
+                log_info "Enabling RLS on all tables with policies (including newly created ones)..."
+                set +e
+                if run_psql_script_with_fallback "Enabling RLS on all tables with policies" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$RLS_ENABLE_SQL"; then
+                    log_success "✓ RLS enabled on all tables with policies (including newly created tables)"
+                    log_to_file "$LOG_FILE" "RLS enabled on all tables with policies successfully"
+                else
+                    log_warning "⚠ Some errors occurred while enabling RLS (some tables may already have RLS enabled)"
+                    log_to_file "$LOG_FILE" "WARNING: Some errors occurred while enabling RLS"
+                fi
+                set -e
+            fi
+
+            # CRITICAL: When policies were extracted from DB, we must drop existing target policies and apply the extracted ones
+            # (The dump-fallback path below does this inside its block; the DB path must do it here.)
+            log_info "Dropping existing policies on target before applying extracted policies..."
+            log_to_file "$LOG_FILE" "Dropping existing policies from all schemas before re-application (DB extraction path)"
+            DROP_POLICIES_SQL="$MIGRATION_DIR/drop_all_policies.sql"
+            run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "
+                SELECT 'DROP POLICY IF EXISTS ' || quote_ident(pol.polname) || ' ON ' ||
+                       quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ';'
+                FROM pg_policy pol
+                JOIN pg_class c ON c.oid = pol.polrelid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                  AND n.nspname NOT LIKE 'pg_toast%'
+                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
+                ORDER BY n.nspname, c.relname, pol.polname;
+            " > "$DROP_POLICIES_SQL" 2>/dev/null || echo ""
+
+            if [ -s "$DROP_POLICIES_SQL" ]; then
+                DROP_COUNT=$(grep -c "^DROP POLICY" "$DROP_POLICIES_SQL" 2>/dev/null || echo "0")
+                log_info "Dropping $DROP_COUNT existing policy(ies) from all schemas..."
+                set +e
+                run_psql_script_with_fallback "Dropping existing policies" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$DROP_POLICIES_SQL" >/dev/null 2>&1
+                set -e
+            fi
+
+            log_info "Applying $ALL_POLICY_COUNT policy(ies) to target..."
+            POLICY_APPLY_SUCCESS=false
+            MAX_RETRIES=3
+            RETRY_COUNT=0
+            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$POLICY_APPLY_SUCCESS" != "true" ]; do
+                RETRY_COUNT=$((RETRY_COUNT + 1))
+                log_info "Applying policies (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+                POLICY_APPLY_OUTPUT=$(mktemp)
+                if run_psql_script_with_fallback "Applying policies from DB extraction" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$POLICY_SQL" 2>"$POLICY_APPLY_OUTPUT"; then
+                    sleep 2
+                    NEW_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                    if [ -s "$POLICY_APPLY_OUTPUT" ]; then
+                        POLICY_ERRORS=$(grep -iE "error|failed|syntax error" "$POLICY_APPLY_OUTPUT" 2>/dev/null | grep -viE "already exists|does not exist" || echo "")
+                        if [ -n "$POLICY_ERRORS" ]; then
+                            log_warning "⚠ Some policy application errors detected:"
+                            echo "$POLICY_ERRORS" | head -5 | while read -r error_line; do
+                                [ -z "$error_line" ] && continue
+                                log_warning "    - $error_line"
+                            done
+                        fi
+                    fi
+                    if [ "$NEW_TARGET_POLICY_COUNT" = "$SOURCE_POLICY_COUNT" ]; then
+                        POLICY_APPLY_SUCCESS=true
+                        log_success "✓ All policies applied successfully (target: $NEW_TARGET_POLICY_COUNT)"
+                        TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+                    elif [ "$NEW_TARGET_POLICY_COUNT" -gt "$TARGET_POLICY_COUNT" ]; then
+                        log_info "Policy count increased to $NEW_TARGET_POLICY_COUNT (was $TARGET_POLICY_COUNT)"
+                        TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+                    fi
+                else
+                    log_warning "Policy application attempt $RETRY_COUNT failed"
+                    [ -s "$POLICY_APPLY_OUTPUT" ] && head -5 "$POLICY_APPLY_OUTPUT" | while read -r line; do log_warning "  - $line"; done
+                fi
+                rm -f "$POLICY_APPLY_OUTPUT"
+            done
+            if [ "$POLICY_APPLY_SUCCESS" != "true" ]; then
+                log_warning "⚠ Not all policies could be applied; check log and $POLICY_SQL"
+                log_to_file "$LOG_FILE" "WARNING: Policy application from DB extraction did not reach source count"
             fi
         else
             log_warning "⚠ Failed to extract policies directly from database, falling back to dump extraction"
@@ -2610,14 +3322,14 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
                 
                 DROP_POLICIES_SQL="$MIGRATION_DIR/drop_all_policies.sql"
                 run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "
-                    SELECT 'DROP POLICY IF EXISTS ' || quote_ident(pol.polname) || ' ON ' || 
+                    SELECT 'DROP POLICY IF EXISTS ' || quote_ident(pol.polname) || ' ON ' ||
                            quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ';'
                     FROM pg_policy pol
                     JOIN pg_class c ON c.oid = pol.polrelid
                     JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                       AND n.nspname NOT LIKE 'pg_toast%'
-                      AND n.nspname != 'storage'  -- Storage policies handled separately in Step 4a
+                      AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
                     ORDER BY n.nspname, c.relname, pol.polname;
                 " > "$DROP_POLICIES_SQL" 2>/dev/null || echo ""
                 
@@ -2677,14 +3389,14 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
                                 JOIN pg_class c ON c.oid = pol.polrelid
                                 JOIN pg_namespace n ON n.oid = c.relnamespace
                                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                                  AND n.nspname != 'storage'
+                                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
                                 EXCEPT
                                 SELECT n.nspname || '.' || c.relname || '.' || pol.polname
                                 FROM pg_policy pol
                                 JOIN pg_class c ON c.oid = pol.polrelid
                                 JOIN pg_namespace n ON n.oid = c.relnamespace
                                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                                  AND n.nspname != 'storage';
+                                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor');
                             " 2>/dev/null | grep -v "^$" || echo "")
                             
                             if [ -n "$MISSING_POLICIES" ]; then
@@ -2810,7 +3522,7 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
                 JOIN pg_namespace n ON n.oid = c.relnamespace
                 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                   AND n.nspname NOT LIKE 'pg_toast%'
-                  AND n.nspname != 'storage'
+                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
                   AND c.relkind = 'r'
                   AND c.relrowsecurity = false
                 ORDER BY n.nspname, c.relname;
@@ -2978,6 +3690,157 @@ elif [ "$SOURCE_STORAGE_RLS" != "$TARGET_STORAGE_RLS" ]; then
     log_to_file "$LOG_FILE" "WARNING: Storage RLS mismatch"
 fi
 
+# CRITICAL: Final verification of all columns (including newly added ones)
+log_info ""
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Final Column Verification (New Fields Check)"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
+
+log_info "Performing final verification of all columns to ensure new fields are migrated..."
+log_to_file "$LOG_FILE" "Performing final column verification"
+
+# Extract final column lists from both source and target
+FINAL_SOURCE_COLUMNS="$MIGRATION_DIR/final_source_columns.txt"
+FINAL_TARGET_COLUMNS="$MIGRATION_DIR/final_target_columns.txt"
+
+extract_columns_info "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$FINAL_SOURCE_COLUMNS"
+extract_columns_info "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$FINAL_TARGET_COLUMNS"
+
+if [ -s "$FINAL_SOURCE_COLUMNS" ] && [ -s "$FINAL_TARGET_COLUMNS" ]; then
+    PYTHON_BIN=$(command -v python3 || command -v python || echo "")
+    if [ -n "$PYTHON_BIN" ]; then
+        FINAL_MISSING_COLS=$("$PYTHON_BIN" - "$FINAL_SOURCE_COLUMNS" "$FINAL_TARGET_COLUMNS" <<'PYTHON_FINAL'
+import sys
+from collections import defaultdict
+
+source_file = sys.argv[1]
+target_file = sys.argv[2]
+
+def parse_columns(file_path):
+    columns = defaultdict(set)
+    with open(file_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('|')
+            if len(parts) >= 3:
+                schema, table, column = parts[0], parts[1], parts[2]
+                key = f"{schema}.{table}"
+                columns[key].add(column)
+    return columns
+
+source_cols = parse_columns(source_file)
+target_cols = parse_columns(target_file)
+
+missing_cols = []
+for table_key, source_table_cols in source_cols.items():
+    target_table_cols = target_cols.get(table_key, set())
+    for col_name in source_table_cols:
+        if col_name not in target_table_cols:
+            missing_cols.append(f"{table_key}.{col_name}")
+
+if missing_cols:
+    print("\n".join(missing_cols))
+    sys.exit(1)
+else:
+    print("0")
+    sys.exit(0)
+PYTHON_FINAL
+)
+        
+        FINAL_COLS_EXIT=$?
+        if [ $FINAL_COLS_EXIT -eq 1 ] && [ -n "$FINAL_MISSING_COLS" ]; then
+            FINAL_MISSING_COUNT=$(echo "$FINAL_MISSING_COLS" | grep -c . || echo "0")
+            if [ "$FINAL_MISSING_COUNT" -gt 0 ]; then
+                log_error "✗ CRITICAL: Found $FINAL_MISSING_COUNT column(s) still missing in target after all migration steps:"
+                echo "$FINAL_MISSING_COLS" | while read -r missing_col; do
+                    [ -z "$missing_col" ] && continue
+                    log_error "    - $missing_col"
+                done
+                log_to_file "$LOG_FILE" "ERROR: $FINAL_MISSING_COUNT columns still missing after all steps"
+                
+                FINAL_MISSING_COLS_FILE="$MIGRATION_DIR/final_missing_columns.txt"
+                echo "$FINAL_MISSING_COLS" > "$FINAL_MISSING_COLS_FILE"
+                log_error "  Missing columns saved to: $FINAL_MISSING_COLS_FILE"
+                log_error "  ACTION REQUIRED: These columns need to be manually added or migration needs to be re-run"
+            fi
+        else
+            log_success "✓ All source columns verified in target (including newly added fields)"
+            log_to_file "$LOG_FILE" "SUCCESS: All columns verified - no missing fields"
+        fi
+    else
+        log_warning "⚠ Python not found - cannot perform final column verification"
+        log_to_file "$LOG_FILE" "WARNING: Final column verification skipped (Python not found)"
+    fi
+else
+    log_warning "⚠ Could not extract columns for final verification"
+    log_to_file "$LOG_FILE" "WARNING: Final column verification skipped (extraction failed)"
+fi
+
+# CRITICAL: Final verification of all policies (including for new tables/fields)
+log_info ""
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Final Policy Verification (New Tables/Fields Policies Check)"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
+
+log_info "Performing final verification of all policies to ensure new table/field policies are migrated..."
+log_to_file "$LOG_FILE" "Performing final policy verification"
+
+# Extract policy names from both source and target
+FINAL_SOURCE_POLICIES="$MIGRATION_DIR/final_source_policies.txt"
+FINAL_TARGET_POLICIES="$MIGRATION_DIR/final_target_policies.txt"
+
+run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "
+    SELECT n.nspname || '|' || c.relname || '|' || pol.polname
+    FROM pg_policy pol
+    JOIN pg_class c ON c.oid = pol.polrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
+    ORDER BY n.nspname, c.relname, pol.polname;
+" > "$FINAL_SOURCE_POLICIES" 2>/dev/null || echo ""
+
+run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "
+    SELECT n.nspname || '|' || c.relname || '|' || pol.polname
+    FROM pg_policy pol
+    JOIN pg_class c ON c.oid = pol.polrelid
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+      AND n.nspname NOT LIKE 'pg_toast%'
+      AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
+    ORDER BY n.nspname, c.relname, pol.polname;
+" > "$FINAL_TARGET_POLICIES" 2>/dev/null || echo ""
+
+if [ -s "$FINAL_SOURCE_POLICIES" ] && [ -s "$FINAL_TARGET_POLICIES" ]; then
+    # Find missing policies
+    FINAL_MISSING_POLICIES=$(comm -23 <(sort "$FINAL_SOURCE_POLICIES") <(sort "$FINAL_TARGET_POLICIES") 2>/dev/null || echo "")
+    
+    if [ -n "$FINAL_MISSING_POLICIES" ]; then
+        FINAL_MISSING_POLICY_COUNT=$(echo "$FINAL_MISSING_POLICIES" | grep -c . || echo "0")
+        log_error "✗ CRITICAL: Found $FINAL_MISSING_POLICY_COUNT policy(ies) still missing in target after all migration steps:"
+        echo "$FINAL_MISSING_POLICIES" | while IFS='|' read -r schema table policy; do
+            [ -z "$schema" ] || [ -z "$table" ] || [ -z "$policy" ] && continue
+            log_error "    - Schema: $schema, Table: $table, Policy: $policy"
+        done
+        log_to_file "$LOG_FILE" "ERROR: $FINAL_MISSING_POLICY_COUNT policies still missing after all steps"
+        
+        FINAL_MISSING_POLICIES_FILE="$MIGRATION_DIR/final_missing_policies.txt"
+        echo "$FINAL_MISSING_POLICIES" > "$FINAL_MISSING_POLICIES_FILE"
+        log_error "  Missing policies saved to: $FINAL_MISSING_POLICIES_FILE"
+        log_error "  ACTION REQUIRED: These policies need to be manually added or migration needs to be re-run"
+    else
+        log_success "✓ All source policies verified in target (including for newly created tables/fields)"
+        log_to_file "$LOG_FILE" "SUCCESS: All policies verified - no missing policies"
+    fi
+else
+    log_warning "⚠ Could not extract policies for final verification"
+    log_to_file "$LOG_FILE" "WARNING: Final policy verification skipped (extraction failed)"
+fi
+
 # Verify Policy Roles Match (Critical Check)
 log_info "Verifying policy roles match between source and target..."
 log_to_file "$LOG_FILE" "Verifying policy roles match"
@@ -3009,7 +3872,7 @@ get_policies_with_roles() {
         LEFT JOIN pg_roles rol ON rol.oid = ANY(pol.polroles)
         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
           AND n.nspname NOT LIKE 'pg_toast%'
-          AND n.nspname != 'storage'  -- Storage policies handled separately
+          AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
         GROUP BY n.nspname, c.relname, pol.polname, pol.polcmd
         ORDER BY n.nspname, c.relname, pol.polname;
     "
@@ -3206,7 +4069,7 @@ run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_RE
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
       AND n.nspname NOT LIKE 'pg_toast%'
-      AND n.nspname != 'storage'
+      AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
     ORDER BY 1;
 " > "$POLICY_DIFF_SQL_SOURCE" 2>/dev/null || true
 run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "
@@ -3216,7 +4079,7 @@ run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_RE
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
       AND n.nspname NOT LIKE 'pg_toast%'
-      AND n.nspname != 'storage'
+      AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
     ORDER BY 1;
 " > "$POLICY_DIFF_SQL_TARGET" 2>/dev/null || true
 if [ -s "$POLICY_DIFF_SQL_SOURCE" ] && [ -s "$POLICY_DIFF_SQL_TARGET" ]; then
