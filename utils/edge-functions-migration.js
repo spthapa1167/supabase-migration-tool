@@ -357,6 +357,65 @@ function loadEnvFile() {
 // Load environment variables
 loadEnvFile();
 
+// Application name for per-app state (SUPABASE_APP_NAME or SUPABSE_APP_NAME typo from .env.local)
+function getAppName() {
+    if (appNameOverride != null && String(appNameOverride).trim() !== '') {
+        return String(appNameOverride).trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+    const name = process.env.SUPABASE_APP_NAME || process.env.SUPABSE_APP_NAME || '';
+    const sanitized = (typeof name === 'string' ? name : '').trim().replace(/[^a-zA-Z0-9_-]/g, '_') || 'default';
+    return sanitized || 'default';
+}
+
+// Target environment for per-env state (test, prod, dev, backup). Used in state path.
+function getTargetEnv() {
+    if (targetEnvOverride != null && String(targetEnvOverride).trim() !== '') {
+        return String(targetEnvOverride).trim().toLowerCase().replace(/[^a-zA-Z0-9_-]/g, '_') || 'default';
+    }
+    return 'default';
+}
+
+// Path to deploy state file: edge_function_deploy_state/<APP_NAME>/<TARGET_ENV>.json
+function getDeployStatePath() {
+    const appName = getAppName();
+    const envName = getTargetEnv();
+    return path.join(PROJECT_ROOT, 'edge_function_deploy_state', appName, `${envName}.json`);
+}
+
+// Load last-deployed state for (app, target env). Returns {} on missing/invalid.
+function loadDeployState() {
+    try {
+        const stateFile = getDeployStatePath();
+        if (!fs.existsSync(stateFile)) {
+            return {};
+        }
+        const raw = fs.readFileSync(stateFile, 'utf8');
+        const state = JSON.parse(raw);
+        return typeof state === 'object' && state !== null ? state : {};
+    } catch {
+        return {};
+    }
+}
+
+// Update last-deployed timestamp for a function (per application and target env).
+// State path: edge_function_deploy_state/<APP_NAME>/<TARGET_ENV>.json
+function updateLastDeployedTimestamp(functionName) {
+    try {
+        const stateFile = getDeployStatePath();
+        const stateDir = path.dirname(stateFile);
+        if (!fs.existsSync(stateDir)) {
+            fs.mkdirSync(stateDir, { recursive: true });
+        }
+        const state = loadDeployState();
+        state[functionName] = new Date().toISOString();
+        const tmpFile = `${stateFile}.${process.pid}.${Date.now()}`;
+        fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf8');
+        fs.renameSync(tmpFile, stateFile);
+    } catch (err) {
+        logWarning(`Could not update last-deployed state for ${functionName}: ${err.message}`);
+    }
+}
+
 // Configuration from arguments
 const SOURCE_REF = process.argv[2];
 const TARGET_REF = process.argv[3];
@@ -370,6 +429,8 @@ let allowPartialFilter = false;
 let incrementalMode = false;
 let replaceMode = false;
 let retryMissingMode = false;
+let appNameOverride = null;
+let targetEnvOverride = null;
 
 for (const rawArg of additionalArgs) {
     if (!rawArg) continue;
@@ -379,6 +440,10 @@ for (const rawArg of additionalArgs) {
         filterList = filterList.concat(names);
     } else if (rawArg.startsWith('--filter-file=')) {
         filterFilePath = rawArg.split('=')[1] || '';
+    } else if (rawArg.startsWith('--app-name=')) {
+        appNameOverride = rawArg.split('=')[1] || '';
+    } else if (rawArg.startsWith('--target-env=')) {
+        targetEnvOverride = rawArg.split('=')[1] || '';
     } else if (rawArg === '--allow-missing') {
         allowPartialFilter = true;
     } else if (rawArg === '--incremental' || rawArg === '--increment') {
@@ -2161,7 +2226,9 @@ async function migrateEdgeFunctions() {
     
     // Determine which functions need migration
     const functionsToMigrate = [];
-    
+    const deployState = loadDeployState(); // last-deployed per (app, target env)
+    const skippedByDeployState = [];
+
     for (const sourceFunction of sourceFunctions) {
         const functionName = sourceFunction.name;
         const existingFunction = replaceMode ? null : targetFunctionMap.get(functionName);
@@ -2169,6 +2236,18 @@ async function migrateEdgeFunctions() {
         if (!functionName) {
             failedFunctions.push('(unnamed)');
             continue;
+        }
+
+        // Skip if we already deployed this version for this (app, target env) and source hasn't changed
+        const lastDeployedAt = deployState[functionName];
+        if (lastDeployedAt != null && !replaceMode) {
+            const stateTs = normalizeTimestamp(lastDeployedAt);
+            const sourceUpdated = normalizeTimestamp(sourceFunction.updated_at ?? sourceFunction.updatedAt);
+            if (sourceUpdated !== null && stateTs !== null && sourceUpdated <= stateTs) {
+                skippedByDeployState.push(functionName);
+                skippedFunctions.push(functionName);
+                continue;
+            }
         }
         
         if (existingFunction && !replaceMode) {
@@ -2208,7 +2287,14 @@ async function migrateEdgeFunctions() {
         logInfo(`  Skipped: ${previewList}${identicalFunctions.length > previewCount ? ', …' : ''}`);
         console.log('');
     }
-    
+    if (skippedByDeployState.length > 0) {
+        logSuccess(`Skipped (already deployed for this env, source unchanged): ${skippedByDeployState.length}`);
+        const previewCount = Math.min(skippedByDeployState.length, 10);
+        const previewList = skippedByDeployState.slice(0, previewCount).join(', ');
+        logInfo(`  Skipped: ${previewList}${skippedByDeployState.length > previewCount ? ', …' : ''}`);
+        console.log('');
+    }
+
     // Check if all functions are already in target (or skipped due to identical versions)
     if (functionsToMigrate.length === 0) {
         if (sourceFunctions.length === 0) {
@@ -2435,6 +2521,7 @@ async function migrateEdgeFunctions() {
             
             if (deploySuccess) {
                 migratedFunctions.push(functionName);
+                updateLastDeployedTimestamp(functionName);
                 logSuccess(`  ✓ Function ${isNew ? 'created' : 'updated'} successfully`);
             } else if (isIncompatible) {
                 incompatibleFunctions.push(functionName);

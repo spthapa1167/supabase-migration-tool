@@ -13,7 +13,6 @@ cd "$PROJECT_ROOT"
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
-source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
 # Helper function for reliable database connections (same as database_migration.sh)
 # Helper: run psql script file with fallback

@@ -16,7 +16,6 @@ cd "$PROJECT_ROOT"
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
-source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
 # Usage function (must be defined before it's called)
 usage() {
@@ -277,6 +276,18 @@ fi
 if [ "$RETRY_MISSING_MODE" = "true" ]; then
     node_args+=("--retryMissing")
 fi
+# Pass app name for per-application last-deployed state (SUPABASE_APP_NAME / SUPABSE_APP_NAME from .env.local)
+load_env 2>/dev/null || true
+APP_NAME_FOR_STATE=""
+if type get_supabase_app_name >/dev/null 2>&1; then
+    APP_NAME_FOR_STATE=$(get_supabase_app_name 2>/dev/null || true)
+fi
+if [ -n "$APP_NAME_FOR_STATE" ]; then
+    node_args+=("--app-name=$APP_NAME_FOR_STATE")
+fi
+if [ -n "$TARGET_ENV" ]; then
+    node_args+=("--target-env=$TARGET_ENV")
+fi
 
 # Run Node.js utility and capture output
 # Environment variables are loaded from .env.local by the Node.js script
@@ -315,36 +326,6 @@ if [ -f "$FAILED_FUNCTIONS_FILE" ]; then
         log_info "No edge function failures recorded (empty failure list)."
     fi
 fi
-
-# Generate HTML report
-if [ "$MIGRATION_SUCCESS" = "true" ]; then
-    STATUS="success"
-else
-    STATUS="failed"
-fi
-
-# Extract migration statistics from log
-MIGRATED_COUNT=$(grep -c "✓ Migrated\|✓ Deployed\|✓ Created" "$LOG_FILE" 2>/dev/null || echo "0")
-SKIPPED_COUNT=$(grep -c "⏭️.*Skipping\|already exists\|identical" "$LOG_FILE" 2>/dev/null || echo "0")
-FAILED_COUNT=$(grep -c "✗ Failed\|ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
-REMOVED_COUNT=$(grep -c "✓ Removed\|✓ Deleted" "$LOG_FILE" 2>/dev/null || echo "0")
-
-# Generate details section
-DETAILS_SECTION=$(format_migration_details "$LOG_FILE" "edge_functions")
-
-# Generate HTML report
-export MIGRATED_COUNT SKIPPED_COUNT FAILED_COUNT REMOVED_COUNT DETAILS_SECTION
-generate_migration_html_report \
-    "$MIGRATION_DIR" \
-    "$COMPONENT_NAME" \
-    "$SOURCE_ENV" \
-    "$TARGET_ENV" \
-    "$SOURCE_REF" \
-    "$TARGET_REF" \
-    "$STATUS" \
-    ""
-
-log_info "HTML report generated: $MIGRATION_DIR/result.html"
 
 if [ "$MIGRATION_SUCCESS" = "true" ]; then
     echo "$MIGRATION_DIR"  # Return migration directory for use by other scripts

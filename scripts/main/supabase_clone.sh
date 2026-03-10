@@ -122,7 +122,7 @@ if [ ${#EXTRA_FLAGS[@]} -gt 0 ]; then
     MAIN_CMD+=("${EXTRA_FLAGS[@]}")
 fi
 
-echo "[INFO] Step 1/6: Running comprehensive migration (schema, users, files, edge functions; secrets NOT touched; data in Step 2)..."
+echo "[INFO] Step 1/7: Running comprehensive migration (schema, users, files, edge functions; secrets NOT touched; data in Step 2)..."
 echo "[INFO] Note: Database data is migrated in Step 2 (migrate_all_table_data). Target secrets remain unchanged."
 # Capture the migration directory from the main migration output if possible
 # The main migration will create a backup directory automatically
@@ -130,7 +130,7 @@ if ! "${MAIN_CMD[@]}"; then
     echo "[ERROR] Primary migration failed; aborting clone."
     exit 1
 fi
-echo "[SUCCESS] Step 1/6: Main migration completed"
+echo "[SUCCESS] Step 1/7: Main migration completed"
 echo ""
 
 # Find the most recent migration directory created by the main migration
@@ -145,12 +145,12 @@ fi
 # Step 2: Ensure all table data is completely replaced (double-check for completeness)
 PUBLIC_SCHEMA_SCRIPT="$PROJECT_ROOT/scripts/components/migrate_all_table_data.sh"
 if [ -x "$PUBLIC_SCHEMA_SCRIPT" ]; then
-    echo "[INFO] Step 2/6: Ensuring complete public schema data replacement..."
+    echo "[INFO] Step 2/7: Ensuring complete public schema data replacement..."
     if ! "$PUBLIC_SCHEMA_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-confirm; then
         echo "[ERROR] Public schema data replacement failed; aborting clone."
         exit 1
     fi
-    echo "[SUCCESS] Step 2/6: Public schema data replacement completed"
+    echo "[SUCCESS] Step 2/7: Public schema data replacement completed"
     echo ""
 else
     echo "[WARNING] migrate_all_table_data.sh not found or not executable; skipping public schema data replacement."
@@ -159,12 +159,12 @@ fi
 # Step 3: Replace all auth users and identities (ensure complete replacement)
 AUTH_USERS_SCRIPT="$PROJECT_ROOT/scripts/components/authUsers_migration.sh"
 if [ -x "$AUTH_USERS_SCRIPT" ]; then
-    echo "[INFO] Step 3/6: Replacing all auth users and identities (replace mode)..."
+    echo "[INFO] Step 3/7: Replacing all auth users and identities (replace mode)..."
     if ! "$AUTH_USERS_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --replace; then
         echo "[ERROR] Auth users migration failed; aborting clone."
         exit 1
     fi
-    echo "[SUCCESS] Step 3/6: Auth users and identities replacement completed"
+    echo "[SUCCESS] Step 3/7: Auth users and identities replacement completed"
     echo ""
 else
     echo "[WARNING] authUsers_migration.sh not found or not executable; skipping auth users replacement."
@@ -173,12 +173,12 @@ fi
 # Step 4: Sync auth system tables and metadata
 AUTH_SYSTEM_SCRIPT="$PROJECT_ROOT/scripts/components/auth_system_tables_migration.sh"
 if [ -x "$AUTH_SYSTEM_SCRIPT" ]; then
-    echo "[INFO] Step 4/6: Syncing auth system tables and Supabase metadata..."
+    echo "[INFO] Step 4/7: Syncing auth system tables and Supabase metadata..."
     if ! "$AUTH_SYSTEM_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-confirm; then
         echo "[ERROR] Auth system tables sync failed; aborting clone."
         exit 1
     fi
-    echo "[SUCCESS] Step 4/6: Auth system tables sync completed"
+    echo "[SUCCESS] Step 4/7: Auth system tables sync completed"
     echo ""
 else
     echo "[WARNING] auth_system_tables_migration.sh not found or not executable; skipping auth system table sync."
@@ -187,7 +187,7 @@ fi
 # Step 5: Ensure storage buckets and files are completely migrated
 STORAGE_SCRIPT="$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh"
 if [ -x "$STORAGE_SCRIPT" ]; then
-    echo "[INFO] Step 5/6: Verifying storage buckets and files migration (with files)..."
+    echo "[INFO] Step 5/7: Verifying storage buckets and files migration (with files)..."
     STORAGE_CMD=("$STORAGE_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV")
     if [ -n "$LATEST_MIGRATION_DIR" ]; then
         STORAGE_CMD+=("$LATEST_MIGRATION_DIR")
@@ -197,7 +197,7 @@ if [ -x "$STORAGE_SCRIPT" ]; then
         echo "[WARNING] Storage buckets verification reported issues. Review logs above."
         echo "[INFO] Continuing clone process (storage was already migrated in Step 1 with --full flag)..."
     else
-        echo "[SUCCESS] Step 5/6: Storage buckets and files verification completed"
+        echo "[SUCCESS] Step 5/7: Storage buckets and files verification completed"
     fi
     echo ""
 else
@@ -207,15 +207,29 @@ fi
 # Step 6: Ensure policies, roles, and access controls are synced
 POLICIES_SCRIPT="$PROJECT_ROOT/scripts/main/policies_migration_new.sh"
 if [ -x "$POLICIES_SCRIPT" ]; then
-    echo "[INFO] Step 6/6: Verifying policies, roles, and access controls sync..."
+    echo "[INFO] Step 6/7: Verifying policies, roles, and access controls sync..."
     if ! "$POLICIES_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" --auto-confirm; then
         echo "[WARNING] Policies/roles verification reported issues. Review logs above."
     else
-        echo "[SUCCESS] Step 6/6: Policies, roles, and access controls verified"
+        echo "[SUCCESS] Step 6/7: Policies, roles, and access controls verified"
     fi
     echo ""
 else
     echo "[WARNING] policies_migration_new.sh not found or not executable; skipping policies verification."
+fi
+
+# Step 7: Run policy_migration_complete.sh to ensure all RLS policies are copied (final pass, closes any policy gap)
+POLICY_COMPLETE_SCRIPT="$PROJECT_ROOT/scripts/main/policy_migration_complete.sh"
+if [ -x "$POLICY_COMPLETE_SCRIPT" ]; then
+    echo "[INFO] Step 7/7: Running policy migration complete (final RLS policy sync)..."
+    if ! "$POLICY_COMPLETE_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV"; then
+        echo "[WARNING] Policy migration complete reported a remaining gap or errors. Check output above for manual SQL file path."
+    else
+        echo "[SUCCESS] Step 7/7: Policy migration complete finished"
+    fi
+    echo ""
+else
+    echo "[WARNING] policy_migration_complete.sh not found or not executable; skipping final policy pass."
 fi
 
 # Secrets: Intentionally NOT migrated during clone. Target secrets remain exactly as they are.

@@ -4,6 +4,8 @@
 
 # Backup directories
 backups/
+.migration_state/
+edge_function_deploy_state/
 *.dump
 *.sql.backup
 

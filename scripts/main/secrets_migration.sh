@@ -21,7 +21,6 @@ cd "$PROJECT_ROOT"
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
-source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
 # Configuration
 SOURCE_ENV=${1:-}
@@ -687,29 +686,6 @@ else
     log_error "❌ Secrets migration completed with errors"
     log_to_file "$LOG_FILE" "Secrets migration completed with errors: $migrated_count migrated, $skipped_count skipped, $failed_count failed, $removed_count removed, $removed_failed_count removal failed"
 fi
-
-# Set migration statistics for HTML report
-MIGRATED_COUNT=$migrated_count
-SKIPPED_COUNT=$skipped_count
-FAILED_COUNT=$failed_count
-REMOVED_COUNT=$removed_count
-
-# Generate details section
-DETAILS_SECTION=$(format_migration_details "$LOG_FILE" "secrets")
-
-# Generate HTML report
-export MIGRATED_COUNT SKIPPED_COUNT FAILED_COUNT REMOVED_COUNT DETAILS_SECTION
-generate_migration_html_report \
-    "$MIGRATION_DIR" \
-    "$COMPONENT_NAME" \
-    "$SOURCE_ENV" \
-    "$TARGET_ENV" \
-    "$SOURCE_REF" \
-    "$TARGET_REF" \
-    "$STATUS" \
-    ""
-
-log_info "HTML report generated: $MIGRATION_DIR/result.html"
 
 log_info ""
 log_success "✓ IMPORTANT: All existing secret keys and values in target were preserved unchanged"
