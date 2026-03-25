@@ -615,6 +615,43 @@ if (!sourceConfig.accessToken || !targetConfig.accessToken) {
     process.exit(1);
 }
 
+// Get edge functions from a project using Management API (with pagination to fetch ALL functions)
+const EDGE_FUNCTIONS_PAGE_SIZE = 200;
+
+function fetchFunctionsPage(projectRef, accessToken, offset = 0, limit = EDGE_FUNCTIONS_PAGE_SIZE) {
+    const url = `https://api.supabase.com/v1/projects/${projectRef}/functions?limit=${limit}&offset=${offset}`;
+    return new Promise((resolve, reject) => {
+        const req = https.request(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            }
+        }, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                        const json = JSON.parse(data);
+                        // API may return array directly or { data: [...] }
+                        const funcList = Array.isArray(json)
+                            ? json
+                            : (json && Array.isArray(json.data) ? json.data : []);
+                        resolve(funcList);
+                    } catch (e) {
+                        reject(new Error(`Failed to parse functions response: ${e.message}`));
+                    }
+                } else {
+                    reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
 // Get edge functions from a project using Management API
 async function getEdgeFunctions(projectRef, accessToken, projectName, dbPassword = null) {
     try {
@@ -630,94 +667,155 @@ async function getEdgeFunctions(projectRef, accessToken, projectName, dbPassword
             logWarning(`  No access token provided`);
         }
         
-        const url = `https://api.supabase.com/v1/projects/${projectRef}/functions`;
-        
-        const functions = await new Promise((resolve, reject) => {
-            const req = https.request(url, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                }
-            }, (res) => {
-                let data = '';
-                res.on('data', (chunk) => { data += chunk; });
-                res.on('end', () => {
-                    if (res.statusCode >= 200 && res.statusCode < 300) {
-                        try {
-                            const json = JSON.parse(data);
-                            const funcList = Array.isArray(json) ? json : [];
-                            resolve(funcList);
-                        } catch (e) {
-                            logError(`  Failed to parse response: ${e.message}`);
-                            reject(new Error(`Failed to parse functions response: ${e.message}`));
-                        }
-                    } else {
-                        // For 403 errors, try Supabase CLI as fallback
-                        if (res.statusCode === 403) {
-                            let errorMsg = '';
-                            try {
-                                const errorJson = JSON.parse(data);
-                                errorMsg = errorJson.message || data.substring(0, 200);
-                            } catch {
-                                errorMsg = data.substring(0, 200);
-                            }
-                            logError(`  HTTP ${res.statusCode}: ${errorMsg}`);
-                            logWarning(`  ⚠ Permission denied: Access token does not have permission to access edge functions endpoint`);
-                            logInfo(`  Attempting to use Supabase CLI as fallback...`);
-                            
-                            // Try to get functions using Supabase CLI
-                            try {
-                                // Use provided dbPassword or try to get it from config
-                                let passwordToUse = dbPassword;
-                                if (!passwordToUse) {
-                                    try {
-                                        const config = getSupabaseConfig(projectRef);
-                                        passwordToUse = config.dbPassword;
-                                    } catch (e) {
-                                        // Ignore - will try without password
-                                    }
-                                }
-                                // Get access token from config if available
-                                let accessTokenToUse = accessToken;
-                                if (!accessTokenToUse) {
-                                    try {
-                                        const config = getSupabaseConfig(projectRef);
-                                        accessTokenToUse = config.accessToken;
-                                    } catch (e) {
-                                        // Ignore - will try without access token
-                                    }
-                                }
-                                const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse, accessTokenToUse);
-                                if (cliFunctions && cliFunctions.length > 0) {
-                                    logSuccess(`  ✓ Successfully retrieved ${cliFunctions.length} function(s) via Supabase CLI`);
-                                    resolve(cliFunctions);
-                                    return;
-                                } else {
-                                    logWarning(`  Supabase CLI did not return any functions`);
-                                }
-                            } catch (cliError) {
-                                logWarning(`  Supabase CLI fallback failed: ${cliError.message}`);
-                            }
-                            
-                            // If CLI fallback failed, return empty array to allow migration to continue
-                            logWarning(`  Edge functions migration will be skipped for this project`);
-                            logWarning(`  To fix: Ensure your access token has 'functions:read' permission or use a token with full project access`);
-                            logWarning(`  Alternative: Use 'supabase login' to authenticate with Supabase CLI`);
-                            resolve([]); // Return empty array to allow migration to continue
-                            return;
-                        }
-                        logError(`  HTTP ${res.statusCode}: ${data.substring(0, 200)}`);
-                        reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
+        // Fetch all pages so we get every function (API may paginate at 100–200)
+        const allFunctions = [];
+        const seenIds = new Set();
+        let offset = 0;
+        let page;
+        try {
+            do {
+                page = await fetchFunctionsPage(projectRef, accessToken, offset, EDGE_FUNCTIONS_PAGE_SIZE);
+                for (const f of page) {
+                    const key = f.id || f.name;
+                    if (key && !seenIds.has(key)) {
+                        seenIds.add(key);
+                        allFunctions.push(f);
                     }
+                }
+                offset += EDGE_FUNCTIONS_PAGE_SIZE;
+            } while (page.length === EDGE_FUNCTIONS_PAGE_SIZE);
+        } catch (apiError) {
+            // If paginated request fails (e.g. API does not support limit/offset), try single request without params
+            if (allFunctions.length === 0) {
+                const url = `https://api.supabase.com/v1/projects/${projectRef}/functions`;
+                const raw = await new Promise((resolve, reject) => {
+                    const req = https.request(url, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${accessToken}`,
+                            'Content-Type': 'application/json'
+                        }
+                    }, (res) => {
+                        let data = '';
+                        res.on('data', (chunk) => { data += chunk; });
+                        res.on('end', () => resolve({ statusCode: res.statusCode, data }));
+                    });
+                    req.on('error', reject);
+                    req.end();
                 });
+                if (raw.statusCode >= 200 && raw.statusCode < 300) {
+                    const json = JSON.parse(raw.data);
+                    const funcList = Array.isArray(json) ? json : (json && Array.isArray(json.data) ? json.data : []);
+                    funcList.forEach(f => allFunctions.push(f));
+                } else if (raw.statusCode === 403) {
+                    let errorMsg = '';
+                    try {
+                        const errorJson = JSON.parse(raw.data);
+                        errorMsg = errorJson.message || raw.data.substring(0, 200);
+                    } catch {
+                        errorMsg = raw.data.substring(0, 200);
+                    }
+                    logError(`  HTTP 403: ${errorMsg}`);
+                    logWarning(`  ⚠ Permission denied: Access token does not have permission to access edge functions endpoint`);
+                    logInfo(`  Attempting to use Supabase CLI as fallback...`);
+                    try {
+                        let passwordToUse = dbPassword;
+                        if (!passwordToUse) {
+                            try {
+                                const config = getSupabaseConfig(projectRef);
+                                passwordToUse = config.dbPassword;
+                            } catch (e) { /* ignore */ }
+                        }
+                        let accessTokenToUse = accessToken;
+                        if (!accessTokenToUse) {
+                            try {
+                                const config = getSupabaseConfig(projectRef);
+                                accessTokenToUse = config.accessToken;
+                            } catch (e) { /* ignore */ }
+                        }
+                        const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse, accessTokenToUse);
+                        if (cliFunctions && cliFunctions.length > 0) {
+                            logSuccess(`  ✓ Successfully retrieved ${cliFunctions.length} function(s) via Supabase CLI`);
+                            return cliFunctions;
+                        }
+                    } catch (cliError) {
+                        logWarning(`  Supabase CLI fallback failed: ${cliError.message}`);
+                    }
+                    logWarning(`  Edge functions migration will be skipped for this project`);
+                    return [];
+                } else {
+                    throw new Error(`HTTP ${raw.statusCode}: ${raw.data.substring(0, 200)}`);
+                }
+            } else {
+                throw apiError;
+            }
+        }
+
+        const functions = allFunctions;
+        
+        // If we got nothing and API might have returned 403, run the 403 path (CLI fallback) via the original URL
+        if (functions.length === 0) {
+            const url = `https://api.supabase.com/v1/projects/${projectRef}/functions`;
+            const response = await new Promise((resolve, reject) => {
+                const req = https.request(url, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    }
+                }, (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => { data += chunk; });
+                    res.on('end', () => resolve({ statusCode: res.statusCode, data }));
+                });
+                req.on('error', reject);
+                req.end();
             });
-            req.on('error', (error) => {
-                logError(`  Request error: ${error.message}`);
-                reject(error);
-            });
-            req.end();
-        });
+            
+            if (response.statusCode === 403) {
+                let errorMsg = '';
+                try {
+                    const errorJson = JSON.parse(response.data);
+                    errorMsg = errorJson.message || response.data.substring(0, 200);
+                } catch {
+                    errorMsg = response.data.substring(0, 200);
+                }
+                logError(`  HTTP 403: ${errorMsg}`);
+                logWarning(`  ⚠ Permission denied: Access token does not have permission to access edge functions endpoint`);
+                logInfo(`  Attempting to use Supabase CLI as fallback...`);
+                
+                try {
+                    let passwordToUse = dbPassword;
+                    if (!passwordToUse) {
+                        try {
+                            const config = getSupabaseConfig(projectRef);
+                            passwordToUse = config.dbPassword;
+                        } catch (e) { /* ignore */ }
+                    }
+                    let accessTokenToUse = accessToken;
+                    if (!accessTokenToUse) {
+                        try {
+                            const config = getSupabaseConfig(projectRef);
+                            accessTokenToUse = config.accessToken;
+                        } catch (e) { /* ignore */ }
+                    }
+                    const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse, accessTokenToUse);
+                    if (cliFunctions && cliFunctions.length > 0) {
+                        logSuccess(`  ✓ Successfully retrieved ${cliFunctions.length} function(s) via Supabase CLI`);
+                        return cliFunctions;
+                    }
+                    logWarning(`  Supabase CLI did not return any functions`);
+                } catch (cliError) {
+                    logWarning(`  Supabase CLI fallback failed: ${cliError.message}`);
+                }
+                logWarning(`  Edge functions migration will be skipped for this project`);
+                logWarning(`  To fix: Ensure your access token has 'functions:read' permission or use a token with full project access`);
+                return [];
+            }
+            if (response.statusCode >= 300) {
+                throw new Error(`HTTP ${response.statusCode}: ${response.data.substring(0, 200)}`);
+            }
+        }
         
         logSuccess(`Found ${functions.length} edge function(s) in ${projectName || 'project'}`);
         if (functions.length > 0) {
