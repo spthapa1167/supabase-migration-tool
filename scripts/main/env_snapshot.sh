@@ -161,10 +161,10 @@ get_db_counts() {
     local public_tables=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
         "SELECT COUNT(*) FROM pg_tables WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null || echo "0")
     
-    # RLS Policies - only count policies on user-created tables in public schema
-    # Exclude policies on system tables by matching table name patterns
+    # RLS Policies - count policies in migratable schemas (same scope as migration: exclude auth, storage, vault, etc.)
+    # This aligns snapshot comparison with what database_and_policy_migration.sh and database_migration.sh migrate
     local policies=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \
-        "SELECT COUNT(*) FROM pg_policies WHERE schemaname = 'public' AND tablename !~ '^(_|supabase_|realtime_|_realtime|_analytics|analytics_|pg_|information_|graphql_|_graphql)' AND tablename NOT LIKE '%_migrations' AND tablename NOT LIKE 'pg_%' AND tablename NOT IN ('_prisma_migrations', '_supabase_migrations', 'schema_migrations', 'ar_internal_metadata');" 2>/dev/null || echo "0")
+        "SELECT COUNT(*) FROM pg_policies WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor');" 2>/dev/null || echo "0")
     
     # Functions
     local functions=$(run_sql_query "$env_name" "$project_ref" "$password" "$pooler_region" "$pooler_port" \

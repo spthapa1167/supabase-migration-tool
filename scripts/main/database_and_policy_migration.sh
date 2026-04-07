@@ -34,148 +34,48 @@ trap 'supabase unlink --yes 2>/dev/null || true; exit' EXIT INT TERM
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
-source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
-# Helper functions for reliable database connections (same as database_migration.sh)
-# Helper: run psql query and capture output with fallback
-run_psql_query_with_fallback() {
+# Get list of tables (schema.table) for constraint sync (same semantics as database_migration.sh)
+get_table_list() {
     local ref=$1
     local password=$2
     local pooler_region=$3
     local pooler_port=$4
-    local query=$5
-
-    local tmp_err
-    tmp_err=$(mktemp)
-    local success=false
-
-    # First, try database connectivity via shared pooler (no API calls)
-    while IFS='|' read -r host port user label; do
-        [ -z "$host" ] && continue
-        if PGPASSWORD="$password" PGSSLMODE=require psql \
-            -h "$host" \
-            -p "$port" \
-            -U "$user" \
-            -d postgres \
-            -F '|' \
-            -t -A \
-            -v ON_ERROR_STOP=on \
-            -c "$query" \
-            2>"$tmp_err"; then
-            success=true
-            break
-        else
-            log_warning "Query execution failed via ${label}: $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
-        fi
-    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
-
-    # If all pooler connections failed, try API to get correct pooler hostname
-    if [ "$success" = "false" ]; then
-        log_info "Pooler connections failed, trying API to get pooler hostname..."
-        local api_pooler_host=""
-        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
-        
-        if [ -n "$api_pooler_host" ]; then
-            log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}"
-            
-            # Try with API-resolved pooler host
-            for port in "$pooler_port" "5432"; do
-                if PGPASSWORD="$password" PGSSLMODE=require psql \
-                    -h "$api_pooler_host" \
-                    -p "$port" \
-                    -U "postgres.${ref}" \
-                    -d postgres \
-                    -F '|' \
-                    -t -A \
-                    -v ON_ERROR_STOP=on \
-                    -c "$query" \
-                    2>"$tmp_err"; then
-                    success=true
-                    break
-                else
-                    log_warning "Query execution failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
-                fi
-            done
-        else
-            log_warning "Could not resolve pooler hostname via API"
-        fi
-    fi
-
-    if [ "$success" = "true" ]; then
-        rm -f "$tmp_err"
-        return 0
-    else
-        cat "$tmp_err" >&2
-        rm -f "$tmp_err"
-        return 1
-    fi
+    local output_file=$5
+    local query="
+        SELECT
+            table_schema || '.' || table_name
+        FROM information_schema.tables
+        WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND table_schema NOT LIKE 'pg_toast%'
+          AND table_schema != 'storage'
+          AND table_schema != 'auth'
+          AND table_type = 'BASE TABLE'
+        ORDER BY table_schema, table_name;
+    "
+    run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" > "$output_file" 2>/dev/null || true
 }
 
-# Helper: run psql script file with fallback
-run_psql_script_with_fallback() {
-    local description=$1
-    local ref=$2
-    local password=$3
-    local pooler_region=$4
-    local pooler_port=$5
-    local script_path=$6
-
-    local success=false
-    local tmp_err
-    tmp_err=$(mktemp)
-
-    # First, try database connectivity via shared pooler (no API calls)
-    while IFS='|' read -r host port user label; do
-        [ -z "$host" ] && continue
-        log_info "${description} via ${label} (${host}:${port})"
-        if PGPASSWORD="$password" PGSSLMODE=require psql \
-            -h "$host" \
-            -p "$port" \
-            -U "$user" \
-            -d postgres \
-            -v ON_ERROR_STOP=off \
-            -f "$script_path" \
-            >>"$LOG_FILE" 2>"$tmp_err"; then
-            success=true
-            break
-        else
-            log_warning "${description} failed via ${label}: $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
-        fi
-    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
-
-    # If all pooler connections failed, try API to get correct pooler hostname
-    if [ "$success" = "false" ]; then
-        log_info "Pooler connections failed, trying API to get pooler hostname..."
-        local api_pooler_host=""
-        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
-        
-        if [ -n "$api_pooler_host" ]; then
-            log_info "Retrying ${description} with API-resolved pooler host: ${api_pooler_host}"
-            
-            # Try with API-resolved pooler host
-            for port in "$pooler_port" "5432"; do
-                log_info "${description} via API-resolved pooler (${api_pooler_host}:${port})"
-                if PGPASSWORD="$password" PGSSLMODE=require psql \
-                    -h "$api_pooler_host" \
-                    -p "$port" \
-                    -U "postgres.${ref}" \
-                    -d postgres \
-                    -v ON_ERROR_STOP=off \
-                    -f "$script_path" \
-                    >>"$LOG_FILE" 2>"$tmp_err"; then
-                    success=true
-                    break
-                else
-                    log_warning "${description} failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
-                fi
-            done
-        else
-            log_warning "Could not resolve pooler hostname via API"
-        fi
-    fi
-
-    rm -f "$tmp_err"
-    $success && return 0 || return 1
+# Extract constraint definitions (PK, UNIQUE, CHECK, FK) for constraint sync
+extract_constraints_definitions() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local output_file=$5
+    local query="
+        SELECT n.nspname || E'\t' || c.relname || E'\t' || con.conname || E'\t' || REPLACE(pg_get_constraintdef(con.oid, true), E'\n', ' ')
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+          AND n.nspname NOT LIKE 'pg_toast%'
+          AND n.nspname NOT IN ('storage', 'auth')
+          AND c.relkind = 'r'
+          AND con.contype IN ('p', 'u', 'c', 'f')
+        ORDER BY n.nspname, c.relname, con.conname;
+    "
+    run_psql_query_with_fallback "$ref" "$password" "$pooler_region" "$pooler_port" "$query" > "$output_file" 2>/dev/null || true
 }
 
 # Usage function (must be defined before it's called)
@@ -1369,55 +1269,545 @@ else
 fi
 set -e
 
-# Apply policies separately with better error handling (using same connection pattern)
-if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
-    policy_count=$(grep -c "^CREATE POLICY\|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$POLICIES_FILE" 2>/dev/null || echo "0")
-    log_info "Applying $policy_count policy statement(s) separately (this may take a moment)..."
-    policies_output_file="$MIGRATION_DIR_ABS/policies_output.log"
-    log_to_file "$LOG_FILE" "Applying policies to target project using reliable connection fallback"
-    
-    # Use run_psql_script_with_fallback which handles all connection retries automatically
+# Step 3b: Constraint sync - apply missing constraints (from source) to target after schema apply
+# Ensures schema-only path gets constraints that may be missing (same logic as database_migration.sh Step 4.1)
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info "  Step 3b: Detecting and Applying Missing Constraints"
+log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
+
+log_info "Refreshing target table list for constraint sync..."
+get_table_list "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$MIGRATION_DIR_ABS/target_tables_for_constraints.txt"
+TARGET_TABLES_FOR_CONSTRAINTS="$MIGRATION_DIR_ABS/target_tables_for_constraints.txt"
+if [ -s "$TARGET_TABLES_FOR_CONSTRAINTS" ]; then
+    REFRESH_TABLE_COUNT=$(wc -l < "$TARGET_TABLES_FOR_CONSTRAINTS" 2>/dev/null | tr -d ' ' || echo "0")
+    log_info "  Target has $REFRESH_TABLE_COUNT table(s) to check for constraints"
+fi
+
+log_info "Extracting table constraints from source and target..."
+log_to_file "$LOG_FILE" "Constraint sync: extracting and comparing table constraints"
+
+CONSTRAINTS_SOURCE_RAW="$MIGRATION_DIR_ABS/constraints_source_defs.txt"
+CONSTRAINTS_TARGET_RAW="$MIGRATION_DIR_ABS/constraints_target_defs.txt"
+MISSING_CONSTRAINTS_SQL="$MIGRATION_DIR_ABS/missing_constraints.sql"
+
+extract_constraints_definitions "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$CONSTRAINTS_SOURCE_RAW"
+extract_constraints_definitions "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$CONSTRAINTS_TARGET_RAW"
+
+TARGET_CONSTRAINT_KEYS="$MIGRATION_DIR_ABS/target_constraint_keys.txt"
+if [ -s "$CONSTRAINTS_TARGET_RAW" ]; then
+    while IFS=$'\t' read -r schema table name _rest; do
+        [ -z "$schema" ] && continue
+        echo "${schema}.${table}.${name}"
+    done < "$CONSTRAINTS_TARGET_RAW" | sort -u > "$TARGET_CONSTRAINT_KEYS"
+else
+    : > "$TARGET_CONSTRAINT_KEYS"
+fi
+
+MISSING_CONSTRAINTS_TMP="$MIGRATION_DIR_ABS/missing_constraints_tmp.sql"
+: > "$MISSING_CONSTRAINTS_TMP"
+MISSING_CONSTRAINT_COUNT=0
+if [ -s "$CONSTRAINTS_SOURCE_RAW" ] && [ -s "$TARGET_TABLES_FOR_CONSTRAINTS" ]; then
+    while IFS=$'\t' read -r schema table constraint_name constraint_def; do
+        [ -z "$schema" ] && continue
+        table_key="${schema}.${table}"
+        if ! grep -Fxq "$table_key" "$TARGET_TABLES_FOR_CONSTRAINTS" 2>/dev/null; then
+            continue
+        fi
+        key="${table_key}.${constraint_name}"
+        if ! grep -Fxq "$key" "$TARGET_CONSTRAINT_KEYS" 2>/dev/null; then
+            printf 'ALTER TABLE "%s"."%s" ADD CONSTRAINT "%s" %s;\n' "$schema" "$table" "$constraint_name" "$constraint_def" >> "$MISSING_CONSTRAINTS_TMP"
+            MISSING_CONSTRAINT_COUNT=$((MISSING_CONSTRAINT_COUNT + 1))
+        fi
+    done < "$CONSTRAINTS_SOURCE_RAW"
+fi
+# Order: non-FK first, then FOREIGN KEY
+if [ -s "$MISSING_CONSTRAINTS_TMP" ]; then
+    grep -v "FOREIGN KEY" "$MISSING_CONSTRAINTS_TMP" > "$MISSING_CONSTRAINTS_SQL" 2>/dev/null || true
+    grep "FOREIGN KEY" "$MISSING_CONSTRAINTS_TMP" >> "$MISSING_CONSTRAINTS_SQL" 2>/dev/null || true
+fi
+
+if [ "$MISSING_CONSTRAINT_COUNT" -gt 0 ] && [ -s "$MISSING_CONSTRAINTS_SQL" ]; then
+    log_info "Found $MISSING_CONSTRAINT_COUNT constraint(s) in source missing from target"
+    log_to_file "$LOG_FILE" "Applying $MISSING_CONSTRAINT_COUNT missing constraints to target"
+    APPLIED=0
+    FAILED=0
     set +e
-    if run_psql_script_with_fallback "Applying policies" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$POLICIES_FILE"; then
-        policies_exit_code=0
-        log_info "Policy application completed successfully"
-    else
-        policies_exit_code=$?
-        log_warning "Policy application completed with exit code $policies_exit_code (checking for expected errors)..."
-        
-        # Extract policy output from log file
-        if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
-            tail -100 "$LOG_FILE" | grep -A 50 "Applying policies" > "$policies_output_file" 2>/dev/null || true
+    CONSTRAINTS_BATCH_SIZE=15
+    constraints_batch_file="$MIGRATION_DIR_ABS/constraints_batch.sql"
+    batch_c=0
+    > "$constraints_batch_file"
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        echo "$line" >> "$constraints_batch_file"
+        batch_c=$((batch_c + 1))
+        if [ "$batch_c" -ge "$CONSTRAINTS_BATCH_SIZE" ]; then
+            if run_psql_script_with_fallback "Constraints batch" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$constraints_batch_file"; then
+                APPLIED=$((APPLIED + batch_c))
+            else
+                while IFS= read -r bl; do
+                    [ -z "$bl" ] && continue
+                    if run_psql_command_with_fallback "Applying missing constraint" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$bl"; then
+                        APPLIED=$((APPLIED + 1))
+                    else
+                        FAILED=$((FAILED + 1))
+                        log_warning "  Failed to apply: ${bl:0:80}..."
+                        log_to_file "$LOG_FILE" "WARNING: Failed to apply constraint: $bl"
+                    fi
+                done < "$constraints_batch_file"
+            fi
+            > "$constraints_batch_file"
+            batch_c=0
+        fi
+    done < "$MISSING_CONSTRAINTS_SQL"
+    if [ -s "$constraints_batch_file" ]; then
+        if run_psql_script_with_fallback "Constraints batch (final)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$constraints_batch_file"; then
+            APPLIED=$((APPLIED + batch_c))
+        else
+            while IFS= read -r bl; do
+                [ -z "$bl" ] && continue
+                if run_psql_command_with_fallback "Applying missing constraint" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$bl"; then
+                    APPLIED=$((APPLIED + 1))
+                else
+                    FAILED=$((FAILED + 1))
+                    log_warning "  Failed to apply: ${bl:0:80}..."
+                    log_to_file "$LOG_FILE" "WARNING: Failed to apply constraint: $bl"
+                fi
+            done < "$constraints_batch_file"
         fi
     fi
+    rm -f "$constraints_batch_file"
     set -e
-    
-    # Check for policy errors in the log file (since run_psql_script_with_fallback writes to LOG_FILE)
-    if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
-        # Extract policy-related output from log file for error checking
-        policies_output_section=$(tail -200 "$LOG_FILE" | grep -A 100 "Applying policies" 2>/dev/null || tail -100 "$LOG_FILE")
-        
-        # Filter out expected policy errors (already exists, syntax errors on CREATE)
-        filtered_policy_errors=$(echo "$policies_output_section" | grep "ERROR:" 2>/dev/null | \
-            grep -vE "policy.*already exists|syntax error.*CREATE|syntax error at or near" | \
-            wc -l | tr -d '[:space:]' || echo "0")
-        
-        if [ "$filtered_policy_errors" -gt 0 ]; then
-            log_warning "Found $filtered_policy_errors unexpected policy error(s) (expected errors filtered out)"
-        else
-            log_info "Policy errors are expected (already exists, syntax issues) - continuing..."
+    if [ "$APPLIED" -gt 0 ]; then
+        log_success "✓ Applied $APPLIED missing constraint(s)"
+        log_to_file "$LOG_FILE" "SUCCESS: Applied $APPLIED missing constraints"
+    fi
+    if [ "$FAILED" -gt 0 ]; then
+        log_warning "⚠ $FAILED constraint(s) could not be applied (may need manual review)"
+        log_to_file "$LOG_FILE" "WARNING: $FAILED constraints could not be applied"
+    fi
+else
+    log_success "✓ No missing constraints detected - target constraints in sync with source"
+    log_to_file "$LOG_FILE" "No missing constraints to apply"
+fi
+log_info ""
+
+# Apply policies in batches for speed; fall back to one-by-one for failed batches
+if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
+    policy_count=$(grep -c "^CREATE POLICY\|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$POLICIES_FILE" 2>/dev/null || echo "0")
+    policy_count=$(echo "$policy_count" | head -1 | tr -d '[:space:]'); [ -z "$policy_count" ] || ! [[ "$policy_count" =~ ^[0-9]+$ ]] && policy_count=0
+    POLICIES_BATCH_SIZE=40
+    FAILED_POLICIES_FILE="$MIGRATION_DIR_ABS/failed_policies.sql"
+    > "$FAILED_POLICIES_FILE"
+    POLICY_APPLIED=0
+    POLICY_FAILED=0
+    policies_batch_file="$MIGRATION_DIR_ABS/policies_batch.sql"
+    log_info "Applying $policy_count policy statement(s) (batches of $POLICIES_BATCH_SIZE, fallback one-by-one on batch failure)..."
+    log_to_file "$LOG_FILE" "Applying policies in batches of $POLICIES_BATCH_SIZE"
+    set +e
+    policy_stmt=""
+    batch_count=0
+    > "$policies_batch_file"
+    while IFS= read -r line; do
+        policy_stmt="${policy_stmt}${policy_stmt:+$'\n'}${line}"
+        if [[ "$line" == *";" ]]; then
+            policy_stmt=$(echo "$policy_stmt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [[ "$policy_stmt" =~ ^(CREATE\ POLICY|ALTER\ TABLE|DROP\ POLICY) ]]; then
+                echo "$policy_stmt" >> "$policies_batch_file"
+                batch_count=$((batch_count + 1))
+                if [ "$batch_count" -ge "$POLICIES_BATCH_SIZE" ]; then
+                    if run_psql_script_with_fallback "Policy batch" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policies_batch_file"; then
+                        POLICY_APPLIED=$((POLICY_APPLIED + batch_count))
+                    else
+                        while IFS= read -r batch_line; do
+                            [ -z "$batch_line" ] || [[ ! "$batch_line" =~ ^(CREATE\ POLICY|ALTER\ TABLE|DROP\ POLICY) ]] && continue
+                            if run_psql_command_with_fallback "Policy" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$batch_line"; then
+                                POLICY_APPLIED=$((POLICY_APPLIED + 1))
+                            else
+                                POLICY_FAILED=$((POLICY_FAILED + 1))
+                                echo "$batch_line" >> "$FAILED_POLICIES_FILE"
+                            fi
+                        done < "$policies_batch_file"
+                    fi
+                    > "$policies_batch_file"
+                    batch_count=0
+                fi
+            fi
+            policy_stmt=""
         fi
-        
-        # Count policy application results
+    done < "$POLICIES_FILE"
+    if [ -n "$policy_stmt" ] && [[ "$policy_stmt" =~ ^(CREATE\ POLICY|ALTER\ TABLE|DROP\ POLICY) ]]; then
+        policy_stmt=$(echo "$policy_stmt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        echo "$policy_stmt" >> "$policies_batch_file"
+        batch_count=$((batch_count + 1))
+    fi
+    if [ -s "$policies_batch_file" ]; then
+        if run_psql_script_with_fallback "Policy batch (final)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policies_batch_file"; then
+            POLICY_APPLIED=$((POLICY_APPLIED + batch_count))
+        else
+            while IFS= read -r batch_line; do
+                [ -z "$batch_line" ] || [[ ! "$batch_line" =~ ^(CREATE\ POLICY|ALTER\ TABLE|DROP\ POLICY) ]] && continue
+                if run_psql_command_with_fallback "Policy" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$batch_line"; then
+                    POLICY_APPLIED=$((POLICY_APPLIED + 1))
+                else
+                    POLICY_FAILED=$((POLICY_FAILED + 1))
+                    echo "$batch_line" >> "$FAILED_POLICIES_FILE"
+                fi
+            done < "$policies_batch_file"
+        fi
+    fi
+    rm -f "$policies_batch_file"
+    set -e
+    if [ "$POLICY_APPLIED" -gt 0 ]; then
+        log_success "✓ Applied $POLICY_APPLIED policy statement(s) successfully"
+        log_to_file "$LOG_FILE" "Applied $POLICY_APPLIED policies successfully"
+    fi
+    if [ "$POLICY_FAILED" -gt 0 ]; then
+        log_warning "⚠ $POLICY_FAILED policy(ies) could not be applied (see $FAILED_POLICIES_FILE)"
+        log_to_file "$LOG_FILE" "WARNING: $POLICY_FAILED policies could not be applied - see $FAILED_POLICIES_FILE"
+    fi
+    policies_exit_code=0
+    [ "$POLICY_FAILED" -gt 0 ] && policies_exit_code=1
+else
+    policies_exit_code=0
+fi
+
+# Legacy: keep policies_output_file and error-check block for compatibility (no script run anymore)
+if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ]; then
+    if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+        policies_output_section=$(tail -200 "$LOG_FILE" | grep -A 100 "Applying policies" 2>/dev/null || tail -100 "$LOG_FILE")
         policies_in_file=$(grep -c "^CREATE POLICY\|^ALTER TABLE.*ENABLE ROW LEVEL SECURITY" "$POLICIES_FILE" 2>/dev/null || echo "0")
-        policies_errors=$(echo "$policies_output_section" | grep -cE "ERROR.*[Pp]olicy|ERROR.*POLICY" 2>/dev/null || echo "0")
+        policies_in_file=$(echo "$policies_in_file" | head -1 | tr -d '[:space:]'); [ -z "$policies_in_file" ] || ! [[ "$policies_in_file" =~ ^[0-9]+$ ]] && policies_in_file=0
         if [ "$policies_in_file" -gt 0 ]; then
-            log_info "Applied $policies_in_file policy statement(s) separately"
-            if [ "$policies_errors" -gt 0 ]; then
-                log_warning "$policies_errors policy statement(s) had errors (may be expected)"
+            log_info "Policy application complete: $POLICY_APPLIED applied, ${POLICY_FAILED:-0} failed"
+        fi
+    fi
+fi
+
+# Remove duplicate block that checked policy errors (we now have POLICY_APPLIED/FAILED above)
+if [ -f "$POLICIES_FILE" ] && [ -s "$POLICIES_FILE" ] && [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
+    # Check for policy errors in the log file (since we apply one-by-one)
+    policies_output_section=$(tail -200 "$LOG_FILE" | grep -A 100 "Applying policies" 2>/dev/null || tail -100 "$LOG_FILE")
+    filtered_policy_errors=$(echo "$policies_output_section" | grep "ERROR:" 2>/dev/null | \
+        grep -vE "policy.*already exists|syntax error.*CREATE|syntax error at or near" | \
+        wc -l | tr -d '[:space:]' || echo "0")
+    filtered_policy_errors=$(echo "$filtered_policy_errors" | head -1 | tr -d '[:space:]'); [ -z "$filtered_policy_errors" ] || ! [[ "$filtered_policy_errors" =~ ^[0-9]+$ ]] && filtered_policy_errors=0
+    if [ "$filtered_policy_errors" -gt 0 ]; then
+        log_warning "Found $filtered_policy_errors unexpected policy error(s) (expected errors filtered out)"
+    fi
+fi
+
+# Policy sync from source DB: always extract from source and apply to target so no policies are missing
+# (Runs every time; ensures target ends up with same policies as source.)
+COUNT_POLICIES_QUERY="SELECT COUNT(*) FROM pg_policies WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor');"
+SOURCE_DB_POLICY_COUNT=$(run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+TARGET_DB_POLICY_COUNT=$(run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+[ -z "$SOURCE_DB_POLICY_COUNT" ] || ! [[ "$SOURCE_DB_POLICY_COUNT" =~ ^[0-9]+$ ]] && SOURCE_DB_POLICY_COUNT=0
+[ -z "$TARGET_DB_POLICY_COUNT" ] || ! [[ "$TARGET_DB_POLICY_COUNT" =~ ^[0-9]+$ ]] && TARGET_DB_POLICY_COUNT=0
+log_info "Policy counts before sync: source=$SOURCE_DB_POLICY_COUNT, target=$TARGET_DB_POLICY_COUNT"
+
+# Always run full policy sync from source DB so target matches source (fixes any missing policies)
+log_info "Syncing all RLS policies from source DB to target..."
+log_to_file "$LOG_FILE" "Policy sync: extracting from source DB and applying to target"
+# Same extraction query as database_migration.sh (GROUP BY + string_agg for roles)
+EXTRACT_POLICIES_QUERY="SELECT 'CREATE POLICY ' || quote_ident(pol.polname) || ' ON ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ' FOR ' || CASE pol.polcmd WHEN 'r' THEN 'SELECT' WHEN 'a' THEN 'INSERT' WHEN 'w' THEN 'UPDATE' WHEN 'd' THEN 'DELETE' WHEN '*' THEN 'ALL' END || CASE WHEN array_length(pol.polroles, 1) > 0 AND (pol.polroles != ARRAY[0]::oid[]) THEN ' TO ' || string_agg(DISTINCT quote_ident(rol.rolname), ', ' ORDER BY rol.rolname) WHEN (pol.polroles = ARRAY[0]::oid[] OR array_length(pol.polroles, 1) IS NULL) THEN ' TO public' ELSE '' END || CASE WHEN pol.polqual IS NOT NULL THEN ' USING (' || pg_get_expr(pol.polqual, pol.polrelid) || ')' ELSE '' END || CASE WHEN pol.polwithcheck IS NOT NULL THEN ' WITH CHECK (' || pg_get_expr(pol.polwithcheck, pol.polrelid) || ')' ELSE '' END || ';' FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace LEFT JOIN pg_roles rol ON rol.oid = ANY(pol.polroles) WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND n.nspname NOT LIKE 'pg_toast%' AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor') GROUP BY pol.polname, n.nspname, c.relname, pol.polcmd, pol.polqual, pol.polrelid, pol.polwithcheck, pol.polroles ORDER BY n.nspname, c.relname, pol.polname;"
+POLICIES_FROM_DB="$MIGRATION_DIR_ABS/policies_from_source_db.sql"
+run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$EXTRACT_POLICIES_QUERY" > "$POLICIES_FROM_DB" 2>/dev/null || true
+if [ -s "$POLICIES_FROM_DB" ]; then
+    SYNC_POLICY_COUNT=$(grep -c "^CREATE POLICY" "$POLICIES_FROM_DB" 2>/dev/null || echo "0")
+    SYNC_POLICY_COUNT=$(echo "$SYNC_POLICY_COUNT" | head -1 | tr -d '[:space:]'); [ -z "$SYNC_POLICY_COUNT" ] || ! [[ "$SYNC_POLICY_COUNT" =~ ^[0-9]+$ ]] && SYNC_POLICY_COUNT=0
+    if [ "$SYNC_POLICY_COUNT" -gt 0 ]; then
+        # Enable RLS on all target tables that have policies (from source list) so CREATE POLICY succeeds
+        ENABLE_RLS_QUERY="SELECT DISTINCT 'ALTER TABLE ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ' ENABLE ROW LEVEL SECURITY;' FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor') AND c.relkind = 'r' ORDER BY 1;"
+        ENABLE_RLS_FILE="$MIGRATION_DIR_ABS/enable_rls_target.sql"
+        run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$ENABLE_RLS_QUERY" > "$ENABLE_RLS_FILE" 2>/dev/null || true
+        if [ -s "$ENABLE_RLS_FILE" ]; then
+            rls_count=$(grep -c "ALTER TABLE" "$ENABLE_RLS_FILE" 2>/dev/null || echo "0")
+            RLS_BATCH_SIZE=50
+            rls_batch_file="$MIGRATION_DIR_ABS/enable_rls_batch.sql"
+            log_info "Enabling RLS on target tables (batches of $RLS_BATCH_SIZE)..."
+            set +e
+            rls_batch=0
+            > "$rls_batch_file"
+            while IFS= read -r rls_line; do
+                [ -z "$rls_line" ] || [[ ! "$rls_line" =~ ALTER\ TABLE ]] && continue
+                echo "$rls_line" >> "$rls_batch_file"
+                rls_batch=$((rls_batch + 1))
+                if [ "$rls_batch" -ge "$RLS_BATCH_SIZE" ]; then
+                    run_psql_script_with_fallback "Enable RLS batch" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$rls_batch_file" || true
+                    > "$rls_batch_file"
+                    rls_batch=0
+                fi
+            done < "$ENABLE_RLS_FILE"
+            [ -s "$rls_batch_file" ] && run_psql_script_with_fallback "Enable RLS batch (final)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$rls_batch_file" || true
+            rm -f "$rls_batch_file"
+            set -e
+        fi
+        # Drop existing target policies in batches
+        DROP_TARGET_POLICIES_QUERY="SELECT 'DROP POLICY IF EXISTS ' || quote_ident(pol.polname) || ' ON ' || quote_ident(n.nspname) || '.' || quote_ident(c.relname) || ';'
+            FROM pg_policy pol JOIN pg_class c ON c.oid = pol.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
+            ORDER BY n.nspname, c.relname, pol.polname;"
+        DROP_POLICIES_FILE="$MIGRATION_DIR_ABS/drop_target_policies_sync.sql"
+        run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$DROP_TARGET_POLICIES_QUERY" > "$DROP_POLICIES_FILE" 2>/dev/null || true
+        if [ -s "$DROP_POLICIES_FILE" ]; then
+            drop_count=$(grep -c "^DROP POLICY" "$DROP_POLICIES_FILE" 2>/dev/null || echo "0")
+            DROP_BATCH_SIZE=100
+            drop_batch_file="$MIGRATION_DIR_ABS/drop_policies_batch.sql"
+            log_info "Dropping existing target policies before sync (batches of $DROP_BATCH_SIZE, $drop_count total)..."
+            set +e
+            drop_batch=0
+            > "$drop_batch_file"
+            while IFS= read -r drop_line; do
+                [ -z "$drop_line" ] || [[ ! "$drop_line" =~ ^DROP\ POLICY ]] && continue
+                echo "$drop_line" >> "$drop_batch_file"
+                drop_batch=$((drop_batch + 1))
+                if [ "$drop_batch" -ge "$DROP_BATCH_SIZE" ]; then
+                    run_psql_script_with_fallback "Drop policy batch" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$drop_batch_file" || true
+                    > "$drop_batch_file"
+                    drop_batch=0
+                fi
+            done < "$DROP_POLICIES_FILE"
+            [ -s "$drop_batch_file" ] && run_psql_script_with_fallback "Drop policy batch (final)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$drop_batch_file" || true
+            rm -f "$drop_batch_file"
+            set -e
+        fi
+        # Apply CREATE POLICY from source in batches; fallback to one-by-one for failed batches. Multiple retries for failures.
+        log_info "Applying $SYNC_POLICY_COUNT policies from source DB (batches of 40, up to 3 retries for failures)..."
+        SYNC_APPLIED=0
+        SYNC_FAILED=0
+        SYNC_FAILED_FILE="$MIGRATION_DIR_ABS/policy_sync_failed.sql"
+        POLICY_SYNC_BATCH_SIZE=40
+        policy_sync_batch_file="$MIGRATION_DIR_ABS/policy_sync_batch.sql"
+        > "$SYNC_FAILED_FILE"
+        set +e
+        batch_count=0
+        > "$policy_sync_batch_file"
+        while IFS= read -r policy_line; do
+            policy_line=$(echo "$policy_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -z "$policy_line" ] || [[ ! "$policy_line" =~ ^CREATE\ POLICY ]] && continue
+            echo "$policy_line" >> "$policy_sync_batch_file"
+            batch_count=$((batch_count + 1))
+            if [ "$batch_count" -ge "$POLICY_SYNC_BATCH_SIZE" ]; then
+                if run_psql_script_with_fallback "Policy sync batch" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policy_sync_batch_file"; then
+                    SYNC_APPLIED=$((SYNC_APPLIED + batch_count))
+                else
+                    while IFS= read -r pl; do
+                        [ -z "$pl" ] || [[ ! "$pl" =~ ^CREATE\ POLICY ]] && continue
+                        if run_psql_command_with_fallback "Policy sync" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$pl"; then
+                            SYNC_APPLIED=$((SYNC_APPLIED + 1))
+                        else
+                            SYNC_FAILED=$((SYNC_FAILED + 1))
+                            echo "$pl" >> "$SYNC_FAILED_FILE"
+                        fi
+                    done < "$policy_sync_batch_file"
+                fi
+                > "$policy_sync_batch_file"
+                batch_count=0
+            fi
+        done < "$POLICIES_FROM_DB"
+        if [ -s "$policy_sync_batch_file" ]; then
+            if run_psql_script_with_fallback "Policy sync batch (final)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policy_sync_batch_file"; then
+                SYNC_APPLIED=$((SYNC_APPLIED + batch_count))
+            else
+                while IFS= read -r pl; do
+                    [ -z "$pl" ] || [[ ! "$pl" =~ ^CREATE\ POLICY ]] && continue
+                    if run_psql_command_with_fallback "Policy sync" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$pl"; then
+                        SYNC_APPLIED=$((SYNC_APPLIED + 1))
+                    else
+                        SYNC_FAILED=$((SYNC_FAILED + 1))
+                        echo "$pl" >> "$SYNC_FAILED_FILE"
+                    fi
+                done < "$policy_sync_batch_file"
+            fi
+        fi
+        rm -f "$policy_sync_batch_file"
+        set -e
+        # Retry failed policies up to 2 more times (3 attempts total)
+        for retry_pass in 1 2; do
+            if [ "$SYNC_FAILED" -gt 0 ] && [ -s "$SYNC_FAILED_FILE" ]; then
+                log_info "Retry pass $((retry_pass + 1))/3: retrying $SYNC_FAILED failed policy(ies)..."
+                SYNC_FAILED_NEW="$MIGRATION_DIR_ABS/policy_sync_failed_new.sql"
+                > "$SYNC_FAILED_NEW"
+                RETRY_APPLIED=0
+                while IFS= read -r policy_line; do
+                    [ -z "$policy_line" ] || [[ ! "$policy_line" =~ ^CREATE\ POLICY ]] && continue
+                    if run_psql_command_with_fallback "Policy sync retry" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policy_line"; then
+                        SYNC_APPLIED=$((SYNC_APPLIED + 1))
+                        RETRY_APPLIED=$((RETRY_APPLIED + 1))
+                        SYNC_FAILED=$((SYNC_FAILED - 1))
+                    else
+                        echo "$policy_line" >> "$SYNC_FAILED_NEW"
+                    fi
+                done < "$SYNC_FAILED_FILE"
+                mv "$SYNC_FAILED_NEW" "$SYNC_FAILED_FILE"
+                [ "$RETRY_APPLIED" -gt 0 ] && log_success "  Retry applied $RETRY_APPLIED policy(ies)"
+            fi
+        done
+        SYNC_FAILED=$(grep -c "^CREATE POLICY" "$SYNC_FAILED_FILE" 2>/dev/null || echo "0")
+        [ -z "$SYNC_FAILED" ] || ! [[ "$SYNC_FAILED" =~ ^[0-9]+$ ]] && SYNC_FAILED=0
+        if [ "$SYNC_APPLIED" -gt 0 ]; then
+            log_success "✓ Policy sync: applied $SYNC_APPLIED policies from source DB"
+            log_to_file "$LOG_FILE" "Policy sync: applied $SYNC_APPLIED policies from source DB"
+        fi
+        if [ "$SYNC_FAILED" -gt 0 ]; then
+            log_warning "Policy sync: $SYNC_FAILED policy(ies) could not be applied - see $SYNC_FAILED_FILE"
+            log_to_file "$LOG_FILE" "WARNING: $SYNC_FAILED policies could not be applied - see $SYNC_FAILED_FILE"
+        fi
+    else
+        log_warning "Extracted policy file empty or no CREATE POLICY lines"
+        log_to_file "$LOG_FILE" "WARNING: Policy extraction produced no policies"
+    fi
+else
+    log_warning "Could not extract policies from source DB (empty file or query failed)"
+    log_to_file "$LOG_FILE" "WARNING: Could not extract policies from source DB for sync"
+fi
+
+# Re-check counts after sync
+TARGET_DB_POLICY_COUNT=$(run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+[ -z "$TARGET_DB_POLICY_COUNT" ] || ! [[ "$TARGET_DB_POLICY_COUNT" =~ ^[0-9]+$ ]] && TARGET_DB_POLICY_COUNT=0
+if [ "$SOURCE_DB_POLICY_COUNT" -gt 0 ] && [ "$TARGET_DB_POLICY_COUNT" -lt "$SOURCE_DB_POLICY_COUNT" ]; then
+    log_warning "After sync: target still has fewer policies ($TARGET_DB_POLICY_COUNT) than source ($SOURCE_DB_POLICY_COUNT). Check ${SYNC_FAILED_FILE:-$MIGRATION_DIR_ABS/policy_sync_failed.sql} and migration log."
+else
+    log_info "Policy count after sync: source=$SOURCE_DB_POLICY_COUNT, target=$TARGET_DB_POLICY_COUNT"
+fi
+
+# Policy gap: apply delta to target once, then prepare manual SQL if gap remains
+if [ "$SOURCE_DB_POLICY_COUNT" -gt 0 ] && [ "$TARGET_DB_POLICY_COUNT" -lt "$SOURCE_DB_POLICY_COUNT" ]; then
+    POLICY_GAP=$((SOURCE_DB_POLICY_COUNT - TARGET_DB_POLICY_COUNT))
+    log_info "Policy gap: $POLICY_GAP missing. Generating and applying delta policies to target (one automatic pass)..."
+    log_to_file "$LOG_FILE" "Policy gap: applying delta policies (one pass)"
+    APPLY_MISSING_AUTO="$MIGRATION_DIR_ABS/apply_missing_policies_auto.sql"
+    if [ -x "$PROJECT_ROOT/scripts/generate_missing_policies_sql.sh" ]; then
+        if "$PROJECT_ROOT/scripts/generate_missing_policies_sql.sh" "$SOURCE_ENV" "$TARGET_ENV" "$APPLY_MISSING_AUTO" >>"$LOG_FILE" 2>&1; then
+            if [ -s "$APPLY_MISSING_AUTO" ] && grep -q "^CREATE POLICY" "$APPLY_MISSING_AUTO" 2>/dev/null; then
+                auto_count=$(grep -c "^CREATE POLICY" "$APPLY_MISSING_AUTO" 2>/dev/null || echo "0")
+                log_info "Applying $auto_count delta policy(ies) to target..."
+                set +e
+                if run_psql_script_with_fallback "Policy delta (auto)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$APPLY_MISSING_AUTO"; then
+                    log_success "✓ Delta policies applied to target"
+                    log_to_file "$LOG_FILE" "Delta policies applied successfully"
+                else
+                    log_warning "Some delta policy statements may have failed (check log)"
+                    log_to_file "$LOG_FILE" "WARNING: Some delta policies may have failed"
+                fi
+                set -e
+            fi
+        fi
+    else
+        log_warning "generate_missing_policies_sql.sh not found or not executable - skipping auto delta"
+    fi
+    # Re-count target after auto-apply
+    TARGET_DB_POLICY_COUNT=$(run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+    [ -z "$TARGET_DB_POLICY_COUNT" ] || ! [[ "$TARGET_DB_POLICY_COUNT" =~ ^[0-9]+$ ]] && TARGET_DB_POLICY_COUNT=0
+    log_info "Policy count after delta apply: source=$SOURCE_DB_POLICY_COUNT, target=$TARGET_DB_POLICY_COUNT"
+    if [ "$TARGET_DB_POLICY_COUNT" -lt "$SOURCE_DB_POLICY_COUNT" ]; then
+        REMAINING_GAP=$((SOURCE_DB_POLICY_COUNT - TARGET_DB_POLICY_COUNT))
+        APPLY_MISSING_MANUAL="$MIGRATION_DIR_ABS/apply_missing_policies_manual_${SOURCE_ENV}_to_${TARGET_ENV}.sql"
+        log_warning "Policy gap remains: $REMAINING_GAP policy(ies) still missing on target."
+        if [ -x "$PROJECT_ROOT/scripts/generate_missing_policies_sql.sh" ]; then
+            if "$PROJECT_ROOT/scripts/generate_missing_policies_sql.sh" "$SOURCE_ENV" "$TARGET_ENV" "$APPLY_MISSING_MANUAL" >>"$LOG_FILE" 2>&1; then
+                if [ -s "$APPLY_MISSING_MANUAL" ]; then
+                    manual_count=$(grep -c "^CREATE POLICY" "$APPLY_MISSING_MANUAL" 2>/dev/null || echo "0")
+                    log_warning "Run the following SQL file in Supabase SQL Editor (target project) to apply remaining $manual_count policy(ies):"
+                    log_warning "  $APPLY_MISSING_MANUAL"
+                    log_to_file "$LOG_FILE" "Manual policy file generated: $APPLY_MISSING_MANUAL (run in Supabase console)"
+                fi
             fi
         fi
     fi
+fi
+
+# Grants sync: copy all table/sequence/function/schema GRANTs from source to target (so every permission is copied)
+log_info "Syncing GRANTs (table, sequence, function, schema permissions) from source to target..."
+log_to_file "$LOG_FILE" "Grants sync: extracting from source and applying to target"
+EXTRACT_GRANTS_QUERY="
+SELECT 'GRANT ' || privilege_type || CASE WHEN is_grantable = 'YES' THEN ' WITH GRANT OPTION' ELSE '' END || ' ON TABLE ' || quote_ident(table_schema) || '.' || quote_ident(table_name) || ' TO ' || quote_ident(grantee) || ';' FROM information_schema.table_privileges WHERE table_schema NOT IN ('pg_catalog','information_schema','pg_toast') AND table_schema NOT LIKE 'pg_toast%' AND table_schema NOT IN ('storage','auth') AND grantee NOT IN ('postgres','PUBLIC')
+UNION ALL
+SELECT 'GRANT ' || privilege_type || CASE WHEN is_grantable = 'YES' THEN ' WITH GRANT OPTION' ELSE '' END || ' ON SEQUENCE ' || quote_ident(object_schema) || '.' || quote_ident(object_name) || ' TO ' || quote_ident(grantee) || ';' FROM information_schema.usage_privileges WHERE object_type = 'SEQUENCE' AND object_schema NOT IN ('pg_catalog','information_schema','pg_toast') AND object_schema NOT IN ('storage','auth') AND grantee NOT IN ('postgres','PUBLIC')
+UNION ALL
+SELECT 'GRANT EXECUTE ON FUNCTION ' || quote_ident(n.nspname) || '.' || quote_ident(p.proname) || '(' || pg_get_function_identity_arguments(p.oid) || ') TO ' || quote_ident(rp.grantee) || ';' FROM information_schema.routine_privileges rp JOIN pg_proc p ON p.proname = rp.routine_name JOIN pg_namespace n ON n.oid = p.pronamespace AND n.nspname = rp.routine_schema WHERE rp.routine_schema NOT IN ('pg_catalog','information_schema','pg_toast') AND rp.routine_schema NOT IN ('storage','auth') AND rp.grantee NOT IN ('postgres','PUBLIC') AND rp.privilege_type = 'EXECUTE'
+UNION ALL
+SELECT DISTINCT 'GRANT USAGE ON SCHEMA ' || quote_ident(object_schema) || ' TO ' || quote_ident(grantee) || ';' FROM information_schema.usage_privileges WHERE object_type = 'SCHEMA' AND object_schema NOT IN ('pg_catalog','information_schema','pg_toast') AND object_schema NOT IN ('storage','auth') AND grantee NOT IN ('postgres','PUBLIC')
+ORDER BY 1;
+"
+ALL_GRANTS_FILE="$MIGRATION_DIR_ABS/grants_from_source.sql"
+run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$EXTRACT_GRANTS_QUERY" > "$ALL_GRANTS_FILE" 2>/dev/null || true
+if [ -s "$ALL_GRANTS_FILE" ]; then
+    GRANT_COUNT=$(grep -c "^GRANT" "$ALL_GRANTS_FILE" 2>/dev/null || echo "0")
+    GRANT_COUNT=$(echo "$GRANT_COUNT" | head -1 | tr -d '[:space:]'); [ -z "$GRANT_COUNT" ] || ! [[ "$GRANT_COUNT" =~ ^[0-9]+$ ]] && GRANT_COUNT=0
+    if [ "$GRANT_COUNT" -gt 0 ]; then
+        # Apply in batches to avoid 3000+ round-trips (which appears stuck and is very slow)
+        GRANT_BATCH_SIZE=200
+        GRANT_BATCH_FILE="$MIGRATION_DIR_ABS/grants_batch.sql"
+        GRANT_FAILED_FILE="$MIGRATION_DIR_ABS/grants_failed.sql"
+        > "$GRANT_FAILED_FILE"
+        GRANT_APPLIED=0
+        GRANT_FAILED=0
+        batch_num=0
+        total_batches=$(( (GRANT_COUNT + GRANT_BATCH_SIZE - 1) / GRANT_BATCH_SIZE ))
+        log_info "Applying $GRANT_COUNT grant(s) in batches of $GRANT_BATCH_SIZE (batch 1/$total_batches)..."
+        set +e
+        batch_count=0
+        while IFS= read -r grant_line; do
+            grant_line=$(echo "$grant_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -z "$grant_line" ] || [[ ! "$grant_line" =~ ^GRANT ]] && continue
+            echo "$grant_line" >> "$GRANT_BATCH_FILE"
+            batch_count=$((batch_count + 1))
+            if [ "$batch_count" -ge "$GRANT_BATCH_SIZE" ]; then
+                batch_num=$((batch_num + 1))
+                if run_psql_script_with_fallback "Grants batch $batch_num/$total_batches" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$GRANT_BATCH_FILE"; then
+                    GRANT_APPLIED=$((GRANT_APPLIED + batch_count))
+                else
+                    # Fallback: apply batch line-by-line to salvage what we can
+                    while IFS= read -r line; do
+                        [ -z "$line" ] || [[ ! "$line" =~ ^GRANT ]] && continue
+                        if run_psql_command_with_fallback "Grant" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$line"; then
+                            GRANT_APPLIED=$((GRANT_APPLIED + 1))
+                        else
+                            GRANT_FAILED=$((GRANT_FAILED + 1))
+                            echo "$line" >> "$GRANT_FAILED_FILE"
+                        fi
+                    done < "$GRANT_BATCH_FILE"
+                fi
+                log_info "  Grants progress: $GRANT_APPLIED applied, batch $batch_num/$total_batches done"
+                > "$GRANT_BATCH_FILE"
+                batch_count=0
+            fi
+        done < "$ALL_GRANTS_FILE"
+        # Apply remaining
+        if [ -s "$GRANT_BATCH_FILE" ]; then
+            batch_num=$((batch_num + 1))
+            if run_psql_script_with_fallback "Grants batch $batch_num/$total_batches" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$GRANT_BATCH_FILE"; then
+                GRANT_APPLIED=$((GRANT_APPLIED + batch_count))
+            else
+                while IFS= read -r line; do
+                    [ -z "$line" ] || [[ ! "$line" =~ ^GRANT ]] && continue
+                    if run_psql_command_with_fallback "Grant" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$line"; then
+                        GRANT_APPLIED=$((GRANT_APPLIED + 1))
+                    else
+                        GRANT_FAILED=$((GRANT_FAILED + 1))
+                        echo "$line" >> "$GRANT_FAILED_FILE"
+                    fi
+                done < "$GRANT_BATCH_FILE"
+            fi
+        fi
+        rm -f "$GRANT_BATCH_FILE"
+        set -e
+        if [ "$GRANT_APPLIED" -gt 0 ]; then
+            log_success "✓ Grants sync: applied $GRANT_APPLIED grant(s)"
+            log_to_file "$LOG_FILE" "Grants sync: applied $GRANT_APPLIED grants"
+        fi
+        if [ "$GRANT_FAILED" -gt 0 ]; then
+            log_warning "Grants sync: $GRANT_FAILED grant(s) could not be applied (see $GRANT_FAILED_FILE)"
+            log_to_file "$LOG_FILE" "WARNING: $GRANT_FAILED grants could not be applied - see $GRANT_FAILED_FILE"
+        fi
+    else
+        log_info "No custom grants found in source"
+    fi
+else
+    log_warning "Could not extract grants from source"
+    log_to_file "$LOG_FILE" "WARNING: Could not extract grants from source"
 fi
 
 # Check for connection errors in the log file
@@ -1909,19 +2299,22 @@ if [ "$target_after_dump_success" = "true" ]; then
         if [ -f "$source_unfiltered_dump" ]; then
             source_total_policies=$(grep -c "^CREATE POLICY" "$source_unfiltered_dump" 2>/dev/null || echo "0")
             source_storage_policies=$(grep -c "^CREATE POLICY.*ON storage\." "$source_unfiltered_dump" 2>/dev/null || echo "0")
-            source_non_storage_policies=$((source_total_policies - source_storage_policies))
         else
-            # Fallback to filtered dump if original not available
             source_total_policies=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
             source_storage_policies=0
-            source_non_storage_policies=$source_total_policies
         fi
+        # Ensure integers (strip newlines/whitespace that can break [ ] and $(( ))
+        source_total_policies=$(echo "$source_total_policies" | head -1 | tr -d '[:space:]'); [ -z "$source_total_policies" ] || ! [[ "$source_total_policies" =~ ^[0-9]+$ ]] && source_total_policies=0
+        source_storage_policies=$(echo "$source_storage_policies" | head -1 | tr -d '[:space:]'); [ -z "$source_storage_policies" ] || ! [[ "$source_storage_policies" =~ ^[0-9]+$ ]] && source_storage_policies=0
+        source_non_storage_policies=$((source_total_policies - source_storage_policies))
         
         # Count policies in filtered dump (what we tried to apply)
         source_policy_count=$(grep -c "^CREATE POLICY" "$SCHEMA_DUMP_FILE" 2>/dev/null || echo "0")
+        source_policy_count=$(echo "$source_policy_count" | head -1 | tr -d '[:space:]'); [ -z "$source_policy_count" ] || ! [[ "$source_policy_count" =~ ^[0-9]+$ ]] && source_policy_count=0
         
         # Count policies in target (from all schemas)
         target_policy_count=$(grep -c "^CREATE POLICY" "$TARGET_SCHEMA_AFTER" 2>/dev/null || echo "0")
+        target_policy_count=$(echo "$target_policy_count" | head -1 | tr -d '[:space:]'); [ -z "$target_policy_count" ] || ! [[ "$target_policy_count" =~ ^[0-9]+$ ]] && target_policy_count=0
         
         log_info "  Source total policies (all schemas): $source_total_policies"
         log_info "  Source storage policies (excluded from migration): $source_storage_policies"
@@ -2136,6 +2529,14 @@ else
     log_to_file "$LOG_FILE" "WARNING: Failed to export target schema for verification"
 fi
 
+# Final policy count from live DB (after migration) - display at end
+FINAL_COUNT_POLICIES_QUERY="SELECT COUNT(*) FROM pg_policies WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast', 'auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor');"
+FINAL_SOURCE_POLICIES=$(run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$FINAL_COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+FINAL_TARGET_POLICIES=$(run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$FINAL_COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+[ -z "$FINAL_SOURCE_POLICIES" ] || ! [[ "$FINAL_SOURCE_POLICIES" =~ ^[0-9]+$ ]] && FINAL_SOURCE_POLICIES=0
+[ -z "$FINAL_TARGET_POLICIES" ] || ! [[ "$FINAL_TARGET_POLICIES" =~ ^[0-9]+$ ]] && FINAL_TARGET_POLICIES=0
+log_to_file "$LOG_FILE" "RLS Policies after migration - Source: $FINAL_SOURCE_POLICIES, Target: $FINAL_TARGET_POLICIES"
+
 # Create summary
 SUMMARY_FILE="$MIGRATION_DIR_ABS/migration_summary.txt"
 {
@@ -2151,6 +2552,7 @@ SUMMARY_FILE="$MIGRATION_DIR_ABS/migration_summary.txt"
     echo ""
     echo "- **Status**: Migration completed"
     echo "- **Method**: pg_dump + Direct SQL Application"
+    echo "- **RLS Policies (after migration)**: Source: ${FINAL_SOURCE_POLICIES:-N/A}, Target: ${FINAL_TARGET_POLICIES:-N/A}"
     echo ""
     echo "## Files Generated"
     echo ""
@@ -2173,6 +2575,9 @@ log_info ""
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info "  Migration Complete"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+log_info ""
+log_info "  RLS Policies after migration:  Source: $FINAL_SOURCE_POLICIES   Target: $FINAL_TARGET_POLICIES"
+log_info "  (RLS policies and GRANTs were synced from source DB to target during migration)"
 log_info ""
 log_success "✓ Database and policies migration completed"
 log_info "Summary: $SUMMARY_FILE"

@@ -4,6 +4,7 @@ A comprehensive, reusable tool for duplicating and synchronizing Supabase projec
 
 ## 🌟 Features
 
+- ✅ **CLI-only migration**: All migration runs from the command line; no HTML reports or web server required (see [MIGRATION_CLI.md](./MIGRATION_CLI.md))
 - ✅ **Complete Migration**: Migrate ALL aspects (Database, Storage, Edge Functions, Secrets, Auth, Realtime, Cron)
 - ✅ **Full Duplication**: Copy entire database (schema + all data) between environments
 - ✅ **Schema-Only Duplication**: Copy structure without data
@@ -154,6 +155,7 @@ Common issues:
 
 ## Documentation
 
+- **[MIGRATION_CLI.md](./MIGRATION_CLI.md)** - CLI-only migration usage, summary, parallel execution, edge function state
 - **[GETTING_STARTED.md](./GETTING_STARTED.md)** - Step-by-step setup guide for new users
 - **[TOOL_USAGE.md](./TOOL_USAGE.md)** - How to use this tool with your own projects
 - **[COMPLETE_MIGRATION_GUIDE.md](./COMPLETE_MIGRATION_GUIDE.md)** - Complete migration guide (ALL components)

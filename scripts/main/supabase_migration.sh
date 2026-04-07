@@ -64,7 +64,7 @@ trap 'IN_CLEANUP=true; execute_cleanup $?; exit $?' EXIT INT TERM
 
 # Source utilities
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
-source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
+source "$PROJECT_ROOT/lib/cli_summary.sh" 2>/dev/null || true
 
 # Default configuration
 ENV_FILE=".env.local"
@@ -1274,28 +1274,6 @@ For issues or questions:
 EOF
     
     log_success "Result page generated: $result_file"
-    
-    # Also generate HTML version (non-fatal if it fails)
-    if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
-        log_info "Generating HTML result page..."
-        if source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null; then
-            local html_file=""
-            if html_file=$(generate_result_html "$migration_dir" "$status" "$comparison_data_file" 2>&1); then
-                if [ -n "$html_file" ] && [ -f "$html_file" ]; then
-                    log_success "HTML result page generated: $html_file"
-                    log_info "Open in browser: file://$(realpath "$html_file" 2>/dev/null || echo "$html_file")"
-                else
-                    log_warning "HTML generation completed but file not found (non-fatal)"
-                fi
-            else
-                log_warning "HTML generation had issues (non-fatal - migration still successful)"
-            fi
-        else
-            log_warning "HTML generator script could not be sourced (non-fatal)"
-        fi
-    else
-        log_warning "HTML generator not found: $PROJECT_ROOT/lib/html_generator.sh (non-fatal)"
-    fi
 }
 
 # Cleanup function for migration (defined as a function that can be registered)
@@ -1444,6 +1422,8 @@ perform_migration() {
     # Create migration directory if it doesn't exist
     mkdir -p "$migration_dir"
     touch "$LOG_FILE"
+    # Record start time for execution time summary
+    date +%s > "$migration_dir/migration_start_epoch.txt" 2>/dev/null || true
     
     # Register cleanup function for this migration
     register_cleanup "cleanup_migration"
@@ -1669,29 +1649,114 @@ perform_migration() {
         log_info "Migrating storage buckets (configuration only - no files)..."
     fi
     # Always use --force-all to ensure all buckets are migrated (not just new ones)
-    # This ensures bucket configurations match source exactly
     storage_migration_args+=("--force-all")
     log_info "Force mode enabled: All buckets will be migrated (even if they exist in target)"
-    
-    # Call storage_buckets_migration.sh component script
-    if [ "$AUTO_CONFIRM" = "true" ]; then
-        storage_migration_args+=("--auto-confirm")
-    fi
-    
+    # Parallel subshells are not interactive; parent already prompted — never re-prompt inside child scripts
+    storage_migration_args+=("--auto-confirm")
+
+    # Step 3: Edge functions and Step 4: Secrets - build commands and do prompts first, then run in parallel with storage
+    local run_storage=false
+    local run_edge=false
+    local run_secrets=false
+    local edge_migration_cmd=()
+    local secrets_migration_cmd=()
+
     if ! prompt_proceed "Storage Migration" "Proceed with storage bucket migration from $source to $target?"; then
         log_warning "Storage migration skipped by user."
         SKIPPED_COMPONENTS+=("storage")
         log_to_file "$LOG_FILE" "Storage migration: SKIPPED (user cancelled)"
     else
-        log_to_file "$LOG_FILE" "Storage migration: STARTING"
+        run_storage=true
+        log_to_file "$LOG_FILE" "Storage migration: STARTING (parallel)"
+    fi
+
+    if [ "$SKIP_EDGE_FUNCTIONS" = "true" ]; then
+        log_info "Skipping edge functions migration (--skipEdge flag set)"
+        SKIPPED_COMPONENTS+=("edge functions")
+        log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (--skipEdge flag)"
+    else
+        log_info "Migrating edge functions..."
+        edge_migration_cmd=("$PROJECT_ROOT/scripts/main/edge_functions_migration.sh" "$source" "$target" "$migration_dir")
+        if [ "$INCREMENTAL_MODE" = "true" ]; then
+            edge_migration_cmd+=("--increment")
+        fi
+        # Required for parallel run: no TTY / stdin for nested prompts (SKIP_COMPONENT_CONFIRM is also exported)
+        edge_migration_cmd+=("--auto-confirm")
+        if ! prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $source to $target?"; then
+            log_warning "Edge functions migration skipped by user."
+            SKIPPED_COMPONENTS+=("edge functions")
+            log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (user cancelled)"
+        else
+            run_edge=true
+            log_to_file "$LOG_FILE" "Edge functions migration: STARTING (parallel)"
+        fi
+    fi
+
+    if [ "$INCLUDE_SECRETS" = "true" ]; then
+        log_info "Migrating secrets..."
+        secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target")
+        if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
+            log_warning "Secrets migration skipped by user."
+            SKIPPED_COMPONENTS+=("secrets")
+            log_to_file "$LOG_FILE" "Secrets migration: SKIPPED (user cancelled)"
+        else
+            run_secrets=true
+            log_to_file "$LOG_FILE" "Secrets migration: STARTING (parallel)"
+        fi
+    else
+        log_info "Secrets migration skipped (use --secret to enable, or remove --no-secrets flag)"
+        SKIPPED_COMPONENTS+=("secrets")
+    fi
+
+    # Run Storage, Edge Functions, and Secrets in parallel (whichever were confirmed)
+    local storage_exit_code=0
+    local edge_exit_code=0
+    local secrets_exit_code=0
+    local log_storage="$LOG_FILE.storage"
+    local log_edge="$LOG_FILE.edge_functions"
+    local log_secrets="$LOG_FILE.secrets"
+
+    if [ "$run_storage" = "true" ] || [ "$run_edge" = "true" ] || [ "$run_secrets" = "true" ]; then
+        log_info "Running Storage, Edge Functions, and Secrets migrations in parallel..."
+        log_info "Live output streams below (components may be interleaved). Per-component copies: ${log_storage}, ${log_edge}, ${log_secrets}"
         set +e
-        set +o pipefail  # Disable pipefail to capture exit code properly
-        "$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"
-        local storage_exit_code=${PIPESTATUS[0]}
-        set -o pipefail  # Re-enable pipefail
+        set +o pipefail
+
+        # Stream each component to the terminal AND migration.log AND a per-component file (do not buffer in .raw — that looked \"stuck\")
+        if [ "$run_storage" = "true" ]; then
+            (
+                cd "$PROJECT_ROOT" || exit 1
+                "$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$log_storage"
+                echo "${PIPESTATUS[0]}" > "${log_storage}.exit"
+            ) &
+        fi
+        if [ "$run_edge" = "true" ]; then
+            (
+                cd "$PROJECT_ROOT" || exit 1
+                "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$log_edge"
+                echo "${PIPESTATUS[0]}" > "${log_edge}.exit"
+            ) &
+        fi
+        if [ "$run_secrets" = "true" ]; then
+            (
+                cd "$PROJECT_ROOT" || exit 1
+                "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$log_secrets"
+                echo "${PIPESTATUS[0]}" > "${log_secrets}.exit"
+            ) &
+        fi
+
+        wait
+        set -o pipefail
         set -e
-        
-        if [ "$storage_exit_code" -eq 0 ]; then
+
+        [ "$run_storage" = "true" ] && [ -f "${log_storage}.exit" ] && storage_exit_code=$(cat "${log_storage}.exit")
+        [ "$run_edge" = "true" ] && [ -f "${log_edge}.exit" ] && edge_exit_code=$(cat "${log_edge}.exit")
+        [ "$run_secrets" = "true" ] && [ -f "${log_secrets}.exit" ] && secrets_exit_code=$(cat "${log_secrets}.exit")
+    fi
+
+    # Record results for storage
+    if [ "$run_storage" = "true" ]; then
+        if [ "${storage_exit_code:-1}" -eq 0 ]; then
             if [ "$INCLUDE_FILES" = "true" ]; then
                 log_success "Storage buckets migrated successfully (with files)"
             else
@@ -1700,90 +1765,65 @@ perform_migration() {
             SUCCEEDED_COMPONENTS+=("storage")
             log_to_file "$LOG_FILE" "Storage migration: SUCCESS"
         else
-            log_warning "Storage buckets migration had errors (exit code: $storage_exit_code), continuing..."
+            log_warning "Storage buckets migration had errors (exit code: ${storage_exit_code:-1}), continuing..."
             FAILED_COMPONENTS+=("storage")
             exit_code=1
-            log_to_file "$LOG_FILE" "Storage migration: FAILED (exit code: $storage_exit_code)"
+            log_to_file "$LOG_FILE" "Storage migration: FAILED (exit code: ${storage_exit_code:-1})"
         fi
     fi
-    
-    # Step 3: Migrate edge functions (unless --skipEdge is specified)
-    if [ "$SKIP_EDGE_FUNCTIONS" = "true" ]; then
-        log_info "Skipping edge functions migration (--skipEdge flag set)"
-        SKIPPED_COMPONENTS+=("edge functions")
-        log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (--skipEdge flag)"
-    else
-        log_info "Migrating edge functions..."
-        # Call edge_functions_migration.sh component script
-        local edge_migration_cmd=("$PROJECT_ROOT/scripts/main/edge_functions_migration.sh" "$source" "$target" "$migration_dir")
-        if [ "$INCREMENTAL_MODE" = "true" ]; then
-            edge_migration_cmd+=("--increment")
-        fi
-        if [ "$AUTO_CONFIRM" = "true" ]; then
-            edge_migration_cmd+=("--auto-confirm")
-        fi
-        if ! prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $source to $target?"; then
-            log_warning "Edge functions migration skipped by user."
-            SKIPPED_COMPONENTS+=("edge functions")
-            log_to_file "$LOG_FILE" "Edge functions migration: SKIPPED (user cancelled)"
+
+    # Record results for edge functions
+    if [ "$run_edge" = "true" ]; then
+        if [ "${edge_exit_code:-1}" -eq 0 ]; then
+            log_success "Edge functions migrated successfully"
+            SUCCEEDED_COMPONENTS+=("edge functions")
+            log_to_file "$LOG_FILE" "Edge functions migration: SUCCESS"
         else
-            log_to_file "$LOG_FILE" "Edge functions migration: STARTING"
-            set +e
-            set +o pipefail  # Disable pipefail to capture exit code properly
-            "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
-            local edge_exit_code=${PIPESTATUS[0]}
-            set -o pipefail  # Re-enable pipefail
-            set -e
-            
-            if [ "$edge_exit_code" -eq 0 ]; then
-                log_success "Edge functions migrated successfully"
-                SUCCEEDED_COMPONENTS+=("edge functions")
-                log_to_file "$LOG_FILE" "Edge functions migration: SUCCESS"
-            else
-                log_warning "Edge functions migration had errors (exit code: $edge_exit_code), continuing..."
-                FAILED_COMPONENTS+=("edge functions")
-                exit_code=1
-                log_to_file "$LOG_FILE" "Edge functions migration: FAILED (exit code: $edge_exit_code)"
-            fi
+            log_warning "Edge functions migration had errors (exit code: ${edge_exit_code:-1}), continuing..."
+            FAILED_COMPONENTS+=("edge functions")
+            exit_code=1
+            log_to_file "$LOG_FILE" "Edge functions migration: FAILED (exit code: ${edge_exit_code:-1})"
         fi
     fi
-    
-    # Step 4: Migrate secrets (runs by default to ensure new secrets are migrated)
-    # Secrets migration only creates new keys that don't exist in target, with blank values
-    # Existing secrets in target are never modified or removed
-    if [ "$INCLUDE_SECRETS" = "true" ]; then
-        log_info "Migrating secrets..."
-        # Call secrets_migration.sh component script
-        local secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target")
-        # Note: Component script doesn't need --increment or --auto-confirm flags
-        # It always runs in incremental mode (only creates new keys)
-        if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
-            log_warning "Secrets migration skipped by user."
-            SKIPPED_COMPONENTS+=("secrets")
-            log_to_file "$LOG_FILE" "Secrets migration: SKIPPED (user cancelled)"
+
+    # Record results for secrets
+    if [ "$run_secrets" = "true" ]; then
+        if [ "${secrets_exit_code:-1}" -eq 0 ]; then
+            log_success "Secrets migrated successfully (structure created - values need manual update)"
+            SUCCEEDED_COMPONENTS+=("secrets")
+            log_to_file "$LOG_FILE" "Secrets migration: SUCCESS"
         else
-            log_to_file "$LOG_FILE" "Secrets migration: STARTING"
-            set +e
-            set +o pipefail  # Disable pipefail to capture exit code properly
-            "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE"
-            local secrets_exit_code=${PIPESTATUS[0]}
-            set -o pipefail  # Re-enable pipefail
-            set -e
-            
-            if [ "$secrets_exit_code" -eq 0 ]; then
-                log_success "Secrets migrated successfully (structure created - values need manual update)"
-                SUCCEEDED_COMPONENTS+=("secrets")
-                log_to_file "$LOG_FILE" "Secrets migration: SUCCESS"
-            else
-                log_warning "Secrets migration had errors (exit code: $secrets_exit_code), continuing..."
-                FAILED_COMPONENTS+=("secrets")
-                exit_code=1
-                log_to_file "$LOG_FILE" "Secrets migration: FAILED (exit code: $secrets_exit_code)"
-            fi
+            log_warning "Secrets migration had errors (exit code: ${secrets_exit_code:-1}), continuing..."
+            FAILED_COMPONENTS+=("secrets")
+            exit_code=1
+            log_to_file "$LOG_FILE" "Secrets migration: FAILED (exit code: ${secrets_exit_code:-1})"
+        fi
+    fi
+
+    # Final step: Run policy_migration_complete.sh to ensure all RLS policies are synced (closes any policy gap)
+    POLICY_COMPLETE_SCRIPT="$PROJECT_ROOT/scripts/main/policy_migration_complete.sh"
+    if [ -x "$POLICY_COMPLETE_SCRIPT" ]; then
+        log_info "Running policy migration complete (final pass to ensure all RLS policies are synced)..."
+        log_to_file "$LOG_FILE" "Policy migration complete (final pass): STARTING"
+        set +e
+        set +o pipefail
+        "$POLICY_COMPLETE_SCRIPT" "$source" "$target" 2>&1 | tee -a "$LOG_FILE"
+        local policy_complete_exit_code=${PIPESTATUS[0]}
+        set -o pipefail
+        set -e
+        if [ "${policy_complete_exit_code:-1}" -eq 0 ]; then
+            log_success "Policy migration complete finished successfully"
+            SUCCEEDED_COMPONENTS+=("policy migration complete")
+            log_to_file "$LOG_FILE" "Policy migration complete: SUCCESS"
+        else
+            log_warning "Policy migration complete had errors or remaining gap (exit code: ${policy_complete_exit_code:-1}); check log for manual SQL file path"
+            FAILED_COMPONENTS+=("policy migration complete")
+            exit_code=1
+            log_to_file "$LOG_FILE" "Policy migration complete: completed with gap or errors (exit code: ${policy_complete_exit_code:-1})"
         fi
     else
-        log_info "Secrets migration skipped (use --secret to enable, or remove --no-secrets flag)"
-        SKIPPED_COMPONENTS+=("secrets")
+        log_warning "policy_migration_complete.sh not found or not executable; skipping final policy pass"
+        log_to_file "$LOG_FILE" "Policy migration complete: SKIPPED (script not found)"
     fi
 
     # Note: Policies migration is now handled in Step 1 together with database schema
@@ -1975,7 +2015,7 @@ perform_migration() {
     # Always generate result files (both success and failure)
     # Note: Result file generation failures are non-fatal and won't affect migration success
     log_info "Generating result files in: $actual_migration_dir"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Generating result.md and result.html files..." >> "$actual_migration_dir/migration.log" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] Generating result.md..." >> "$actual_migration_dir/migration.log" 2>/dev/null || true
     
     # Store original exit code before result generation (which should not affect migration status)
     local migration_exit_code=$exit_code
@@ -1983,7 +2023,7 @@ perform_migration() {
     
     if [ $migration_exit_code -eq 0 ]; then
         # Give Supabase a moment to settle before generating reports
-        sleep 2
+        sleep 1
         
         # Generate result files - ensure they're created even if function fails partially
         # This queries target counts AFTER migration completes for accuracy
@@ -1996,32 +2036,26 @@ perform_migration() {
         set -e
         
         if [ "$result_gen_exit_code" -eq 0 ]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] result.md and result.html generated successfully with post-migration counts" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] result.md generated successfully with post-migration counts" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         else
             result_gen_success=false
             log_warning "Result file generation had issues (non-fatal - migration succeeded)"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] Result generation completed with warnings (migration still successful)" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         fi
         
-        # Generate HTML result if available
-        if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
-            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
-            if generate_result_html "$actual_migration_dir" "✅ Completed" "$comparison_data_file" 2>&1 | tee -a "$actual_migration_dir/migration.log" 2>/dev/null; then
-                log_success "HTML result page generated: $actual_migration_dir/result.html"
-                log_info "Open in browser: file://$(realpath "$actual_migration_dir/result.html" 2>/dev/null || echo "$actual_migration_dir/result.html")"
-            else
-                log_warning "HTML result generation had issues (non-fatal)"
-            fi
-        else
-            log_warning "HTML generator not found, skipping HTML result generation"
-        fi
-        
         if [ "$result_gen_success" = "true" ]; then
             log_success "Migration completed: $actual_migration_dir"
-            log_success "Result files: $actual_migration_dir/result.md and $actual_migration_dir/result.html"
+            log_success "Result file: $actual_migration_dir/result.md"
         else
             log_success "Migration completed: $actual_migration_dir"
-            log_warning "Result files may be incomplete (check $actual_migration_dir/result.md and $actual_migration_dir/result.html)"
+            log_warning "Result file may be incomplete (check $actual_migration_dir/result.md)"
+        fi
+        
+        if type collect_object_counts >/dev/null 2>&1; then
+            collect_object_counts "$actual_migration_dir" 2>/dev/null || true
+        fi
+        if type print_migration_summary >/dev/null 2>&1; then
+            print_migration_summary "$actual_migration_dir" "✅ Completed" | tee -a "$actual_migration_dir/migration.log" 2>/dev/null || true
         fi
         
         # Cleanup old migration records (keep only the last 3)
@@ -2043,25 +2077,21 @@ perform_migration() {
         set -e
         
         if [ "$result_gen_exit_code" -eq 0 ]; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] result.md and result.html generated with failure status" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] result.md generated with failure status" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         else
             log_warning "Result file generation had issues (check migration.log for actual migration errors)"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARN] Result generation completed with warnings" >> "$actual_migration_dir/migration.log" 2>/dev/null || true
         fi
         
-        # Generate HTML result if available
-        if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
-            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
-            local error_details=""
-            if [ -f "$actual_migration_dir/migration.log" ]; then
-                error_details=$(grep -iE "(ERROR|FATAL|failed|error:)" "$actual_migration_dir/migration.log" 2>/dev/null | tail -20 || echo "")
-            fi
-            generate_result_html "$actual_migration_dir" "❌ Failed" "$comparison_data_file" "$error_details" 2>&1 | tee -a "$actual_migration_dir/migration.log" 2>/dev/null || log_warning "HTML result generation had issues"
-        fi
-        
         log_warning "Migration completed with issues: $actual_migration_dir"
-        log_info "Result files: $actual_migration_dir/result.md and $actual_migration_dir/result.html"
+        log_info "Result file: $actual_migration_dir/result.md"
         log_info "Check $actual_migration_dir/migration.log for detailed information"
+        if type collect_object_counts >/dev/null 2>&1; then
+            collect_object_counts "$actual_migration_dir" 2>/dev/null || true
+        fi
+        if type print_migration_summary >/dev/null 2>&1; then
+            print_migration_summary "$actual_migration_dir" "❌ Failed" | tee -a "$actual_migration_dir/migration.log" 2>/dev/null || true
+        fi
         return $migration_exit_code
     fi
     
@@ -2136,6 +2166,32 @@ interactive_mode() {
     log_info "  Backup: $BACKUP_TARGET"
     log_info "  Dry Run: $DRY_RUN"
     log_info "  Incremental Mode: $INCREMENTAL_MODE"
+    echo ""
+}
+
+# Post-migration environment snapshot (non-fatal — does not change migration exit code)
+run_env_snapshot_post_migration() {
+    local src="${1:-}"
+    local tgt="${2:-}"
+    local snap="$PROJECT_ROOT/scripts/main/env_snapshot.sh"
+    if [ -z "$src" ] || [ -z "$tgt" ]; then
+        log_warning "run_env_snapshot_post_migration: missing source or target — skipping"
+        return 0
+    fi
+    if [ ! -f "$snap" ]; then
+        log_warning "env_snapshot.sh not found ($snap) — skipping snapshot"
+        return 0
+    fi
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Environment snapshot: $src → $tgt (scripts/main/env_snapshot.sh)"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    set +e
+    bash "$snap" "$src" "$tgt"
+    local snap_rc=$?
+    set -e
+    if [ "$snap_rc" -ne 0 ]; then
+        log_warning "env_snapshot.sh exited with code $snap_rc (migration exit status unchanged)"
+    fi
     echo ""
 }
 
@@ -2226,20 +2282,9 @@ main() {
         log_success "  MIGRATION COMPLETED SUCCESSFULLY"
         log_success "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         
-        # Generate result files even on success (they should already be generated, but try again if needed)
-        if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
-            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
-            if generate_result_html "$migration_dir" "✅ Completed" "$migration_dir/comparison_details.txt" 2>&1 | tee -a "$migration_dir/migration.log" 2>/dev/null; then
-                log_info "HTML result file generated"
-            else
-                log_warning "HTML result generation had issues (non-fatal - migration succeeded)"
-            fi
-        else
-            log_warning "HTML generator not found, skipping HTML result generation"
-        fi
-        
         log_info "Migration folder kept: $migration_dir"
-        log_info "Results: $migration_dir/result.md and $migration_dir/result.html"
+        log_info "Results: $migration_dir/result.md"
+        run_env_snapshot_post_migration "$SOURCE_ENV" "$TARGET_ENV"
         exit 0
     else
         migration_success=false
@@ -2253,20 +2298,6 @@ main() {
             error_details=$(grep -iE "(ERROR|FATAL|failed|error:)" "$migration_dir/migration.log" 2>/dev/null | tail -20 || echo "")
         fi
         
-        # Generate result files with error details (non-fatal if generation fails)
-        log_info "Generating result files with error details..."
-        if [ -f "$PROJECT_ROOT/lib/html_generator.sh" ]; then
-            source "$PROJECT_ROOT/lib/html_generator.sh" 2>/dev/null || true
-            # Pass error details as 4th parameter
-            if generate_result_html "$migration_dir" "❌ Failed" "$migration_dir/comparison_details.txt" "$error_details" 2>&1 | tee -a "$migration_dir/migration.log" 2>/dev/null; then
-                log_info "HTML result file generated"
-            else
-                log_warning "HTML result generation had issues (non-fatal)"
-            fi
-        else
-            log_warning "HTML generator not found, skipping HTML result generation"
-        fi
-        
         # Generate result.md with error details (non-fatal if generation fails)
         if generate_result_md "$migration_dir" "❌ Failed" "$migration_dir/comparison_details.txt" "$error_details" 2>&1 | tee -a "$migration_dir/migration.log" 2>/dev/null; then
             log_info "Result markdown file generated"
@@ -2276,7 +2307,8 @@ main() {
         
         log_warning "Migration folder kept for debugging: $migration_dir"
         log_info "Check $migration_dir/migration.log for details"
-        log_info "Results: $migration_dir/result.md and $migration_dir/result.html (may be incomplete if generation had issues)"
+        log_info "Results: $migration_dir/result.md (may be incomplete if generation had issues)"
+        run_env_snapshot_post_migration "$SOURCE_ENV" "$TARGET_ENV"
         exit 1
     fi
 }

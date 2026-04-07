@@ -12,7 +12,6 @@ cd "$PROJECT_ROOT"
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
-source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
 # Configuration
 SOURCE_ENV=${1:-}
@@ -286,36 +285,6 @@ else
     log_to_file "$LOG_FILE" "Storage buckets migration failed (exit code: $NODE_EXIT_CODE)"
 fi
 set -o pipefail  # Re-enable pipefail
-
-# Generate HTML report
-if [ "$MIGRATION_SUCCESS" = "true" ]; then
-    STATUS="success"
-else
-    STATUS="partial"
-fi
-
-# Extract migration statistics from log
-MIGRATED_COUNT=$(grep -c "✓ Migrated\|✓ Created\|✓ Updated" "$LOG_FILE" 2>/dev/null || echo "0")
-SKIPPED_COUNT=$(grep -c "⏭️.*Skipping\|already exists" "$LOG_FILE" 2>/dev/null || echo "0")
-FAILED_COUNT=$(grep -c "✗ Failed\|ERROR" "$LOG_FILE" 2>/dev/null || echo "0")
-REMOVED_COUNT=$(grep -c "✓ Removed\|✓ Deleted" "$LOG_FILE" 2>/dev/null || echo "0")
-
-# Generate details section
-DETAILS_SECTION=$(format_migration_details "$LOG_FILE" "storage")
-
-# Generate HTML report
-export MIGRATED_COUNT SKIPPED_COUNT FAILED_COUNT REMOVED_COUNT DETAILS_SECTION
-generate_migration_html_report \
-    "$MIGRATION_DIR" \
-    "$COMPONENT_NAME" \
-    "$SOURCE_ENV" \
-    "$TARGET_ENV" \
-    "$SOURCE_REF" \
-    "$TARGET_REF" \
-    "$STATUS" \
-    ""
-
-log_info "HTML report generated: $MIGRATION_DIR/result.html"
 
 if [ "$MIGRATION_SUCCESS" = "true" ]; then
     echo "$MIGRATION_DIR"  # Return migration directory for use by other scripts

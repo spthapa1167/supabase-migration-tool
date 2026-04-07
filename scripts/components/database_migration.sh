@@ -226,7 +226,6 @@ cd "$PROJECT_ROOT"
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
-source "$PROJECT_ROOT/lib/html_report_generator.sh" 2>/dev/null || true
 
 # Default: schema-only migration (no data)
 INCLUDE_DATA=false
@@ -2243,6 +2242,15 @@ log_info "  Step 4.1: Detecting and Applying Missing Constraints"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
 
+# Refresh target table list so newly created tables (Step 3.5) and any new columns (Step 4) are accounted for
+log_info "Refreshing target table list for constraint sync (ensures new tables are included)..."
+get_table_list "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$MIGRATION_DIR/target_tables_for_constraints.txt"
+TARGET_TABLES_FOR_CONSTRAINTS="$MIGRATION_DIR/target_tables_for_constraints.txt"
+if [ -s "$TARGET_TABLES_FOR_CONSTRAINTS" ]; then
+    REFRESH_TABLE_COUNT=$(wc -l < "$TARGET_TABLES_FOR_CONSTRAINTS" | tr -d ' ')
+    log_info "  Target has $REFRESH_TABLE_COUNT table(s) to check for constraints"
+fi
+
 log_info "Extracting table constraints from source and target..."
 log_to_file "$LOG_FILE" "Extracting and comparing table constraints"
 
@@ -2287,8 +2295,8 @@ else
     > "$TARGET_CONSTRAINT_KEYS"
 fi
 
-# Reuse target table list from Step 4 so we only add constraints on tables that exist in target
-TARGET_TABLES_FOR_CONSTRAINTS="${CURRENT_TARGET_TABLES_FILE:-$TARGET_TABLES_FILE}"
+# Reuse target table list (already refreshed above)
+# TARGET_TABLES_FOR_CONSTRAINTS is set above; only overwrite if empty
 if [ ! -s "$TARGET_TABLES_FOR_CONSTRAINTS" ]; then
     get_table_list "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$MIGRATION_DIR/target_tables_for_constraints.txt"
     TARGET_TABLES_FOR_CONSTRAINTS="$MIGRATION_DIR/target_tables_for_constraints.txt"
@@ -2346,6 +2354,68 @@ if [ "$MISSING_CONSTRAINT_COUNT" -gt 0 ] && [ -s "$MISSING_CONSTRAINTS_SQL" ]; t
 else
     log_success "✓ No missing constraints detected - target constraints in sync with source"
     log_to_file "$LOG_FILE" "No missing constraints to apply"
+fi
+echo ""
+
+# Step 4.1b: Second pass - Re-sync constraints after schema changes (catches constraints on new columns/tables)
+# New columns or tables may have added constraints in source; re-extract and apply any still missing
+log_info "Step 4.1b: Second pass - syncing constraints (for new columns/tables)..."
+log_to_file "$LOG_FILE" "Second pass: constraint sync for new columns/tables"
+CONSTRAINTS_SOURCE_RAW_PASS2="$MIGRATION_DIR/constraints_source_defs_pass2.txt"
+CONSTRAINTS_TARGET_RAW_PASS2="$MIGRATION_DIR/constraints_target_defs_pass2.txt"
+MISSING_CONSTRAINTS_SQL_PASS2="$MIGRATION_DIR/missing_constraints_pass2.sql"
+extract_constraints_definitions "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$CONSTRAINTS_SOURCE_RAW_PASS2"
+extract_constraints_definitions "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$CONSTRAINTS_TARGET_RAW_PASS2"
+TARGET_CONSTRAINT_KEYS_PASS2="$MIGRATION_DIR/target_constraint_keys_pass2.txt"
+if [ -s "$CONSTRAINTS_TARGET_RAW_PASS2" ]; then
+    while IFS=$'\t' read -r schema table name _rest; do
+        [ -z "$schema" ] && continue
+        echo "${schema}.${table}.${name}"
+    done < "$CONSTRAINTS_TARGET_RAW_PASS2" | sort -u > "$TARGET_CONSTRAINT_KEYS_PASS2"
+else
+    > "$TARGET_CONSTRAINT_KEYS_PASS2"
+fi
+MISSING_CONSTRAINTS_TMP_PASS2="$MIGRATION_DIR/missing_constraints_tmp_pass2.sql"
+> "$MISSING_CONSTRAINTS_TMP_PASS2"
+MISSING_CONSTRAINT_COUNT_PASS2=0
+if [ -s "$CONSTRAINTS_SOURCE_RAW_PASS2" ] && [ -s "$TARGET_TABLES_FOR_CONSTRAINTS" ]; then
+    while IFS=$'\t' read -r schema table constraint_name constraint_def; do
+        [ -z "$schema" ] && continue
+        table_key="${schema}.${table}"
+        if ! grep -Fxq "$table_key" "$TARGET_TABLES_FOR_CONSTRAINTS" 2>/dev/null; then
+            continue
+        fi
+        key="${table_key}.${constraint_name}"
+        if ! grep -Fxq "$key" "$TARGET_CONSTRAINT_KEYS_PASS2" 2>/dev/null; then
+            printf 'ALTER TABLE "%s"."%s" ADD CONSTRAINT "%s" %s;\n' "$schema" "$table" "$constraint_name" "$constraint_def" >> "$MISSING_CONSTRAINTS_TMP_PASS2"
+            MISSING_CONSTRAINT_COUNT_PASS2=$((MISSING_CONSTRAINT_COUNT_PASS2 + 1))
+        fi
+    done < "$CONSTRAINTS_SOURCE_RAW_PASS2"
+fi
+if [ -s "$MISSING_CONSTRAINTS_TMP_PASS2" ]; then
+    grep -v "FOREIGN KEY" "$MISSING_CONSTRAINTS_TMP_PASS2" > "$MISSING_CONSTRAINTS_SQL_PASS2" 2>/dev/null || true
+    grep "FOREIGN KEY" "$MISSING_CONSTRAINTS_TMP_PASS2" >> "$MISSING_CONSTRAINTS_SQL_PASS2" 2>/dev/null || true
+fi
+if [ "$MISSING_CONSTRAINT_COUNT_PASS2" -gt 0 ] && [ -s "$MISSING_CONSTRAINTS_SQL_PASS2" ]; then
+    log_info "Second pass: Found $MISSING_CONSTRAINT_COUNT_PASS2 additional constraint(s) to apply"
+    APPLIED_P2=0
+    FAILED_P2=0
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        if run_psql_command_with_fallback "Applying constraint (pass2)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$line"; then
+            APPLIED_P2=$((APPLIED_P2 + 1))
+        else
+            FAILED_P2=$((FAILED_P2 + 1))
+            log_warning "  Pass2 failed: ${line:0:70}..."
+        fi
+    done < "$MISSING_CONSTRAINTS_SQL_PASS2"
+    if [ "$APPLIED_P2" -gt 0 ]; then
+        log_success "✓ Second pass: Applied $APPLIED_P2 constraint(s)"
+        log_to_file "$LOG_FILE" "Second pass: Applied $APPLIED_P2 constraints"
+    fi
+    [ "$FAILED_P2" -gt 0 ] && log_warning "  $FAILED_P2 constraint(s) could not be applied in pass2"
+else
+    log_info "Second pass: No additional missing constraints"
 fi
 echo ""
 
@@ -2597,10 +2667,10 @@ extract_all_grants() {
         
         UNION ALL
         
-        -- Sequence grants
+        -- Sequence grants (usage_privileges uses object_schema, object_name)
         SELECT 'GRANT ' || privilege_type ||
                CASE WHEN is_grantable = 'YES' THEN ' WITH GRANT OPTION' ELSE '' END ||
-               ' ON SEQUENCE ' || quote_ident(sequence_schema) || '.' || quote_ident(sequence_name) ||
+               ' ON SEQUENCE ' || quote_ident(object_schema) || '.' || quote_ident(object_name) ||
                ' TO ' || quote_ident(grantee) || ';' as grant_sql
         FROM information_schema.usage_privileges
         WHERE object_type = 'SEQUENCE'
@@ -2629,8 +2699,8 @@ extract_all_grants() {
         
         UNION ALL
         
-        -- Schema usage grants (simplified - extract from information_schema if available)
-        SELECT DISTINCT 'GRANT USAGE ON SCHEMA ' || quote_ident(table_schema) ||
+        -- Schema usage grants (usage_privileges: object_schema for schema objects)
+        SELECT DISTINCT 'GRANT USAGE ON SCHEMA ' || quote_ident(object_schema) ||
                ' TO ' || quote_ident(grantee) || ';' as grant_sql
         FROM information_schema.usage_privileges
         WHERE object_type = 'SCHEMA'
@@ -2665,17 +2735,31 @@ if [ -s "$ALL_GRANTS_SQL" ]; then
         log_info "  Grant breakdown: Tables=$TABLE_GRANTS, Sequences=$SEQUENCE_GRANTS, Functions=$FUNCTION_GRANTS, Schemas=$SCHEMA_GRANTS"
         log_to_file "$LOG_FILE" "Grants breakdown: Tables=$TABLE_GRANTS, Sequences=$SEQUENCE_GRANTS, Functions=$FUNCTION_GRANTS, Schemas=$SCHEMA_GRANTS"
         
-        # Apply grants to target
-        log_info "Applying grants to target..."
+        # Apply grants statement-by-statement so one failure does not skip the rest (covers new tables/objects)
+        log_info "Applying grants to target (per-statement for resilience and new tables)..."
+        GRANT_APPLIED=0
+        GRANT_FAILED=0
         set +e
-        if run_psql_script_with_fallback "Applying all grants" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$ALL_GRANTS_SQL"; then
-            log_success "✓ All grants applied successfully"
-            log_to_file "$LOG_FILE" "SUCCESS: All grants applied"
-        else
-            log_warning "⚠ Some errors occurred while applying grants (some may already exist)"
-            log_to_file "$LOG_FILE" "WARNING: Some grants may not have been applied"
-        fi
+        while IFS= read -r grant_line; do
+            [ -z "$grant_line" ] && continue
+            [[ ! "$grant_line" =~ ^GRANT ]] && continue
+            if run_psql_command_with_fallback "Grant" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$grant_line"; then
+                GRANT_APPLIED=$((GRANT_APPLIED + 1))
+            else
+                GRANT_FAILED=$((GRANT_FAILED + 1))
+                log_warning "  Grant failed (object may not exist or role missing): ${grant_line:0:70}..."
+                log_to_file "$LOG_FILE" "WARNING: Grant failed: $grant_line"
+            fi
+        done < "$ALL_GRANTS_SQL"
         set -e
+        if [ "$GRANT_APPLIED" -gt 0 ]; then
+            log_success "✓ Applied $GRANT_APPLIED grant(s) successfully"
+            log_to_file "$LOG_FILE" "SUCCESS: Applied $GRANT_APPLIED grants"
+        fi
+        if [ "$GRANT_FAILED" -gt 0 ]; then
+            log_warning "⚠ $GRANT_FAILED grant(s) could not be applied (object/role may not exist - check log)"
+            log_to_file "$LOG_FILE" "WARNING: $GRANT_FAILED grants could not be applied"
+        fi
     else
         log_info "No custom grants found (using default permissions)"
         log_to_file "$LOG_FILE" "No custom grants to migrate"
@@ -3187,44 +3271,81 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
                 set -e
             fi
 
-            log_info "Applying $ALL_POLICY_COUNT policy(ies) to target..."
+            log_info "Applying $ALL_POLICY_COUNT policy(ies) to target (one-by-one so no permission is skipped)..."
             POLICY_APPLY_SUCCESS=false
-            MAX_RETRIES=3
-            RETRY_COUNT=0
-            while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$POLICY_APPLY_SUCCESS" != "true" ]; do
-                RETRY_COUNT=$((RETRY_COUNT + 1))
-                log_info "Applying policies (attempt $RETRY_COUNT/$MAX_RETRIES)..."
-                POLICY_APPLY_OUTPUT=$(mktemp)
-                if run_psql_script_with_fallback "Applying policies from DB extraction" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$POLICY_SQL" 2>"$POLICY_APPLY_OUTPUT"; then
-                    sleep 2
-                    NEW_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
-                    if [ -s "$POLICY_APPLY_OUTPUT" ]; then
-                        POLICY_ERRORS=$(grep -iE "error|failed|syntax error" "$POLICY_APPLY_OUTPUT" 2>/dev/null | grep -viE "already exists|does not exist" || echo "")
-                        if [ -n "$POLICY_ERRORS" ]; then
-                            log_warning "⚠ Some policy application errors detected:"
-                            echo "$POLICY_ERRORS" | head -5 | while read -r error_line; do
-                                [ -z "$error_line" ] && continue
-                                log_warning "    - $error_line"
-                            done
+            POLICY_APPLIED=0
+            POLICY_FAILED=0
+            FAILED_POLICIES_FILE="$MIGRATION_DIR/failed_policies.sql"
+            > "$FAILED_POLICIES_FILE"
+            set +e
+            while IFS= read -r policy_line; do
+                policy_line=$(echo "$policy_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [ -z "$policy_line" ] && continue
+                [[ ! "$policy_line" =~ ^CREATE\ POLICY ]] && continue
+                if run_psql_command_with_fallback "Policy" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policy_line"; then
+                    POLICY_APPLIED=$((POLICY_APPLIED + 1))
+                else
+                    POLICY_FAILED=$((POLICY_FAILED + 1))
+                    echo "$policy_line" >> "$FAILED_POLICIES_FILE"
+                    policy_preview=$(echo "$policy_line" | head -c 100)
+                    log_warning "  Policy failed: ${policy_preview}..."
+                    log_to_file "$LOG_FILE" "WARNING: Policy failed: $policy_line"
+                fi
+            done < "$POLICY_SQL"
+            set -e
+            if [ "$POLICY_APPLIED" -gt 0 ]; then
+                log_success "✓ Applied $POLICY_APPLIED policy(ies) successfully"
+                log_to_file "$LOG_FILE" "Applied $POLICY_APPLIED policies successfully"
+            fi
+            if [ "$POLICY_FAILED" -gt 0 ]; then
+                log_warning "⚠ $POLICY_FAILED policy(ies) could not be applied (often due to missing role or table - see $FAILED_POLICIES_FILE)"
+                log_to_file "$LOG_FILE" "WARNING: $POLICY_FAILED policies could not be applied - see $FAILED_POLICIES_FILE"
+            fi
+            sleep 2
+            NEW_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+            if [ "$NEW_TARGET_POLICY_COUNT" = "$SOURCE_POLICY_COUNT" ]; then
+                POLICY_APPLY_SUCCESS=true
+                log_success "✓ All policies applied (target: $NEW_TARGET_POLICY_COUNT)"
+                TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+            elif [ "$NEW_TARGET_POLICY_COUNT" -gt "$TARGET_POLICY_COUNT" ]; then
+                log_info "Policy count increased to $NEW_TARGET_POLICY_COUNT (was $TARGET_POLICY_COUNT)"
+                TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+            fi
+            if [ "$POLICY_FAILED" -gt 0 ] && [ -s "$FAILED_POLICIES_FILE" ]; then
+                MAX_RETRIES=2
+                RETRY_COUNT=0
+                while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                    RETRY_COUNT=$((RETRY_COUNT + 1))
+                    log_info "Retrying failed policy(ies) (attempt $RETRY_COUNT/$MAX_RETRIES)..."
+                    FAILED_POLICIES_NEW="$MIGRATION_DIR/failed_policies_retry.sql"
+                    > "$FAILED_POLICIES_NEW"
+                    STILL_FAILED=0
+                    while IFS= read -r policy_line; do
+                        policy_line=$(echo "$policy_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        [ -z "$policy_line" ] && continue
+                        if run_psql_command_with_fallback "Policy retry" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policy_line"; then
+                            POLICY_APPLIED=$((POLICY_APPLIED + 1))
+                            POLICY_FAILED=$((POLICY_FAILED - 1))
+                        else
+                            echo "$policy_line" >> "$FAILED_POLICIES_NEW"
+                            STILL_FAILED=$((STILL_FAILED + 1))
                         fi
-                    fi
+                    done < "$FAILED_POLICIES_FILE"
+                    mv "$FAILED_POLICIES_NEW" "$FAILED_POLICIES_FILE"
+                    POLICY_FAILED=$STILL_FAILED
+                    NEW_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
                     if [ "$NEW_TARGET_POLICY_COUNT" = "$SOURCE_POLICY_COUNT" ]; then
                         POLICY_APPLY_SUCCESS=true
-                        log_success "✓ All policies applied successfully (target: $NEW_TARGET_POLICY_COUNT)"
                         TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
-                    elif [ "$NEW_TARGET_POLICY_COUNT" -gt "$TARGET_POLICY_COUNT" ]; then
-                        log_info "Policy count increased to $NEW_TARGET_POLICY_COUNT (was $TARGET_POLICY_COUNT)"
-                        TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+                        break
                     fi
-                else
-                    log_warning "Policy application attempt $RETRY_COUNT failed"
-                    [ -s "$POLICY_APPLY_OUTPUT" ] && head -5 "$POLICY_APPLY_OUTPUT" | while read -r line; do log_warning "  - $line"; done
-                fi
-                rm -f "$POLICY_APPLY_OUTPUT"
-            done
+                    [ "$STILL_FAILED" -eq 0 ] && break
+                    sleep 2
+                done
+            fi
             if [ "$POLICY_APPLY_SUCCESS" != "true" ]; then
-                log_warning "⚠ Not all policies could be applied; check log and $POLICY_SQL"
-                log_to_file "$LOG_FILE" "WARNING: Policy application from DB extraction did not reach source count"
+                log_warning "⚠ Not all policies could be applied; check $FAILED_POLICIES_FILE and migration log"
+                log_to_file "$LOG_FILE" "WARNING: Policy application did not reach source count; failed policies in $FAILED_POLICIES_FILE"
             fi
         else
             log_warning "⚠ Failed to extract policies directly from database, falling back to dump extraction"
@@ -3345,108 +3466,63 @@ if [ "$RESTORE_SUCCESS" = "true" ]; then
                     set -e
                 fi
                 
-                # Apply policies with retry logic (after RLS is enabled and old policies dropped)
+                # Apply policies with retry logic (one-by-one so no permission is skipped)
                 if [ -f "$POLICY_SQL" ] && [ -s "$POLICY_SQL" ]; then
                     POLICY_COUNT_IN_FILE=$(grep -c "^CREATE POLICY" "$POLICY_SQL" 2>/dev/null || echo "0")
-                    log_info "Found $POLICY_COUNT_IN_FILE policy definition(s) to re-apply with correct roles..."
+                    log_info "Found $POLICY_COUNT_IN_FILE policy definition(s) to re-apply (one-by-one)..."
                     
-                    MAX_RETRIES=3
-                    RETRY_COUNT=0
-                    POLICY_APPLY_SUCCESS=false
-                    
-                    while [ $RETRY_COUNT -lt $MAX_RETRIES ] && [ "$POLICY_APPLY_SUCCESS" != "true" ]; do
-                        RETRY_COUNT=$((RETRY_COUNT + 1))
-                        log_info "Attempting to apply policies with correct roles (attempt $RETRY_COUNT/$MAX_RETRIES)..."
-                        
-                        # Apply policies with error handling and detailed error reporting
-                        POLICY_APPLY_OUTPUT=$(mktemp)
-                        if run_psql_script_with_fallback "Policy re-application with roles (attempt $RETRY_COUNT)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$POLICY_SQL" 2>"$POLICY_APPLY_OUTPUT"; then
-                            # Verify policies were applied
-                            sleep 2  # Give database time to update
-                            NEW_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
-                            
-                            # Check for specific policy application errors
-                            if [ -s "$POLICY_APPLY_OUTPUT" ]; then
-                                POLICY_ERRORS=$(grep -iE "error|failed|syntax error" "$POLICY_APPLY_OUTPUT" 2>/dev/null | grep -viE "already exists|does not exist" || echo "")
-                                if [ -n "$POLICY_ERRORS" ]; then
-                                    log_warning "⚠ Some policy application errors detected:"
-                                    echo "$POLICY_ERRORS" | head -5 | while read -r error_line; do
-                                        [ -z "$error_line" ] && continue
-                                        log_warning "    - $error_line"
-                                    done
-                                    if [ "$(echo "$POLICY_ERRORS" | wc -l)" -gt 5 ]; then
-                                        log_warning "    ... and more errors (check log file for details)"
-                                    fi
-                                    log_to_file "$LOG_FILE" "Policy application errors: $POLICY_ERRORS"
+                    FAILED_POLICIES_FILE="$MIGRATION_DIR/failed_policies_dump.sql"
+                    > "$FAILED_POLICIES_FILE"
+                    POLICY_APPLIED=0
+                    POLICY_FAILED=0
+                    policy_stmt=""
+                    set +e
+                    while IFS= read -r line; do
+                        policy_stmt="${policy_stmt}${policy_stmt:+$'\n'}${line}"
+                        if [[ "$line" == *";" ]]; then
+                            policy_stmt=$(echo "$policy_stmt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                            if [[ "$policy_stmt" =~ ^CREATE\ POLICY ]]; then
+                                if run_psql_command_with_fallback "Policy (dump)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policy_stmt"; then
+                                    POLICY_APPLIED=$((POLICY_APPLIED + 1))
+                                else
+                                    POLICY_FAILED=$((POLICY_FAILED + 1))
+                                    echo "$policy_stmt" >> "$FAILED_POLICIES_FILE"
+                                    log_to_file "$LOG_FILE" "WARNING: Policy failed: $policy_stmt"
                                 fi
                             fi
-                            
-                            # Compare source and target policies by schema to find missing ones
-                            log_info "Comparing policies by schema to identify any missing policies..."
-                            MISSING_POLICIES=$(run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "
-                                SELECT n.nspname || '.' || c.relname || '.' || pol.polname
-                                FROM pg_policy pol
-                                JOIN pg_class c ON c.oid = pol.polrelid
-                                JOIN pg_namespace n ON n.oid = c.relnamespace
-                                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor')
-                                EXCEPT
-                                SELECT n.nspname || '.' || c.relname || '.' || pol.polname
-                                FROM pg_policy pol
-                                JOIN pg_class c ON c.oid = pol.polrelid
-                                JOIN pg_namespace n ON n.oid = c.relnamespace
-                                WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
-                                  AND n.nspname NOT IN ('auth', 'vault', 'storage', 'realtime', 'pgbouncer', 'graphql_public', 'supabase_functions', 'supabase_functions_api', 'pgsodium', 'supavisor');
-                            " 2>/dev/null | grep -v "^$" || echo "")
-                            
-                            if [ -n "$MISSING_POLICIES" ]; then
-                                MISSING_COUNT=$(echo "$MISSING_POLICIES" | grep -c . || echo "0")
-                                log_warning "⚠ Found $MISSING_COUNT policy(ies) in source that are missing in target:"
-                                echo "$MISSING_POLICIES" | head -10 | while read -r policy; do
-                                    [ -z "$policy" ] && continue
-                                    log_warning "    - $policy"
-                                done
-                                if [ "$MISSING_COUNT" -gt 10 ]; then
-                                    log_warning "    ... and $((MISSING_COUNT - 10)) more missing policies"
-                                fi
-                                log_to_file "$LOG_FILE" "WARNING: $MISSING_COUNT policies missing in target"
-                            fi
-                            
-                            if [ "$NEW_TARGET_POLICY_COUNT" -ge "$TARGET_POLICY_COUNT" ]; then
-                                if [ "$NEW_TARGET_POLICY_COUNT" = "$SOURCE_POLICY_COUNT" ]; then
-                                    POLICY_APPLY_SUCCESS=true
-                                    log_success "✓ All policies re-applied successfully"
-                                    log_info "  Target now has: $NEW_TARGET_POLICY_COUNT policies (matches source)"
-                                    TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
-                                elif [ "$NEW_TARGET_POLICY_COUNT" -gt "$TARGET_POLICY_COUNT" ]; then
-                                    log_info "Policy count increased to $NEW_TARGET_POLICY_COUNT (was $TARGET_POLICY_COUNT), continuing..."
-                                    TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
-                                    # Continue to next retry if not at max
-                                    if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                                        continue
-                                    fi
-                                fi
-                            else
-                                log_warning "Policy count did not increase after re-application (still $NEW_TARGET_POLICY_COUNT)"
-                            fi
-                        else
-                            log_warning "Policy re-application attempt $RETRY_COUNT failed"
-                            if [ -s "$POLICY_APPLY_OUTPUT" ]; then
-                                log_warning "Error details:"
-                                head -10 "$POLICY_APPLY_OUTPUT" | while read -r error_line; do
-                                    [ -z "$error_line" ] && continue
-                                    log_warning "  - $error_line"
-                                done
-                                log_to_file "$LOG_FILE" "Policy application error output: $(cat "$POLICY_APPLY_OUTPUT")"
-                            fi
+                            policy_stmt=""
                         fi
-                        rm -f "$POLICY_APPLY_OUTPUT"
-                    done
-                    
+                    done < "$POLICY_SQL"
+                    if [ -n "$policy_stmt" ] && [[ "$policy_stmt" =~ ^CREATE\ POLICY ]]; then
+                        policy_stmt=$(echo "$policy_stmt" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                        if run_psql_command_with_fallback "Policy (dump)" "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$policy_stmt"; then
+                            POLICY_APPLIED=$((POLICY_APPLIED + 1))
+                        else
+                            POLICY_FAILED=$((POLICY_FAILED + 1))
+                            echo "$policy_stmt" >> "$FAILED_POLICIES_FILE"
+                        fi
+                    fi
+                    set -e
+                    if [ "$POLICY_APPLIED" -gt 0 ]; then
+                        log_success "✓ Applied $POLICY_APPLIED policy(ies) from dump"
+                    fi
+                    if [ "$POLICY_FAILED" -gt 0 ]; then
+                        log_warning "⚠ $POLICY_FAILED policy(ies) could not be applied (see $FAILED_POLICIES_FILE)"
+                    fi
+                    sleep 2
+                    NEW_TARGET_POLICY_COUNT=$(count_policies "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT")
+                    POLICY_APPLY_SUCCESS=false
+                    if [ "$NEW_TARGET_POLICY_COUNT" = "$SOURCE_POLICY_COUNT" ]; then
+                        POLICY_APPLY_SUCCESS=true
+                        log_success "✓ All policies re-applied successfully"
+                        TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+                    elif [ "$NEW_TARGET_POLICY_COUNT" -gt "$TARGET_POLICY_COUNT" ]; then
+                        log_info "Policy count increased to $NEW_TARGET_POLICY_COUNT (was $TARGET_POLICY_COUNT)"
+                        TARGET_POLICY_COUNT=$NEW_TARGET_POLICY_COUNT
+                    fi
                     if [ "$POLICY_APPLY_SUCCESS" != "true" ]; then
-                        log_warning "⚠ Failed to re-apply all policies after $MAX_RETRIES attempts"
-                        log_warning "  Some policies may need manual review. Check: $POLICY_SQL"
-                        log_to_file "$LOG_FILE" "WARNING: Policy re-application failed after $MAX_RETRIES attempts"
+                        log_warning "⚠ Not all policies could be applied; check $FAILED_POLICIES_FILE and migration log"
+                        log_to_file "$LOG_FILE" "WARNING: Policy re-application did not reach source count"
                     fi
                 fi
                 
@@ -4247,59 +4323,24 @@ log_info "  Comprehensive Verification Complete"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
 
-# Generate HTML report
 if [ "$RESTORE_SUCCESS" = "true" ]; then
-    STATUS="success"
     if [ "$INCLUDE_DATA" = "true" ] && [ "$INCLUDE_USERS" = "true" ]; then
-        COMPONENT_NAME="Database Migration (Schema + Data + Auth Users)"
         log_success "✅ Database schema + data + auth users migration completed successfully"
         log_to_file "$LOG_FILE" "Database schema + data + auth users migration completed successfully"
     elif [ "$INCLUDE_DATA" = "true" ]; then
-        COMPONENT_NAME="Database Migration (Schema + Data)"
         log_success "✅ Database schema + data migration completed successfully"
         log_to_file "$LOG_FILE" "Database schema + data migration completed successfully"
     elif [ "$INCLUDE_USERS" = "true" ]; then
-        COMPONENT_NAME="Database Migration (Schema + Auth Users)"
         log_success "✅ Database schema + auth users migration completed successfully"
         log_to_file "$LOG_FILE" "Database schema + auth users migration completed successfully"
     else
-        COMPONENT_NAME="Database Migration (Schema Only)"
         log_success "✅ Database schema-only migration completed successfully"
         log_to_file "$LOG_FILE" "Database schema migration completed successfully"
     fi
 else
-    STATUS="failed"
-    COMPONENT_NAME="Database Migration"
     log_error "❌ Database migration failed!"
     log_to_file "$LOG_FILE" "Database migration failed"
 fi
-
-# Collect migration statistics
-MIGRATED_COUNT=0
-SKIPPED_COUNT=0
-FAILED_COUNT=0
-if [ "$RESTORE_SUCCESS" = "true" ]; then
-    MIGRATED_COUNT=1  # Schema migrated successfully
-else
-    FAILED_COUNT=1
-fi
-
-# Generate details section
-DETAILS_SECTION=$(format_migration_details "$LOG_FILE" "database")
-
-# Generate HTML report
-export MIGRATED_COUNT SKIPPED_COUNT FAILED_COUNT DETAILS_SECTION
-generate_migration_html_report \
-    "$MIGRATION_DIR" \
-    "$COMPONENT_NAME" \
-    "$SOURCE_ENV" \
-    "$TARGET_ENV" \
-    "$SOURCE_REF" \
-    "$TARGET_REF" \
-    "$STATUS" \
-    ""
-
-log_info "HTML report generated: $MIGRATION_DIR/result.html"
 
 if [ "$RESTORE_SUCCESS" = "true" ]; then
     echo "$MIGRATION_DIR"  # Return migration directory for use by other scripts

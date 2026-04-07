@@ -514,6 +514,192 @@ get_supabase_connection_endpoints() {
     return 0
 }
 
+# Run psql query and capture output with fallback (for policy extraction, counts, etc.)
+# Caller may redirect stdout: run_psql_query_with_fallback ... > file
+run_psql_query_with_fallback() {
+    local ref=$1
+    local password=$2
+    local pooler_region=$3
+    local pooler_port=$4
+    local query=$5
+
+    local tmp_err
+    tmp_err=$(mktemp)
+    local success=false
+
+    # First, try database connectivity via shared pooler (no API calls)
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -F '|' \
+            -t -A \
+            -v ON_ERROR_STOP=on \
+            -c "$query" \
+            2>"$tmp_err"; then
+            success=true
+            break
+        else
+            log_warning "Query execution failed via ${label}: $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying query with API-resolved pooler host: ${api_pooler_host}"
+
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -F '|' \
+                    -t -A \
+                    -v ON_ERROR_STOP=on \
+                    -c "$query" \
+                    2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "Query execution failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
+
+    if [ "$success" = "true" ]; then
+        rm -f "$tmp_err"
+        return 0
+    else
+        cat "$tmp_err" >&2
+        rm -f "$tmp_err"
+        return 1
+    fi
+}
+
+# Run psql script file with fallback. Callers must set LOG_FILE (output is appended there).
+run_psql_script_with_fallback() {
+    local description=$1
+    local ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    local script_path=$6
+
+    local success=false
+    local tmp_err
+    tmp_err=$(mktemp)
+
+    # First, try database connectivity via shared pooler (no API calls)
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        log_info "${description} via ${label} (${host}:${port})"
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" \
+            -p "$port" \
+            -U "$user" \
+            -d postgres \
+            -v ON_ERROR_STOP=off \
+            -f "$script_path" \
+            >>"${LOG_FILE:-/dev/null}" 2>"$tmp_err"; then
+            success=true
+            break
+        else
+            log_warning "${description} failed via ${label}: $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    # If all pooler connections failed, try API to get correct pooler hostname
+    if [ "$success" = "false" ]; then
+        log_info "Pooler connections failed, trying API to get pooler hostname..."
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+
+        if [ -n "$api_pooler_host" ]; then
+            log_info "Retrying ${description} with API-resolved pooler host: ${api_pooler_host}"
+
+            # Try with API-resolved pooler host
+            for port in "$pooler_port" "5432"; do
+                log_info "${description} via API-resolved pooler (${api_pooler_host}:${port})"
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" \
+                    -p "$port" \
+                    -U "postgres.${ref}" \
+                    -d postgres \
+                    -v ON_ERROR_STOP=off \
+                    -f "$script_path" \
+                    >>"${LOG_FILE:-/dev/null}" 2>"$tmp_err"; then
+                    success=true
+                    break
+                else
+                    log_warning "${description} failed via API-resolved pooler (${api_pooler_host}:${port}): $(head -n 1 "$tmp_err" 2>/dev/null || echo 'unknown error')"
+                fi
+            done
+        else
+            log_warning "Could not resolve pooler hostname via API"
+        fi
+    fi
+
+    rm -f "$tmp_err"
+    $success && return 0 || return 1
+}
+
+# Run a single psql command with fallback (e.g. one-by-one policy application).
+run_psql_command_with_fallback() {
+    local description=$1
+    local ref=$2
+    local password=$3
+    local pooler_region=$4
+    local pooler_port=$5
+    local command=$6
+
+    local success=false
+    local tmp_err
+    tmp_err=$(mktemp)
+
+    while IFS='|' read -r host port user label; do
+        [ -z "$host" ] && continue
+        if PGPASSWORD="$password" PGSSLMODE=require psql \
+            -h "$host" -p "$port" -U "$user" -d postgres \
+            -v ON_ERROR_STOP=on -c "$command" \
+            >>"${LOG_FILE:-/dev/null}" 2>"$tmp_err"; then
+            success=true
+            break
+        fi
+    done < <(get_supabase_connection_endpoints "$ref" "$pooler_region" "$pooler_port")
+
+    if [ "$success" = "false" ]; then
+        local api_pooler_host=""
+        api_pooler_host=$(get_pooler_host_via_api "$ref" 2>/dev/null || echo "")
+        if [ -n "$api_pooler_host" ]; then
+            for port in "$pooler_port" "5432"; do
+                if PGPASSWORD="$password" PGSSLMODE=require psql \
+                    -h "$api_pooler_host" -p "$port" -U "postgres.${ref}" -d postgres \
+                    -v ON_ERROR_STOP=on -c "$command" \
+                    >>"${LOG_FILE:-/dev/null}" 2>"$tmp_err"; then
+                    success=true
+                    break
+                fi
+            done
+        fi
+    fi
+
+    rm -f "$tmp_err"
+    $success && return 0 || return 1
+}
+
 # Run a PostgreSQL tool (pg_dump, pg_restore, etc.) with fallback connections
 # First tries database connectivity via shared pooler, only uses API if connection fails
 run_pg_tool_with_fallback() {

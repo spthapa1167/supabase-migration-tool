@@ -18,14 +18,43 @@
  *   --incremental                   Incremental mode (skip identical functions)
  *   --replace                       Replace mode (delete all target functions first)
  *   --retryMissing                  Only deploy functions missing in target
+ *   --compare-target                Download target copy and diff vs source before deploy (slower; default is direct deploy from source only)
+ *   --prune-target                  After deploy, delete edge functions that exist on target but not in source (full mirror; skipped with --functions / --retryMissing)
+ *
+ * Edge deploy tuning (env):
+ *   EDGE_DEPLOY_STRATEGY           Force one method: use-api | use-docker (skips probing; sticky is that method).
+ *   EDGE_DEPLOY_TIMEOUT_USE_API_MS Per-strategy timeout for --use-api (default 90000).
+ *   EDGE_DEPLOY_TIMEOUT_USE_DOCKER_MS Per-strategy timeout for --use-docker (default 180000).
+ *   EDGE_DOCKER_NO_AUTO_START=true   Do not open Docker Desktop / systemctl start docker from this utility.
+ *   EDGE_DOCKER_START_WAIT_SEC       Max seconds to poll after auto-start (default 120).
  */
 
 const https = require('https');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { execSync, spawn } = require('child_process');
+const { execSync } = require('child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
+const {
+    createDeployStrategyContext,
+    deployWithProbeAndSticky,
+    getDeployStrategyOrder
+} = require('./lib/edgeFunctionDeploy');
+
+// When stdout is a pipe (e.g. `node … | tee`), Node uses block buffering — logs appear stuck.
+// setBlocking makes writes flush promptly on Unix/macOS.
+(function lineBufferStdio() {
+    try {
+        for (const stream of [process.stdout, process.stderr]) {
+            const h = stream && stream._handle;
+            if (h && typeof h.setBlocking === 'function') {
+                h.setBlocking(true);
+            }
+        }
+    } catch (_) {
+        /* ignore */
+    }
+})();
 
 // ANSI color codes for console output
 const colors = {
@@ -351,11 +380,74 @@ function loadEnvFile() {
             loaded = true;
         }
     }
+    if (!loaded) {
+        logWarning('No .env.local or .env in current directory — using existing process environment only.');
+    }
     return loaded;
 }
 
 // Load environment variables
 loadEnvFile();
+logInfo(`[edge-functions-migration] cwd=${process.cwd()} | ${new Date().toISOString()}`);
+
+// Application name for per-app state (SUPABASE_APP_NAME or SUPABSE_APP_NAME typo from .env.local)
+function getAppName() {
+    if (appNameOverride != null && String(appNameOverride).trim() !== '') {
+        return String(appNameOverride).trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+    }
+    const name = process.env.SUPABASE_APP_NAME || process.env.SUPABSE_APP_NAME || '';
+    const sanitized = (typeof name === 'string' ? name : '').trim().replace(/[^a-zA-Z0-9_-]/g, '_') || 'default';
+    return sanitized || 'default';
+}
+
+// Target environment for per-env state (test, prod, dev, backup). Used in state path.
+function getTargetEnv() {
+    if (targetEnvOverride != null && String(targetEnvOverride).trim() !== '') {
+        return String(targetEnvOverride).trim().toLowerCase().replace(/[^a-zA-Z0-9_-]/g, '_') || 'default';
+    }
+    return 'default';
+}
+
+// Path to deploy state file: edge_function_deploy_state/<APP_NAME>/<TARGET_ENV>.json
+function getDeployStatePath() {
+    const appName = getAppName();
+    const envName = getTargetEnv();
+    return path.join(PROJECT_ROOT, 'edge_function_deploy_state', appName, `${envName}.json`);
+}
+
+// Load last-deployed state for (app, target env). Returns {} on missing/invalid.
+function loadDeployState() {
+    try {
+        const stateFile = getDeployStatePath();
+        if (!fs.existsSync(stateFile)) {
+            return {};
+        }
+        const raw = fs.readFileSync(stateFile, 'utf8');
+        const state = JSON.parse(raw);
+        return typeof state === 'object' && state !== null ? state : {};
+    } catch {
+        return {};
+    }
+}
+
+// Update last-deployed timestamp for a function (per application and target env).
+// State path: edge_function_deploy_state/<APP_NAME>/<TARGET_ENV>.json
+function updateLastDeployedTimestamp(functionName) {
+    try {
+        const stateFile = getDeployStatePath();
+        const stateDir = path.dirname(stateFile);
+        if (!fs.existsSync(stateDir)) {
+            fs.mkdirSync(stateDir, { recursive: true });
+        }
+        const state = loadDeployState();
+        state[functionName] = new Date().toISOString();
+        const tmpFile = `${stateFile}.${process.pid}.${Date.now()}`;
+        fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), 'utf8');
+        fs.renameSync(tmpFile, stateFile);
+    } catch (err) {
+        logWarning(`Could not update last-deployed state for ${functionName}: ${err.message}`);
+    }
+}
 
 // Configuration from arguments
 const SOURCE_REF = process.argv[2];
@@ -370,6 +462,12 @@ let allowPartialFilter = false;
 let incrementalMode = false;
 let replaceMode = false;
 let retryMissingMode = false;
+/** When true: remove target-only functions after migration so target name set matches source. */
+let pruneTargetMode = false;
+/** When false (default): skip downloading target for byte compare — always deploy source to target (faster). */
+let compareWithTarget = false;
+let appNameOverride = null;
+let targetEnvOverride = null;
 
 for (const rawArg of additionalArgs) {
     if (!rawArg) continue;
@@ -379,6 +477,10 @@ for (const rawArg of additionalArgs) {
         filterList = filterList.concat(names);
     } else if (rawArg.startsWith('--filter-file=')) {
         filterFilePath = rawArg.split('=')[1] || '';
+    } else if (rawArg.startsWith('--app-name=')) {
+        appNameOverride = rawArg.split('=')[1] || '';
+    } else if (rawArg.startsWith('--target-env=')) {
+        targetEnvOverride = rawArg.split('=')[1] || '';
     } else if (rawArg === '--allow-missing') {
         allowPartialFilter = true;
     } else if (rawArg === '--incremental' || rawArg === '--increment') {
@@ -387,6 +489,10 @@ for (const rawArg of additionalArgs) {
         replaceMode = true;
     } else if (rawArg === '--retryMissing' || rawArg === '--retry-missing') {
         retryMissingMode = true;
+    } else if (rawArg === '--prune-target' || rawArg === '--prune-target-edge') {
+        pruneTargetMode = true;
+    } else if (rawArg === '--compare-target' || rawArg === '--compare-with-target') {
+        compareWithTarget = true;
     } else if (rawArg.trim().length > 0) {
         logWarning(`Unknown argument ignored: ${rawArg}`);
     }
@@ -550,6 +656,45 @@ if (!sourceConfig.accessToken || !targetConfig.accessToken) {
     process.exit(1);
 }
 
+logInfo('[edge-functions-migration] Config validated — starting migration run…');
+
+// Get edge functions from a project using Management API (with pagination to fetch ALL functions)
+const EDGE_FUNCTIONS_PAGE_SIZE = 200;
+
+function fetchFunctionsPage(projectRef, accessToken, offset = 0, limit = EDGE_FUNCTIONS_PAGE_SIZE) {
+    const url = `https://api.supabase.com/v1/projects/${projectRef}/functions?limit=${limit}&offset=${offset}`;
+    return new Promise((resolve, reject) => {
+        const req = https.request(url, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Content-Type': 'application/json'
+            }
+        }, (res) => {
+            let data = '';
+            res.on('data', (chunk) => { data += chunk; });
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    try {
+                        const json = JSON.parse(data);
+                        // API may return array directly or { data: [...] }
+                        const funcList = Array.isArray(json)
+                            ? json
+                            : (json && Array.isArray(json.data) ? json.data : []);
+                        resolve(funcList);
+                    } catch (e) {
+                        reject(new Error(`Failed to parse functions response: ${e.message}`));
+                    }
+                } else {
+                    reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
+                }
+            });
+        });
+        req.on('error', reject);
+        req.end();
+    });
+}
+
 // Get edge functions from a project using Management API
 async function getEdgeFunctions(projectRef, accessToken, projectName, dbPassword = null) {
     try {
@@ -565,94 +710,159 @@ async function getEdgeFunctions(projectRef, accessToken, projectName, dbPassword
             logWarning(`  No access token provided`);
         }
         
-        const url = `https://api.supabase.com/v1/projects/${projectRef}/functions`;
-        
-        const functions = await new Promise((resolve, reject) => {
-            const req = https.request(url, {
-                method: 'GET',
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                }
-            }, (res) => {
-                let data = '';
-                res.on('data', (chunk) => { data += chunk; });
-                res.on('end', () => {
-                    if (res.statusCode >= 200 && res.statusCode < 300) {
-                        try {
-                            const json = JSON.parse(data);
-                            const funcList = Array.isArray(json) ? json : [];
-                            resolve(funcList);
-                        } catch (e) {
-                            logError(`  Failed to parse response: ${e.message}`);
-                            reject(new Error(`Failed to parse functions response: ${e.message}`));
-                        }
-                    } else {
-                        // For 403 errors, try Supabase CLI as fallback
-                        if (res.statusCode === 403) {
-                            let errorMsg = '';
-                            try {
-                                const errorJson = JSON.parse(data);
-                                errorMsg = errorJson.message || data.substring(0, 200);
-                            } catch {
-                                errorMsg = data.substring(0, 200);
-                            }
-                            logError(`  HTTP ${res.statusCode}: ${errorMsg}`);
-                            logWarning(`  ⚠ Permission denied: Access token does not have permission to access edge functions endpoint`);
-                            logInfo(`  Attempting to use Supabase CLI as fallback...`);
-                            
-                            // Try to get functions using Supabase CLI
-                            try {
-                                // Use provided dbPassword or try to get it from config
-                                let passwordToUse = dbPassword;
-                                if (!passwordToUse) {
-                                    try {
-                                        const config = getSupabaseConfig(projectRef);
-                                        passwordToUse = config.dbPassword;
-                                    } catch (e) {
-                                        // Ignore - will try without password
-                                    }
-                                }
-                                // Get access token from config if available
-                                let accessTokenToUse = accessToken;
-                                if (!accessTokenToUse) {
-                                    try {
-                                        const config = getSupabaseConfig(projectRef);
-                                        accessTokenToUse = config.accessToken;
-                                    } catch (e) {
-                                        // Ignore - will try without access token
-                                    }
-                                }
-                                const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse, accessTokenToUse);
-                                if (cliFunctions && cliFunctions.length > 0) {
-                                    logSuccess(`  ✓ Successfully retrieved ${cliFunctions.length} function(s) via Supabase CLI`);
-                                    resolve(cliFunctions);
-                                    return;
-                                } else {
-                                    logWarning(`  Supabase CLI did not return any functions`);
-                                }
-                            } catch (cliError) {
-                                logWarning(`  Supabase CLI fallback failed: ${cliError.message}`);
-                            }
-                            
-                            // If CLI fallback failed, return empty array to allow migration to continue
-                            logWarning(`  Edge functions migration will be skipped for this project`);
-                            logWarning(`  To fix: Ensure your access token has 'functions:read' permission or use a token with full project access`);
-                            logWarning(`  Alternative: Use 'supabase login' to authenticate with Supabase CLI`);
-                            resolve([]); // Return empty array to allow migration to continue
-                            return;
-                        }
-                        logError(`  HTTP ${res.statusCode}: ${data.substring(0, 200)}`);
-                        reject(new Error(`HTTP ${res.statusCode}: ${data.substring(0, 200)}`));
+        // Fetch all pages so we get every function (API may paginate at 100–200)
+        const allFunctions = [];
+        const seenIds = new Set();
+        let offset = 0;
+        let page;
+        try {
+            do {
+                logInfo(
+                    `  Management API: fetching functions page (offset ${offset}, limit ${EDGE_FUNCTIONS_PAGE_SIZE})…`
+                );
+                page = await fetchFunctionsPage(projectRef, accessToken, offset, EDGE_FUNCTIONS_PAGE_SIZE);
+                for (const f of page) {
+                    const key = f.id || f.name;
+                    if (key && !seenIds.has(key)) {
+                        seenIds.add(key);
+                        allFunctions.push(f);
                     }
+                }
+                logInfo(`  … page done — ${allFunctions.length} unique function(s) so far`);
+                offset += EDGE_FUNCTIONS_PAGE_SIZE;
+            } while (page.length === EDGE_FUNCTIONS_PAGE_SIZE);
+        } catch (apiError) {
+            // If paginated request fails (e.g. API does not support limit/offset), try single request without params
+            if (allFunctions.length === 0) {
+                const url = `https://api.supabase.com/v1/projects/${projectRef}/functions`;
+                const raw = await new Promise((resolve, reject) => {
+                    const req = https.request(url, {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${accessToken}`,
+                            'Content-Type': 'application/json'
+                        }
+                    }, (res) => {
+                        let data = '';
+                        res.on('data', (chunk) => { data += chunk; });
+                        res.on('end', () => resolve({ statusCode: res.statusCode, data }));
+                    });
+                    req.on('error', reject);
+                    req.end();
                 });
+                if (raw.statusCode >= 200 && raw.statusCode < 300) {
+                    const json = JSON.parse(raw.data);
+                    const funcList = Array.isArray(json) ? json : (json && Array.isArray(json.data) ? json.data : []);
+                    funcList.forEach(f => allFunctions.push(f));
+                } else if (raw.statusCode === 403) {
+                    let errorMsg = '';
+                    try {
+                        const errorJson = JSON.parse(raw.data);
+                        errorMsg = errorJson.message || raw.data.substring(0, 200);
+                    } catch {
+                        errorMsg = raw.data.substring(0, 200);
+                    }
+                    logError(`  HTTP 403: ${errorMsg}`);
+                    logWarning(`  ⚠ Permission denied: Access token does not have permission to access edge functions endpoint`);
+                    logInfo(`  Attempting to use Supabase CLI as fallback...`);
+                    try {
+                        let passwordToUse = dbPassword;
+                        if (!passwordToUse) {
+                            try {
+                                const config = getSupabaseConfig(projectRef);
+                                passwordToUse = config.dbPassword;
+                            } catch (e) { /* ignore */ }
+                        }
+                        let accessTokenToUse = accessToken;
+                        if (!accessTokenToUse) {
+                            try {
+                                const config = getSupabaseConfig(projectRef);
+                                accessTokenToUse = config.accessToken;
+                            } catch (e) { /* ignore */ }
+                        }
+                        const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse, accessTokenToUse);
+                        if (cliFunctions && cliFunctions.length > 0) {
+                            logSuccess(`  ✓ Successfully retrieved ${cliFunctions.length} function(s) via Supabase CLI`);
+                            return cliFunctions;
+                        }
+                    } catch (cliError) {
+                        logWarning(`  Supabase CLI fallback failed: ${cliError.message}`);
+                    }
+                    logWarning(`  Edge functions migration will be skipped for this project`);
+                    return [];
+                } else {
+                    throw new Error(`HTTP ${raw.statusCode}: ${raw.data.substring(0, 200)}`);
+                }
+            } else {
+                throw apiError;
+            }
+        }
+
+        const functions = allFunctions;
+        
+        // If we got nothing and API might have returned 403, run the 403 path (CLI fallback) via the original URL
+        if (functions.length === 0) {
+            const url = `https://api.supabase.com/v1/projects/${projectRef}/functions`;
+            const response = await new Promise((resolve, reject) => {
+                const req = https.request(url, {
+                    method: 'GET',
+                    headers: {
+                        'Authorization': `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json'
+                    }
+                }, (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => { data += chunk; });
+                    res.on('end', () => resolve({ statusCode: res.statusCode, data }));
+                });
+                req.on('error', reject);
+                req.end();
             });
-            req.on('error', (error) => {
-                logError(`  Request error: ${error.message}`);
-                reject(error);
-            });
-            req.end();
-        });
+            
+            if (response.statusCode === 403) {
+                let errorMsg = '';
+                try {
+                    const errorJson = JSON.parse(response.data);
+                    errorMsg = errorJson.message || response.data.substring(0, 200);
+                } catch {
+                    errorMsg = response.data.substring(0, 200);
+                }
+                logError(`  HTTP 403: ${errorMsg}`);
+                logWarning(`  ⚠ Permission denied: Access token does not have permission to access edge functions endpoint`);
+                logInfo(`  Attempting to use Supabase CLI as fallback...`);
+                
+                try {
+                    let passwordToUse = dbPassword;
+                    if (!passwordToUse) {
+                        try {
+                            const config = getSupabaseConfig(projectRef);
+                            passwordToUse = config.dbPassword;
+                        } catch (e) { /* ignore */ }
+                    }
+                    let accessTokenToUse = accessToken;
+                    if (!accessTokenToUse) {
+                        try {
+                            const config = getSupabaseConfig(projectRef);
+                            accessTokenToUse = config.accessToken;
+                        } catch (e) { /* ignore */ }
+                    }
+                    const cliFunctions = getEdgeFunctionsViaCLI(projectRef, projectName, passwordToUse, accessTokenToUse);
+                    if (cliFunctions && cliFunctions.length > 0) {
+                        logSuccess(`  ✓ Successfully retrieved ${cliFunctions.length} function(s) via Supabase CLI`);
+                        return cliFunctions;
+                    }
+                    logWarning(`  Supabase CLI did not return any functions`);
+                } catch (cliError) {
+                    logWarning(`  Supabase CLI fallback failed: ${cliError.message}`);
+                }
+                logWarning(`  Edge functions migration will be skipped for this project`);
+                logWarning(`  To fix: Ensure your access token has 'functions:read' permission or use a token with full project access`);
+                return [];
+            }
+            if (response.statusCode >= 300) {
+                throw new Error(`HTTP ${response.statusCode}: ${response.data.substring(0, 200)}`);
+            }
+        }
         
         logSuccess(`Found ${functions.length} edge function(s) in ${projectName || 'project'}`);
         if (functions.length > 0) {
@@ -803,12 +1013,43 @@ function checkDocker() {
     }
 }
 
-// Ensure Docker is running before edge function download/deploy. On macOS, attempt to start Docker Desktop.
+// Ensure Docker is running before edge function download/deploy. Tries to start Docker on macOS/Linux unless EDGE_DOCKER_NO_AUTO_START=true.
 async function ensureDockerRunning() {
+    logInfo('Preflight: checking Docker (`docker ps`)…');
     if (checkDocker()) {
+        logSuccess('Preflight: Docker is reachable.');
         return;
     }
+    if (process.env.EDGE_DOCKER_NO_AUTO_START === 'true') {
+        logError('Docker is not running and EDGE_DOCKER_NO_AUTO_START=true (auto-start disabled).');
+        throw new Error('Docker is not running');
+    }
+
+    let waitSec = parseInt(process.env.EDGE_DOCKER_START_WAIT_SEC || '120', 10);
+    if (!Number.isFinite(waitSec) || waitSec < 1) {
+        waitSec = 120;
+    }
+    const maxWaitMs = waitSec * 1000;
+    const pollIntervalMs = 3000;
+
+    const waitForDockerDaemon = async () => {
+        for (let waited = 0; waited < maxWaitMs; waited += pollIntervalMs) {
+            logInfo(`Waiting for Docker to be ready... (${waited / 1000}s / ${maxWaitMs / 1000}s)`);
+            try {
+                execSync('docker ps', { stdio: 'pipe', timeout: 10000 });
+                logSuccess('Docker is running.');
+                return true;
+            } catch (e) {
+                /* keep polling */
+            }
+            await new Promise((r) => setTimeout(r, pollIntervalMs));
+        }
+        return false;
+    };
+
     const isMac = process.platform === 'darwin';
+    const isLinux = process.platform === 'linux';
+
     if (isMac) {
         logInfo('Docker is not running. Attempting to start Docker Desktop...');
         try {
@@ -816,26 +1057,32 @@ async function ensureDockerRunning() {
         } catch (e) {
             logWarning('Could not launch Docker Desktop (open -a Docker failed).');
         }
-        const maxWaitMs = 90000; // 90 seconds
-        const pollIntervalMs = 3000;
-        for (let waited = 0; waited < maxWaitMs; waited += pollIntervalMs) {
-            logInfo(`Waiting for Docker to be ready... (${waited / 1000}s)`);
+        if (await waitForDockerDaemon()) {
+            return;
+        }
+    } else if (isLinux) {
+        logInfo('Docker is not running. Attempting systemctl start docker...');
+        try {
+            execSync('systemctl start docker', { stdio: 'pipe', timeout: 15000 });
+        } catch (e) {
             try {
-                execSync('docker ps', { stdio: 'pipe', timeout: 10000 });
-                logSuccess('Docker is running.');
-                return;
-            } catch (e) {
-                // continue waiting
+                execSync('sudo -n systemctl start docker', { stdio: 'pipe', timeout: 15000 });
+            } catch (e2) {
+                logWarning('Could not start docker via systemctl (try: sudo systemctl start docker).');
             }
-            await new Promise((r) => setTimeout(r, pollIntervalMs));
+        }
+        if (await waitForDockerDaemon()) {
+            return;
         }
     }
+
     logError('Docker is not running - required for edge function download and deploy.');
-    logInfo('Please start Docker Desktop and run this migration again.');
+    logInfo('Please start Docker and run this migration again.');
     if (isMac) {
         logInfo('  macOS: Open Docker from Applications, or run: open -a Docker');
+    } else if (isLinux) {
+        logInfo('  Linux: sudo systemctl start docker (or start your container runtime)');
     } else {
-        logInfo('  Linux: start the Docker daemon (e.g. sudo systemctl start docker)');
         logInfo('  Windows: Start Docker Desktop from the Start menu');
     }
     throw new Error('Docker is not running');
@@ -1419,10 +1666,22 @@ function removeEnvFilesFromDeployDir(dir) {
     }
 }
 
-// Deploy edge function using Supabase CLI
-// Note: No retry logic - failures are added to retry list for manual retry
-async function deployEdgeFunction(functionName, functionDir, targetRef, dbPassword, sourceRef = null, sourceDbPassword = null, targetAccessToken = null) {
+// Deploy edge function using Supabase CLI (--use-api / --use-docker with sticky strategy).
+// Non-429 failures are not retried here; they go to the retry list.
+async function deployEdgeFunction(
+    functionName,
+    functionDir,
+    targetRef,
+    dbPassword,
+    sourceRef = null,
+    sourceDbPassword = null,
+    targetAccessToken = null,
+    deployStrategyContext
+) {
     try {
+        if (!deployStrategyContext) {
+            throw new Error('deployStrategyContext is required');
+        }
         logInfo(`    Deploying function: ${functionName}...`);
         
         // Check if function directory exists
@@ -1760,68 +2019,43 @@ async function deployEdgeFunction(functionName, functionDir, targetRef, dbPasswo
                 }
             }
             
-            // Deploy (project is now linked)
-            // Use spawn to better capture both stdout and stderr
+            // Deploy (project is now linked): API bundle first, then Docker; sticky after first success.
             let deployOutput = '';
             let deployStderr = '';
             try {
-                // Wrap deploy in retry logic for rate limiting
-                await retryWithBackoff(async () => {
-                    // Use minimal env only (no .env.local / secrets) so we never touch target project secrets
-                    const env = getMinimalDeployEnv(targetAccessToken);
-                    
-                    const deployProcess = spawn('supabase', ['functions', 'deploy', functionName], {
-                        cwd: supabaseConfigDir,
-                        stdio: ['pipe', 'pipe', 'pipe'],
-                        env: env
-                        // Removed shell: true to fix deprecation warning - args are already properly separated
-                    });
-                    
-                    let stdout = '';
-                    let stderr = '';
-                    
-                    deployProcess.stdout.on('data', (data) => {
-                        stdout += data.toString();
-                    });
-                    
-                    deployProcess.stderr.on('data', (data) => {
-                        stderr += data.toString();
-                    });
-                    
-                    // Wait for process to complete with timeout (synchronous using execSync-like approach)
-                    // For better error handling, we'll use a Promise-based approach
-                    const deployPromise = new Promise((resolve, reject) => {
-                        const timeout = setTimeout(() => {
-                            deployProcess.kill();
-                            reject(new Error('Deployment timeout after 120 seconds'));
-                        }, 120000);
-                        
-                        deployProcess.on('close', (code) => {
-                            clearTimeout(timeout);
-                            if (code === 0) {
-                                resolve({ stdout, stderr });
-                            } else {
-                                const error = new Error(`Deployment failed with exit code ${code}`);
-                                error.stdout = stdout;
-                                error.stderr = stderr;
-                                error.code = code;
-                                reject(error);
-                            }
-                        });
-                        
-                        deployProcess.on('error', (err) => {
-                            clearTimeout(timeout);
-                            reject(err);
-                        });
-                    });
-                    
-                    // Wait for deployment
-                    const result = await deployPromise;
-                    deployOutput = result.stdout;
-                    deployStderr = result.stderr;
-                }, 3, 2000, false);
-                
-                // Log successful deployment output
+                const deployEnv = getMinimalDeployEnv(targetAccessToken);
+                const order = deployStrategyContext.getOrder();
+
+                if (!deployStrategyContext.getSticky() && order.length > 1 && !deployStrategyContext.probeBannerLogged) {
+                    logInfo(`    Deploy strategy: probing (--use-api, then --use-docker)...`);
+                    deployStrategyContext.probeBannerLogged = true;
+                }
+
+                const result = await deployWithProbeAndSticky({
+                    cwd: supabaseConfigDir,
+                    env: deployEnv,
+                    functionName,
+                    context: deployStrategyContext,
+                    onRateLimit: (delay, attempt, max) => {
+                        logWarning(
+                            `    ⚠ Rate limit hit (429), retrying in ${delay / 1000}s... (attempt ${attempt}/${max})`
+                        );
+                    }
+                });
+
+                deployOutput = result.stdout || '';
+                deployStderr = result.stderr || '';
+
+                if (result.recoveredAfterStickyFailure) {
+                    logWarning(
+                        `    Sticky deploy (${result.previousSticky}) failed; recovered with --${result.strategyUsed}`
+                    );
+                }
+                if (result.probed && !deployStrategyContext.lockBannerLogged && order.length > 1) {
+                    logSuccess(`    Deploy strategy locked: ${result.strategyUsed}`);
+                    deployStrategyContext.lockBannerLogged = true;
+                }
+
                 if (deployOutput) {
                     logInfo(`    Deployment output: ${deployOutput.trim().substring(0, 200)}`);
                 }
@@ -1973,6 +2207,7 @@ async function migrateEdgeFunctions() {
     console.log('');
 
     // Ensure Docker is running (required for CLI download/deploy). On macOS, try to start Docker Desktop.
+    logInfo('Step 0/4: Docker preflight (this can take up to ~90s if Docker is starting)…');
     await ensureDockerRunning();
 
     // Step 1: Get source edge functions
@@ -2060,6 +2295,7 @@ async function migrateEdgeFunctions() {
             logSuccess('All source functions are present in target. Nothing to migrate.');
             console.log('');
             return {
+                success: true,
                 attempted: [],
                 migrated: [],
                 failed: [],
@@ -2145,23 +2381,31 @@ async function migrateEdgeFunctions() {
     let migratedCount = 0;
     let skippedCount = 0;
     let failedCount = 0;
-    
+    let edgeDeployContext = null;
+
     // Create functions directory for downloads
     const functionsDir = path.join(MIGRATION_DIR, 'edge_functions');
     if (!fs.existsSync(functionsDir)) {
         fs.mkdirSync(functionsDir, { recursive: true });
     }
     
-    // Step 4: Smart migration - compare functions and deploy only what's needed
-    logInfo(`Function comparison:`);
+    // Step 4: Plan which functions to deploy from source → target
+    logInfo(`Edge functions plan:`);
     logInfo(`  Source: ${sourceFunctions.length} function(s)`);
     logInfo(`  Target: ${targetFunctions.length} function(s)${replaceMode ? ' (cleared in replace mode)' : ''}`);
-    logInfo(`  Mode: ${replaceMode ? 'REPLACE (all functions will be redeployed)' : incrementalMode ? 'incremental (skip identical)' : 'standard (redeploy existing)'}`);
+    const compareNote = compareWithTarget
+        ? 'compare-with-target (download target + byte diff before deploy)'
+        : 'direct deploy from source (no target code compare — faster)';
+    logInfo(
+        `  Mode: ${replaceMode ? 'REPLACE (all functions will be redeployed)' : incrementalMode ? 'incremental (skip identical API metadata)' : 'standard'} | ${compareNote}`
+    );
     console.log('');
     
     // Determine which functions need migration
     const functionsToMigrate = [];
-    
+    const deployState = loadDeployState(); // last-deployed per (app, target env)
+    const skippedByDeployState = [];
+
     for (const sourceFunction of sourceFunctions) {
         const functionName = sourceFunction.name;
         const existingFunction = replaceMode ? null : targetFunctionMap.get(functionName);
@@ -2169,6 +2413,19 @@ async function migrateEdgeFunctions() {
         if (!functionName) {
             failedFunctions.push('(unnamed)');
             continue;
+        }
+
+        // Skip if we already deployed this version for this (app, target env) and source hasn't changed.
+        // Only when the function still exists on target — otherwise redeploy (target may have been wiped or drifted).
+        const lastDeployedAt = deployState[functionName];
+        if (lastDeployedAt != null && !replaceMode && existingFunction) {
+            const stateTs = normalizeTimestamp(lastDeployedAt);
+            const sourceUpdated = normalizeTimestamp(sourceFunction.updated_at ?? sourceFunction.updatedAt);
+            if (sourceUpdated !== null && stateTs !== null && sourceUpdated <= stateTs) {
+                skippedByDeployState.push(functionName);
+                skippedFunctions.push(functionName);
+                continue;
+            }
         }
         
         if (existingFunction && !replaceMode) {
@@ -2208,7 +2465,14 @@ async function migrateEdgeFunctions() {
         logInfo(`  Skipped: ${previewList}${identicalFunctions.length > previewCount ? ', …' : ''}`);
         console.log('');
     }
-    
+    if (skippedByDeployState.length > 0) {
+        logSuccess(`Skipped (already deployed for this env, source unchanged): ${skippedByDeployState.length}`);
+        const previewCount = Math.min(skippedByDeployState.length, 10);
+        const previewList = skippedByDeployState.slice(0, previewCount).join(', ');
+        logInfo(`  Skipped: ${previewList}${skippedByDeployState.length > previewCount ? ', …' : ''}`);
+        console.log('');
+    }
+
     // Check if all functions are already in target (or skipped due to identical versions)
     if (functionsToMigrate.length === 0) {
         if (sourceFunctions.length === 0) {
@@ -2223,6 +2487,12 @@ async function migrateEdgeFunctions() {
         logInfo(`Functions to migrate: ${functionsToMigrate.length}`);
         logInfo(`  - New functions: ${functionsToMigrate.filter(f => f.isNew).length}`);
         logInfo(`  - Existing functions (will update): ${functionsToMigrate.filter(f => !f.isNew).length}`);
+        console.log('');
+
+        edgeDeployContext = createDeployStrategyContext();
+        logInfo(
+            `Edge function deploy strategy order: ${edgeDeployContext.getOrder().join(' → ')} (locks after first successful deploy)`
+        );
         console.log('');
         
         // Pre-deployment: Collect all shared files from all functions before deploying
@@ -2271,38 +2541,14 @@ async function migrateEdgeFunctions() {
             if (isNew) {
                 logInfo(`  Status: NEW - will create in target`);
             } else {
-                logInfo(`  Status: EXISTS - checking for updates`);
+                logInfo(
+                    `  Status: EXISTS - will ${compareWithTarget ? 'compare with target then deploy if different' : 'deploy from source (overwrite target)'}` 
+                );
                 logInfo(`  Source ID: ${sourceFunction.id || 'N/A'}`);
                 logInfo(`  Target ID: ${existing?.id || 'N/A'}`);
             }
             
-            // Check if function needs shared files BEFORE downloading
-            // First, try to check from local repository if available
-            const localFunctionPath = path.join(PROJECT_ROOT, 'supabase', 'functions', functionName);
-            let functionNeedsSharedFiles = false;
-            if (fs.existsSync(localFunctionPath)) {
-                const localIndexPath = path.join(localFunctionPath, 'index.ts');
-                const localIndexJsPath = path.join(localFunctionPath, 'index.js');
-                let localFunctionCode = '';
-                if (fs.existsSync(localIndexPath)) {
-                    localFunctionCode = fs.readFileSync(localIndexPath, 'utf8');
-                } else if (fs.existsSync(localIndexJsPath)) {
-                    localFunctionCode = fs.readFileSync(localIndexJsPath, 'utf8');
-                }
-                functionNeedsSharedFiles = hasSharedFileImports(localFunctionCode);
-            }
-            
-            // Check if function has shared files - if so, skip in main migration
-            // These will be handled by the dedicated shared functions migration script
-            if (functionNeedsSharedFiles) {
-                logInfo(`  Has shared files dependency - skipping in main migration`);
-                logInfo(`  This function will be migrated using migrate_shared_edge_functions.sh`);
-                skippedSharedFunctions.push(functionName);
-                console.log('');
-                continue;
-            }
-            
-            // Download function from source
+            // Download function from source (shared imports are bundled in deployEdgeFunction via _shared)
             const functionDir = path.join(functionsDir, functionName);
             logInfo(`  Downloading edge function from source...`);
             
@@ -2361,21 +2607,14 @@ async function migrateEdgeFunctions() {
             } else if (fs.existsSync(downloadedIndexJsPath)) {
                 downloadedFunctionCode = fs.readFileSync(downloadedIndexJsPath, 'utf8');
             }
-            const downloadedFunctionNeedsSharedFiles = hasSharedFileImports(downloadedFunctionCode);
-            
-            if (downloadedFunctionNeedsSharedFiles) {
-                logInfo(`  ✓ Confirmed: Has shared files dependency`);
-                logInfo(`  Skipping rest of process - will be handled by migrate_shared_edge_functions.sh`);
-                logInfo(`  This function will be migrated using migrate_shared_edge_functions.sh`);
-                skippedSharedFunctions.push(functionName);
-                console.log('');
-                continue; // Skip comparison and deployment - let dedicated script handle it
+            if (hasSharedFileImports(downloadedFunctionCode)) {
+                logInfo(`  ✓ Confirmed: imports from _shared (will bundle during deploy)`);
             }
             
             logSuccess(`  ✓ Downloaded function: ${functionName}`);
             
-            // For existing functions, compare with target before deploying (skip comparison in replace mode)
-            if (!isNew && !replaceMode) {
+            // Optional: download target and byte-compare (slow); default is deploy source → target without compare
+            if (!isNew && !replaceMode && compareWithTarget) {
                 logInfo(`  Comparing with target function...`);
                 
                 // Download target function for comparison (quiet mode to reduce noise)
@@ -2395,7 +2634,6 @@ async function migrateEdgeFunctions() {
                         if (fs.existsSync(targetFunctionDir)) {
                             // Get file counts for logging
                             const sourceFiles = getAllCodeFiles(functionDir);
-                            const targetFiles = getAllCodeFiles(targetFunctionDir);
                             logInfo(`  Comparing ${sourceFiles.length} code files (byte-for-byte)...`);
                             
                             const areIdentical = compareFunctionDirectories(functionDir, targetFunctionDir);
@@ -2426,8 +2664,17 @@ async function migrateEdgeFunctions() {
                 }
             }
             
-            // Deploy function to target (no retry - failures go to retry list)
-            const deployResult = await deployEdgeFunction(functionName, functionDir, TARGET_REF, targetConfig.dbPassword, SOURCE_REF, sourceConfig.dbPassword, targetConfig.accessToken);
+            // Deploy function to target (failures go to retry list)
+            const deployResult = await deployEdgeFunction(
+                functionName,
+                functionDir,
+                TARGET_REF,
+                targetConfig.dbPassword,
+                SOURCE_REF,
+                sourceConfig.dbPassword,
+                targetConfig.accessToken,
+                edgeDeployContext
+            );
             
             // Handle different return types (boolean or object)
             const deploySuccess = typeof deployResult === 'object' ? deployResult.success : deployResult;
@@ -2435,6 +2682,7 @@ async function migrateEdgeFunctions() {
             
             if (deploySuccess) {
                 migratedFunctions.push(functionName);
+                updateLastDeployedTimestamp(functionName);
                 logSuccess(`  ✓ Function ${isNew ? 'created' : 'updated'} successfully`);
             } else if (isIncompatible) {
                 incompatibleFunctions.push(functionName);
@@ -2450,7 +2698,56 @@ async function migrateEdgeFunctions() {
             console.log('');
         }
     }
-    
+
+    let prunedTargetOnlyNames = [];
+    let pruneDeleteFailed = [];
+    const sourceNameSet = new Set(sourceFunctions.map((f) => f?.name).filter(Boolean));
+    const allowPruneTarget =
+        pruneTargetMode && !uniqueFilterSet && !retryMissingMode && sourceNameSet.size > 0;
+
+    if (allowPruneTarget) {
+        logSeparator();
+        logInfo(`${colors.bright}Pruning target-only edge functions (not in source)${colors.reset}`);
+        logSeparator();
+
+        let currentTargetList = [];
+        try {
+            currentTargetList = await getEdgeFunctions(
+                TARGET_REF,
+                targetConfig.accessToken,
+                'Target',
+                targetConfig.dbPassword
+            );
+        } catch (pruneFetchErr) {
+            logWarning(`Could not list target functions for prune: ${pruneFetchErr.message || pruneFetchErr}`);
+        }
+
+        const extras = currentTargetList.filter((f) => f?.name && !sourceNameSet.has(f.name));
+        if (extras.length === 0) {
+            logSuccess('Target has no extra edge functions vs source (nothing to prune).');
+        } else {
+            logInfo(
+                `Removing ${extras.length} function(s) on target only: ${extras.map((f) => f.name).join(', ')}`
+            );
+            for (const tf of extras) {
+                const name = tf.name;
+                try {
+                    if (await deleteEdgeFunction(name, TARGET_REF, targetConfig.dbPassword, targetConfig.accessToken)) {
+                        logSuccess(`  ✓ Pruned: ${name}`);
+                        prunedTargetOnlyNames.push(name);
+                    } else {
+                        logError(`  ✗ Could not prune: ${name}`);
+                        pruneDeleteFailed.push(name);
+                    }
+                } catch (prErr) {
+                    logError(`  ✗ Prune error for ${name}: ${prErr.message || prErr}`);
+                    pruneDeleteFailed.push(name);
+                }
+            }
+        }
+        console.log('');
+    }
+
     const dedupe = (arr) => Array.from(new Set(arr.filter(Boolean)));
     const attemptedFunctionNames = functionsToMigrate.map(({ function: func }) => func?.name).filter(Boolean);
     const uniqueMigratedFunctions = dedupe(migratedFunctions);
@@ -2458,6 +2755,7 @@ async function migrateEdgeFunctions() {
     const uniqueSkippedFunctions = dedupe(skippedFunctions);
     const uniqueSkippedSharedFunctions = dedupe(skippedSharedFunctions);
     const uniqueIncompatibleFunctions = dedupe(incompatibleFunctions);
+    const uniquePruneFailed = dedupe(pruneDeleteFailed);
 
     migratedCount = uniqueMigratedFunctions.length;
     failedCount = uniqueFailedFunctions.length;
@@ -2477,7 +2775,14 @@ async function migrateEdgeFunctions() {
         incompatible: uniqueIncompatibleFunctions,
         identical: dedupe(identicalFunctions),
         incrementalMode,
-        missingInSource: dedupe(missingFilterFunctions)
+        compareWithTarget,
+        missingInSource: dedupe(missingFilterFunctions),
+        deployStrategyOrder: getDeployStrategyOrder(),
+        deployStrategyResolved: edgeDeployContext ? edgeDeployContext.getSticky() : null,
+        deployStrategyChanges: edgeDeployContext ? edgeDeployContext.strategyChanges : [],
+        pruneTarget: allowPruneTarget,
+        prunedTargetOnly: dedupe(prunedTargetOnlyNames),
+        pruneFailed: uniquePruneFailed
     };
 
     const failedFilePath = path.join(MIGRATION_DIR, 'edge_functions_failed.txt');
@@ -2503,6 +2808,12 @@ async function migrateEdgeFunctions() {
         logWarning(`Failed edge functions recorded in: ${failedFilePath}`);
     } else {
         logSuccess('No edge function failures recorded.');
+    }
+
+    if (uniquePruneFailed.length > 0) {
+        logError(
+            `Target prune failures (${uniquePruneFailed.length}): ${uniquePruneFailed.join(', ')} — re-run with network access or remove these functions in the dashboard.`
+        );
     }
     
     if (uniqueSkippedSharedFunctions.length > 0) {
@@ -2551,7 +2862,44 @@ ${sourceFunctions.map(f => `- ${f.name} (id: ${f.id || 'N/A'})`).join('\n')}
 `;
     fs.writeFileSync(readmePath, readmeContent);
     logInfo(`Created README: ${readmePath}`);
-    
+
+    if (!uniqueFilterSet && !retryMissingMode && sourceNameSet.size > 0) {
+        try {
+            const verifyTargetList = await getEdgeFunctions(
+                TARGET_REF,
+                targetConfig.accessToken,
+                'Target',
+                targetConfig.dbPassword
+            );
+            const targetVerifySet = new Set(verifyTargetList.map((f) => f?.name).filter(Boolean));
+            const namesMatch =
+                targetVerifySet.size === sourceNameSet.size &&
+                [...sourceNameSet].every((n) => targetVerifySet.has(n));
+            if (namesMatch) {
+                logSuccess(
+                    `Edge function parity: source and target both have ${sourceNameSet.size} function(s) with the same names.`
+                );
+            } else {
+                const missingOnTarget = [...sourceNameSet].filter((n) => !targetVerifySet.has(n)).sort();
+                const extraOnTarget = [...targetVerifySet].filter((n) => !sourceNameSet.has(n)).sort();
+                logWarning(
+                    `Edge function parity: source has ${sourceNameSet.size} named function(s), target has ${targetVerifySet.size}.`
+                );
+                if (missingOnTarget.length > 0) {
+                    logWarning(`  Missing on target (deploy failed, skipped, or incompatible): ${missingOnTarget.join(', ')}`);
+                }
+                if (extraOnTarget.length > 0) {
+                    logWarning(
+                        `  Extra on target only: ${extraOnTarget.join(', ')} — use ${colors.cyan}--prune-target${colors.reset} on the next run to remove them.`
+                    );
+                }
+            }
+        } catch (parityErr) {
+            logWarning(`Could not verify edge function parity: ${parityErr.message || parityErr}`);
+        }
+        console.log('');
+    }
+
     console.log('');
     logSeparator();
     logSuccess(`${colors.bright}Migration Complete!${colors.reset}`);
@@ -2598,12 +2946,16 @@ ${sourceFunctions.map(f => `- ${f.name} (id: ${f.id || 'N/A'})`).join('\n')}
         logWarning(`⚠ Note: Functions with shared dependencies may require shared files to be available.`);
         logWarning(`   The retry script will handle shared files automatically.`);
         logSeparator();
-    } else {
+    } else if (uniquePruneFailed.length === 0) {
         logSuccess('No edge function failures - all functions deployed successfully!');
     }
+    if (uniqueFailedFunctions.length === 0 && uniquePruneFailed.length > 0) {
+        logError('All deploys succeeded but one or more target-only functions could not be pruned.');
+    }
     console.log('');
-    
-    return { success: true, migrated: migratedCount, skipped: skippedCount, failed: failedCount };
+
+    const success = uniqueFailedFunctions.length === 0 && uniquePruneFailed.length === 0;
+    return { success, migrated: migratedCount, skipped: skippedCount, failed: failedCount };
 }
 
 // Run migration

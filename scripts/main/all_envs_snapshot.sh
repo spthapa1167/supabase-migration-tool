@@ -208,14 +208,35 @@ query_edge_functions_count() {
     
     local temp_json=$(mktemp)
     local count=0
+    local limit=200
+    local offset=0
+    local page_count=0
     
-    if curl -s -H "Authorization: Bearer $access_token" \
-        "https://api.supabase.com/v1/projects/${project_ref}/functions" \
-        -o "$temp_json" 2>/dev/null; then
-        if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then
-            count=$(jq '. | length' "$temp_json" 2>/dev/null || echo "0")
+    # Paginate to get all edge functions (API may return up to 200 per page)
+    while true; do
+        if ! curl -s -H "Authorization: Bearer $access_token" \
+            "https://api.supabase.com/v1/projects/${project_ref}/functions?limit=${limit}&offset=${offset}" \
+            -o "$temp_json" 2>/dev/null; then
+            # If paginated request fails, try once without params
+            if [ "$offset" -eq 0 ] && curl -s -H "Authorization: Bearer $access_token" \
+                "https://api.supabase.com/v1/projects/${project_ref}/functions" \
+                -o "$temp_json" 2>/dev/null; then
+                if command -v jq >/dev/null 2>&1 && jq empty "$temp_json" 2>/dev/null; then
+                    page_count=$(jq 'if type == "array" then length else (if .data | type == "array" then .data | length else 0 end) end' "$temp_json" 2>/dev/null || echo "0")
+                    count=$((count + page_count))
+                fi
+            fi
+            break
         fi
-    fi
+        if ! command -v jq >/dev/null 2>&1 || ! jq empty "$temp_json" 2>/dev/null; then
+            [ "$offset" -eq 0 ] && count=0
+            break
+        fi
+        page_count=$(jq 'if type == "array" then length else (if .data | type == "array" then .data | length else 0 end) end' "$temp_json" 2>/dev/null || echo "0")
+        count=$((count + page_count))
+        [ "${page_count:-0}" -lt "$limit" ] && break
+        offset=$((offset + limit))
+    done
     
     rm -f "$temp_json"
     echo "${count:-0}"
