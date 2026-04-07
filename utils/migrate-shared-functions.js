@@ -3,13 +3,21 @@
  * Migrate Edge Functions with Shared Files
  * Dedicated utility for migrating edge functions that have shared file dependencies
  * Handles bundling, import maps, and proper deployment of shared files
+ *
+ * Deploy tuning (same as edge-functions-migration.js): EDGE_DEPLOY_STRATEGY,
+ * EDGE_DEPLOY_TIMEOUT_USE_API_MS, EDGE_DEPLOY_TIMEOUT_USE_DOCKER_MS
  */
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync, spawn } = require('child_process');
+const { execSync } = require('child_process');
 const PROJECT_ROOT = path.resolve(__dirname, '..');
+const {
+    createDeployStrategyContext,
+    deployWithProbeAndSticky,
+    getDeployStrategyOrder
+} = require('./lib/edgeFunctionDeploy');
 const LOCAL_FUNCTIONS_DIR = path.join(PROJECT_ROOT, 'supabase', 'functions');
 
 // ANSI color codes
@@ -488,7 +496,17 @@ function removeEnvFilesFromDeployDir(dir) {
 }
 
 // Deploy function with shared files
-async function deployFunctionWithShared(functionName, functionDir, targetRef, dbPassword, targetAccessToken = null) {
+async function deployFunctionWithShared(
+    functionName,
+    functionDir,
+    targetRef,
+    dbPassword,
+    targetAccessToken = null,
+    deployStrategyContext
+) {
+    if (!deployStrategyContext) {
+        throw new Error('deployStrategyContext is required');
+    }
     const env = getMinimalDeployEnv(targetAccessToken);
     const originalCwd = process.cwd();
     const functionsParentDir = path.dirname(functionDir);
@@ -615,43 +633,39 @@ async function deployFunctionWithShared(functionName, functionDir, targetRef, db
             throw new Error('Failed to link to target project');
         }
 
-        // Deploy (minimal env - never touch target secrets)
-        logInfo(`    Deploying ${functionName}...`);
-        const deployProcess = spawn('supabase', ['functions', 'deploy', functionName], {
+        const order = deployStrategyContext.getOrder();
+        if (!deployStrategyContext.getSticky() && order.length > 1 && !deployStrategyContext.probeBannerLogged) {
+            logInfo(`    Deploy strategy: probing (--use-api, then --use-docker)...`);
+            deployStrategyContext.probeBannerLogged = true;
+        }
+
+        const result = await deployWithProbeAndSticky({
             cwd: configDir,
-            stdio: ['pipe', 'pipe', 'pipe'],
-            shell: true,
-            env: env
+            env,
+            functionName,
+            context: deployStrategyContext,
+            onRateLimit: (delay, attempt, max) => {
+                logWarning(
+                    `    Rate limit (429), retrying in ${delay / 1000}s... (attempt ${attempt}/${max})`
+                );
+            }
         });
 
-        let stdout = '';
-        let stderr = '';
+        if (result.recoveredAfterStickyFailure) {
+            logWarning(
+                `    Sticky deploy (${result.previousSticky}) failed; recovered with --${result.strategyUsed}`
+            );
+        }
+        if (result.probed && !deployStrategyContext.lockBannerLogged && order.length > 1) {
+            logSuccess(`    Deploy strategy locked: ${result.strategyUsed}`);
+            deployStrategyContext.lockBannerLogged = true;
+        }
 
-        deployProcess.stdout.on('data', (data) => {
-            stdout += data.toString();
-        });
-
-        deployProcess.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
-
-        return new Promise((resolve, reject) => {
-            deployProcess.on('close', (code) => {
-                if (code === 0) {
-                    logSuccess(`    ✓ Deployed ${functionName} successfully`);
-                    resolve(true);
-                } else {
-                    logError(`    ✗ Failed to deploy ${functionName}`);
-                    if (stderr) logError(`    Error: ${stderr}`);
-                    reject(new Error(`Deployment failed with code ${code}`));
-                }
-            });
-
-            deployProcess.on('error', (error) => {
-                logError(`    ✗ Deployment error: ${error.message}`);
-                reject(error);
-            });
-        });
+        if (result.stdout) {
+            logInfo(`    Output: ${result.stdout.trim().substring(0, 200)}`);
+        }
+        logSuccess(`    ✓ Deployed ${functionName} successfully`);
+        return true;
     } finally {
         process.chdir(originalCwd);
     }
@@ -873,6 +887,10 @@ async function main() {
         }
     }
 
+    const edgeDeployContext = createDeployStrategyContext();
+    logInfo(`Edge function deploy strategy order: ${edgeDeployContext.getOrder().join(' → ')}`);
+    console.log('');
+
     // Process each function
     for (let i = 0; i < functionsToMigrate.length; i++) {
         const functionName = functionsToMigrate[i];
@@ -1059,7 +1077,14 @@ async function main() {
 
             // Deploy to target
             logInfo(`  Deploying to target...`);
-            await deployFunctionWithShared(functionName, functionDir, TARGET_REF, targetConfig.dbPassword, targetConfig.accessToken);
+            await deployFunctionWithShared(
+                functionName,
+                functionDir,
+                TARGET_REF,
+                targetConfig.dbPassword,
+                targetConfig.accessToken,
+                edgeDeployContext
+            );
 
             migrated.push(functionName);
         } catch (error) {
@@ -1082,13 +1107,23 @@ async function main() {
 
     // Write results
     const resultFile = path.join(MIGRATION_DIR, 'shared_functions_migration_result.json');
-    fs.writeFileSync(resultFile, JSON.stringify({
-        timestamp: new Date().toISOString(),
-        sourceRef: SOURCE_REF,
-        targetRef: TARGET_REF,
-        migrated,
-        failed
-    }, null, 2));
+    fs.writeFileSync(
+        resultFile,
+        JSON.stringify(
+            {
+                timestamp: new Date().toISOString(),
+                sourceRef: SOURCE_REF,
+                targetRef: TARGET_REF,
+                migrated,
+                failed,
+                deployStrategyOrder: getDeployStrategyOrder(),
+                deployStrategyResolved: edgeDeployContext.getSticky(),
+                deployStrategyChanges: edgeDeployContext.strategyChanges
+            },
+            null,
+            2
+        )
+    );
 
     if (failed.length > 0) {
         process.exit(1);

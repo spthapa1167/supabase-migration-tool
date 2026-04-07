@@ -1651,9 +1651,8 @@ perform_migration() {
     # Always use --force-all to ensure all buckets are migrated (not just new ones)
     storage_migration_args+=("--force-all")
     log_info "Force mode enabled: All buckets will be migrated (even if they exist in target)"
-    if [ "$AUTO_CONFIRM" = "true" ]; then
-        storage_migration_args+=("--auto-confirm")
-    fi
+    # Parallel subshells are not interactive; parent already prompted — never re-prompt inside child scripts
+    storage_migration_args+=("--auto-confirm")
 
     # Step 3: Edge functions and Step 4: Secrets - build commands and do prompts first, then run in parallel with storage
     local run_storage=false
@@ -1681,9 +1680,8 @@ perform_migration() {
         if [ "$INCREMENTAL_MODE" = "true" ]; then
             edge_migration_cmd+=("--increment")
         fi
-        if [ "$AUTO_CONFIRM" = "true" ]; then
-            edge_migration_cmd+=("--auto-confirm")
-        fi
+        # Required for parallel run: no TTY / stdin for nested prompts (SKIP_COMPONENT_CONFIRM is also exported)
+        edge_migration_cmd+=("--auto-confirm")
         if ! prompt_proceed "Edge Functions Migration" "Proceed with edge functions migration from $source to $target?"; then
             log_warning "Edge functions migration skipped by user."
             SKIPPED_COMPONENTS+=("edge functions")
@@ -1720,34 +1718,30 @@ perform_migration() {
 
     if [ "$run_storage" = "true" ] || [ "$run_edge" = "true" ] || [ "$run_secrets" = "true" ]; then
         log_info "Running Storage, Edge Functions, and Secrets migrations in parallel..."
+        log_info "Live output streams below (components may be interleaved). Per-component copies: ${log_storage}, ${log_edge}, ${log_secrets}"
         set +e
         set +o pipefail
 
+        # Stream each component to the terminal AND migration.log AND a per-component file (do not buffer in .raw — that looked \"stuck\")
         if [ "$run_storage" = "true" ]; then
             (
-                "$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh" "${storage_migration_args[@]}" > "${log_storage}.raw" 2>&1
-                ec=$?
-                tee -a "$LOG_FILE" < "${log_storage}.raw" > "$log_storage"
-                echo $ec > "${log_storage}.exit"
-                rm -f "${log_storage}.raw"
+                cd "$PROJECT_ROOT" || exit 1
+                "$PROJECT_ROOT/scripts/main/storage_buckets_migration.sh" "${storage_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$log_storage"
+                echo "${PIPESTATUS[0]}" > "${log_storage}.exit"
             ) &
         fi
         if [ "$run_edge" = "true" ]; then
             (
-                "${edge_migration_cmd[@]}" > "${log_edge}.raw" 2>&1
-                ec=$?
-                tee -a "$LOG_FILE" < "${log_edge}.raw" > "$log_edge"
-                echo $ec > "${log_edge}.exit"
-                rm -f "${log_edge}.raw"
+                cd "$PROJECT_ROOT" || exit 1
+                "${edge_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$log_edge"
+                echo "${PIPESTATUS[0]}" > "${log_edge}.exit"
             ) &
         fi
         if [ "$run_secrets" = "true" ]; then
             (
-                "${secrets_migration_cmd[@]}" > "${log_secrets}.raw" 2>&1
-                ec=$?
-                tee -a "$LOG_FILE" < "${log_secrets}.raw" > "$log_secrets"
-                echo $ec > "${log_secrets}.exit"
-                rm -f "${log_secrets}.raw"
+                cd "$PROJECT_ROOT" || exit 1
+                "${secrets_migration_cmd[@]}" 2>&1 | tee -a "$LOG_FILE" | tee "$log_secrets"
+                echo "${PIPESTATUS[0]}" > "${log_secrets}.exit"
             ) &
         fi
 
@@ -2175,6 +2169,32 @@ interactive_mode() {
     echo ""
 }
 
+# Post-migration environment snapshot (non-fatal — does not change migration exit code)
+run_env_snapshot_post_migration() {
+    local src="${1:-}"
+    local tgt="${2:-}"
+    local snap="$PROJECT_ROOT/scripts/main/env_snapshot.sh"
+    if [ -z "$src" ] || [ -z "$tgt" ]; then
+        log_warning "run_env_snapshot_post_migration: missing source or target — skipping"
+        return 0
+    fi
+    if [ ! -f "$snap" ]; then
+        log_warning "env_snapshot.sh not found ($snap) — skipping snapshot"
+        return 0
+    fi
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    log_info "  Environment snapshot: $src → $tgt (scripts/main/env_snapshot.sh)"
+    log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    set +e
+    bash "$snap" "$src" "$tgt"
+    local snap_rc=$?
+    set -e
+    if [ "$snap_rc" -ne 0 ]; then
+        log_warning "env_snapshot.sh exited with code $snap_rc (migration exit status unchanged)"
+    fi
+    echo ""
+}
+
 # Main execution
 main() {
     # Parse arguments
@@ -2264,6 +2284,7 @@ main() {
         
         log_info "Migration folder kept: $migration_dir"
         log_info "Results: $migration_dir/result.md"
+        run_env_snapshot_post_migration "$SOURCE_ENV" "$TARGET_ENV"
         exit 0
     else
         migration_success=false
@@ -2287,6 +2308,7 @@ main() {
         log_warning "Migration folder kept for debugging: $migration_dir"
         log_info "Check $migration_dir/migration.log for details"
         log_info "Results: $migration_dir/result.md (may be incomplete if generation had issues)"
+        run_env_snapshot_post_migration "$SOURCE_ENV" "$TARGET_ENV"
         exit 1
     fi
 }
