@@ -1,4 +1,3 @@
-crm-twilio-sms-inbound
-crm-webmail-save-draft
+crm-webmail-accounts
+crm-webmail-fetch
 crm-webmail-message-action
-send-hr-pay-preparation-reminder

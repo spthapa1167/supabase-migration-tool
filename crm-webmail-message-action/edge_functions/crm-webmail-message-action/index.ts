@@ -31,7 +31,9 @@ const WEBMAIL_FOLDER_CANDIDATES = {
     "[Gmail]/Trash",
     "Bin",
     "INBOX/Trash",
-    "Deleted"
+    "Deleted",
+    "INBOX.Deleted",
+    "INBOX/Deleted"
   ],
   drafts: [
     "Drafts",
@@ -338,7 +340,14 @@ Deno.serve(async (req)=>{
         }
       });
     }
-    if (action !== "move_to_trash" && action !== "restore_to_drafts") {
+    const allowedActions = new Set([
+      "move_to_trash",
+      "restore_to_drafts",
+      "mark_seen",
+      "mark_unseen",
+      "delete_permanent"
+    ]);
+    if (!allowedActions.has(action)) {
       return new Response(JSON.stringify({
         error: "Invalid action"
       }), {
@@ -377,7 +386,31 @@ Deno.serve(async (req)=>{
       await client.connect();
       await client.authenticate();
       await selectMailboxResilient(client, folderMapping, folderNorm);
-      if (action === "move_to_trash") {
+      if (action === "mark_seen") {
+        await client.setFlags(String(messageUid), [
+          "\\Seen"
+        ], "add", true);
+      } else if (action === "mark_unseen") {
+        await client.setFlags(String(messageUid), [
+          "\\Seen"
+        ], "remove", true);
+      } else if (action === "delete_permanent") {
+        if (folderNorm !== "trash") {
+          return new Response(JSON.stringify({
+            error: "Permanent delete is only allowed in Deleted"
+          }), {
+            status: 400,
+            headers: {
+              ...corsHeaders,
+              "Content-Type": "application/json"
+            }
+          });
+        }
+        await client.setFlags(String(messageUid), [
+          "\\Deleted"
+        ], "add", true);
+        await client.expunge();
+      } else if (action === "move_to_trash") {
         const trashName = await resolveTargetMailboxName(client, folderMapping, "trash");
         await client.moveMessages(String(messageUid), trashName, true);
       } else {

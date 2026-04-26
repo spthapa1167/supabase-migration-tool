@@ -130,9 +130,7 @@ crm-voice-status-callback
 ttms-sso-token
 crm-webmail-send
 auto-create-batches-for-enrollment
-crm-webmail-accounts
 crm-webmail-test-connection
-crm-webmail-fetch
 crm-webmail-folders
 webmail-fetch
 create-student-portal-credentials
@@ -153,6 +151,7 @@ send-trial-meeting-details
 send-trial-30min-reminders
 admin-set-temporary-password
 crm-webmail-watcher-poll
+crm-twilio-sms-inbound
 get-crm-twilio-inbound-config
 get-crm-twilio-sms-sender
 parent-request-absence
@@ -167,3 +166,6 @@ crm-send-report-email
 crm-ai-customer-summary
 crm-ai-compose-message
 csr-ai-dashboard-summary
+crm-webmail-save-draft
+send-hr-pay-preparation-reminder
+notify-parent-absence
