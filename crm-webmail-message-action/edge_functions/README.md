@@ -5,11 +5,11 @@ This folder contains edge functions downloaded from source project for migration
 ## Migration Summary
 - Source: xvlawjjvronwaukcpnwt
 - Target: llpfqjrnzfewnhebfmza
-- Functions migrated: 4
-- Functions skipped: 169
+- Functions migrated: 3
+- Functions skipped: 171
 - Functions failed: 0
 - Functions incompatible: 0
-- Date: 2026-04-06T17:33:10.106Z
+- Date: 2026-04-14T02:41:40.787Z
 
 ## Manual Deployment
 
@@ -198,3 +198,4 @@ supabase functions deploy <function-name> --project-ref llpfqjrnzfewnhebfmza
 - crm-webmail-save-draft (id: c14f148a-aab4-41c2-aca6-81506db8046f)
 - crm-webmail-message-action (id: d469e42a-600d-4be9-bd08-bf4f928ba67b)
 - send-hr-pay-preparation-reminder (id: a07714fa-96d1-4aab-b4ef-0488b7b4ca70)
+- notify-parent-absence (id: 106f813d-e776-4228-9eb4-b33f6ed0ffad)
