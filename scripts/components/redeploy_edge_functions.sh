@@ -11,6 +11,7 @@ cd "$PROJECT_ROOT"
 
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
+source "$PROJECT_ROOT/lib/edge_docker_preflight.sh"
 
 usage() {
     cat <<EOF
@@ -109,15 +110,22 @@ TARGET_REF=$(get_project_ref "$TARGET_ENV")
 # Find migration directory if not provided
 if [ -z "$MIGRATION_DIR" ]; then
     log_info "Searching for migration directory..."
-    pattern="backups/edge_functions_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
+    pattern_edge="backups/edge_functions_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
+    pattern_schema="backups/schema_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
     shopt -s nullglob
-    candidates=($pattern)
+    candidates_edge=($pattern_edge)
+    candidates_schema=($pattern_schema)
     shopt -u nullglob
-    
-    if [ ${#candidates[@]} -gt 0 ]; then
-        MIGRATION_DIR=$(ls -1dt "${candidates[@]}" 2>/dev/null | head -n 1 || true)
+
+    if [ ${#candidates_edge[@]} -gt 0 ]; then
+        MIGRATION_DIR=$(ls -1dt "${candidates_edge[@]}" 2>/dev/null | head -n 1 || true)
         if [ -n "$MIGRATION_DIR" ]; then
-            log_info "Found migration directory: $MIGRATION_DIR"
+            log_info "Found migration directory (edge): $MIGRATION_DIR"
+        fi
+    elif [ ${#candidates_schema[@]} -gt 0 ]; then
+        MIGRATION_DIR=$(ls -1dt "${candidates_schema[@]}" 2>/dev/null | head -n 1 || true)
+        if [ -n "$MIGRATION_DIR" ]; then
+            log_info "Found migration directory (schema backup): $MIGRATION_DIR"
         fi
     fi
 fi
@@ -145,6 +153,8 @@ if ! command -v supabase >/dev/null 2>&1; then
     log_error "Supabase CLI not found - please install Supabase CLI"
     exit 1
 fi
+
+edge_docker_preflight_or_exit
 
 EDGE_FUNCTIONS_UTIL="$PROJECT_ROOT/utils/edge-functions-migration.js"
 if [ ! -f "$EDGE_FUNCTIONS_UTIL" ]; then

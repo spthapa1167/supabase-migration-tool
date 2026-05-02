@@ -1,8 +1,9 @@
 #!/bin/bash
 # Supabase Clone Script
 # Clone one Supabase environment into another (destructive on the target)
-# Creates a complete replica: schema, data, users, buckets, files, policies, edge functions.
-# Target secrets are NEVER touched and remain exactly as they are.
+# Creates a complete replica: schema, data, users, buckets, files, policies, edge functions,
+# and project secret names (Edge/CLI secrets) aligned to the source with placeholder/blank
+# values so you can set real values after cutover.
 
 set -euo pipefail
 
@@ -27,12 +28,13 @@ Description:
   - RLS policies, roles, grants, and access controls
   - Edge functions (all functions with code and shared dependencies)
 
-  Target secrets are NOT modified: existing secrets in the target project remain
-  exactly as they are (keys and values). No secrets are added, updated, or removed.
+  Supabase project secrets: secret names from the source are applied to the target with
+  blank or PLACEHOLDER_UPDATE_REQUIRED values. Existing target secret values for those keys
+  are overwritten. Update real values in the target project after cloning.
 
 Notes:
-  - Target environment will be REPLACED with source state (destructive for data/schema/users/files only!)
-  - Target secrets are preserved and never touched
+  - Target environment will be REPLACED with source state (destructive for data/schema/users/files/secret values)
+  - Use the target project's own anon and service_role keys in the app; URL and API keys are per project
   - Automatically takes a backup of the target before cloning
   - Additional flags are forwarded to ./scripts/main/supabase_migration.sh
 EOF
@@ -86,11 +88,11 @@ echo "  ✓ Storage buckets (all bucket configurations and policies)"
 echo "  ✓ Storage files (all files in all buckets - complete file migration)"
 echo "  ✓ RLS policies, roles, grants, and access controls (complete policy sync)"
 echo "  ✓ Edge functions (all functions with code and shared dependencies)"
-echo "  ○ Secrets: NOT TOUCHED (target secrets remain as-is)"
+echo "  ✓ Project secrets (key names from source; values set to blank/placeholder — set real values after)"
 echo "==================================================================="
 echo
 echo "⚠️  WARNING: This operation is DESTRUCTIVE on the target environment."
-echo "   Schema, data, users, and files will be REPLACED. Target secrets are preserved."
+echo "   Schema, data, users, files, and project secret key values (placeholders) will be replaced/aligned to source."
 echo "   A pre-clone backup of the target will be created automatically."
 echo
 
@@ -103,16 +105,16 @@ if [ "$AUTO_PROCEED" != "true" ]; then
     fi
 fi
 
-# Step 1: Run comprehensive main migration with all components EXCEPT secrets and EXCEPT database data
-# --no-secrets: target secrets are never touched.
-# --clone: skip database data in main migration; clone does full data replacement in Step 2 (migrate_all_table_data)
+# Step 1: Main migration: all components; database data handled in later clone steps
+# --clone-secrets: align target project secret key names to source; values blank/placeholder (may overwrite)
+# --clone: skip database data in main migration; Step 2 runs migrate_all_table_data for full data replacement
 MAIN_CMD=(
     "$PROJECT_ROOT/scripts/main/supabase_migration.sh"
     "$SOURCE_ENV"
     "$TARGET_ENV"
-    --full              # Complete migration: schema + data + users + files + edge functions
-    --no-secrets        # Do NOT touch target secrets - they remain as-is
-    --clone             # Skip database data here; Step 2 runs migrate_all_table_data for full data replacement
+    --full              # Schema + data flags + users + files + edge functions + secrets
+    --clone-secrets     # Secret keys from source; placeholder/blank values on target
+    --clone             # Skip database data in main; Step 2 runs migrate_all_table_data
     --replace-data      # REPLACE all target data (ensures complete clone)
     --backup            # Create backup before migration
     --auto-confirm      # Skip confirmation prompts
@@ -122,8 +124,8 @@ if [ ${#EXTRA_FLAGS[@]} -gt 0 ]; then
     MAIN_CMD+=("${EXTRA_FLAGS[@]}")
 fi
 
-echo "[INFO] Step 1/7: Running comprehensive migration (schema, users, files, edge functions; secrets NOT touched; data in Step 2)..."
-echo "[INFO] Note: Database data is migrated in Step 2 (migrate_all_table_data). Target secrets remain unchanged."
+echo "[INFO] Step 1/7: Running comprehensive migration (schema, users, files, edge functions, secrets w/ placeholders; data in Step 2)..."
+echo "[INFO] Note: Database data is migrated in Step 2 (migrate_all_table_data). Secrets use placeholders — set real values on target after clone."
 # Capture the migration directory from the main migration output if possible
 # The main migration will create a backup directory automatically
 if ! "${MAIN_CMD[@]}"; then
@@ -232,8 +234,7 @@ else
     echo "[WARNING] policy_migration_complete.sh not found or not executable; skipping final policy pass."
 fi
 
-# Secrets: Intentionally NOT migrated during clone. Target secrets remain exactly as they are.
-echo "[INFO] Secrets: Skipped by design. Target project secrets are not touched and remain as-is."
+echo "[INFO] Secrets: Applied in Step 1 via --clone-secrets (key names from source, placeholder/blank values on target)."
 echo ""
 
 # Note: Edge functions are migrated once in Step 1 via supabase_migration.sh
@@ -267,12 +268,14 @@ echo "  ✓ Storage buckets (all bucket configurations and policies)"
 echo "  ✓ Storage files (all files in all buckets - complete file migration)"
 echo "  ✓ RLS policies, roles, grants, and access controls (complete policy sync)"
 echo "  ✓ Edge functions (all functions with code and shared dependencies)"
-echo "  ○ Secrets: Not modified (target secrets remain as-is)"
+echo "  ✓ Project secret names aligned to source; values are placeholders — set before production use"
 echo ""
 echo " Verification:"
 echo "  - Review migration logs in the backups/ directory"
 echo "  - Check component summaries in the migration directory"
 echo "  - Use compare_env.sh to verify environment parity if needed"
+echo "  - Set real project secret values: supabase secrets set KEY=value --project-ref <target_ref>"
+echo "  - Use the target project URL, anon, and service_role keys in the application"
 echo ""
 echo " Note: Review migration logs in the backups/ directory for detailed information."
 echo "==================================================================="

@@ -11,6 +11,7 @@ cd "$PROJECT_ROOT"
 
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
+source "$PROJECT_ROOT/lib/edge_docker_preflight.sh"
 
 usage() {
     cat <<EOF
@@ -30,6 +31,9 @@ Options:
   --migration-dir=<dir> Use existing migration directory
   --auto-confirm        Automatically proceed without interactive confirmation
   -h, --help            Show this help message
+
+Environment (Docker):
+  EDGE_DOCKER_NO_AUTO_START, EDGE_DOCKER_START_WAIT_SEC, EDGE_DOCKER_PS_TIMEOUT_SEC, SKIP_DOCKER_CHECK (see edge_functions_migration.sh)
 
 Examples:
   $0 dev test
@@ -106,6 +110,8 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
+edge_docker_preflight_or_exit
+
 if [ -z "$SUPABASE_ACCESS_TOKEN" ]; then
     log_error "SUPABASE_ACCESS_TOKEN not set - cannot use Node.js utility"
     exit 1
@@ -114,15 +120,22 @@ fi
 # Find or create migration directory
 if [ -z "$MIGRATION_DIR" ]; then
     log_info "Searching for migration directory..."
-    pattern="backups/edge_functions_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
+    pattern_edge="backups/edge_functions_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
+    pattern_schema="backups/schema_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
     shopt -s nullglob
-    candidates=($pattern)
+    candidates_edge=($pattern_edge)
+    candidates_schema=($pattern_schema)
     shopt -u nullglob
-    
-    if [ ${#candidates[@]} -gt 0 ]; then
-        MIGRATION_DIR=$(ls -1dt "${candidates[@]}" 2>/dev/null | head -n 1 || true)
+
+    if [ ${#candidates_edge[@]} -gt 0 ]; then
+        MIGRATION_DIR=$(ls -1dt "${candidates_edge[@]}" 2>/dev/null | head -n 1 || true)
         if [ -n "$MIGRATION_DIR" ]; then
-            log_info "Found migration directory: $MIGRATION_DIR"
+            log_info "Found migration directory (edge): $MIGRATION_DIR"
+        fi
+    elif [ ${#candidates_schema[@]} -gt 0 ]; then
+        MIGRATION_DIR=$(ls -1dt "${candidates_schema[@]}" 2>/dev/null | head -n 1 || true)
+        if [ -n "$MIGRATION_DIR" ]; then
+            log_info "Found migration directory (schema backup): $MIGRATION_DIR"
         fi
     fi
     

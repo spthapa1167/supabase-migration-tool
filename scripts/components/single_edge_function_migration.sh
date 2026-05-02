@@ -10,6 +10,7 @@ cd "$PROJECT_ROOT"
 
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
+source "$PROJECT_ROOT/lib/edge_docker_preflight.sh"
 
 usage() {
     cat <<EOF
@@ -97,6 +98,8 @@ if ! command -v supabase >/dev/null 2>&1; then
     log_error "Supabase CLI not found - please install Supabase CLI"
     exit 1
 fi
+
+edge_docker_preflight_or_exit
 
 EDGE_FUNCTIONS_UTIL="$PROJECT_ROOT/utils/edge-functions-migration.js"
 SHARED_FUNCTIONS_UTIL="$PROJECT_ROOT/utils/migrate-shared-functions.js"
