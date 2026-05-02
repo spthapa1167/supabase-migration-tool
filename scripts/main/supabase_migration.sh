@@ -85,6 +85,7 @@ INCLUDE_DATA=false   # Default: false  - don't migrate database row data by defa
 INCLUDE_FILES=false  # Default: false  - don't migrate bucket files by default
 INCLUDE_USERS=false  # Default: false  - don't migrate auth.users / identities unless --users is specified
 INCLUDE_SECRETS=true  # Default: true  - always migrate secrets (new keys only, with blank values) to ensure parity
+CLONE_SECRETS_PLACEHOLDERS=false  # When true (--clone-secrets), run secrets in clone mode (overwrite with placeholders)
 REPLACE_TARGET_DATA=false  # Default: false - never wipe target data unless explicitly allowed
 INCREMENTAL_MODE=false     # Default: false - full sync for data unless --increment is provided
 SKIP_EDGE_FUNCTIONS=false  # Default: false - migrate edge functions unless --skipEdge is specified
@@ -127,7 +128,9 @@ Options:
   --users                 Include authentication users/identities migration (default: disabled; auth users are NOT copied unless this is set)
   --files                 Include storage bucket files migration (default: disabled)
   --secret                Include secrets migration (default: enabled; use --no-secrets to skip)
-  --no-secrets           Skip secrets migration (secrets are migrated by default)
+  --no-secrets            Skip secrets migration (secrets are migrated by default; disables --clone-secrets)
+  --clone-secrets         With secrets: align target keys to source and set blank/placeholder (overwrites
+                          existing secret values on the target; intended for supabase_clone)
   --skipEdge              Skip edge functions migration (default: edge functions are migrated)
   --env-file <file>       Environment file (default: .env.local)
   --dry-run               Preview migration without executing
@@ -155,7 +158,8 @@ Default Behavior:
   Incremental mode preserves existing target data and only adds new/delta data from source.
   Use --files to include storage bucket file migration.
   Use --users to copy auth users/identities so login state matches source.
-  Secrets are migrated by default (adds new secret keys incrementally; existing secrets in target are never modified or removed). Use --no-secrets to skip.
+  Secrets are migrated by default (adds new secret keys incrementally; existing target values are preserved).
+  Use --no-secrets to skip. Use --clone-secrets for full key alignment with placeholders (overwrites values).
   Use --full for a complete migration (schema + data + users + files + secrets + edge functions).
 
 Examples:
@@ -261,6 +265,12 @@ parse_args() {
                 ;;
             --no-secrets)
                 INCLUDE_SECRETS=false
+                CLONE_SECRETS_PLACEHOLDERS=false
+                shift
+                ;;
+            --clone-secrets)
+                INCLUDE_SECRETS=true
+                CLONE_SECRETS_PLACEHOLDERS=true
                 shift
                 ;;
             --clone)
@@ -1693,8 +1703,15 @@ perform_migration() {
     fi
 
     if [ "$INCLUDE_SECRETS" = "true" ]; then
-        log_info "Migrating secrets..."
+        if [ "$CLONE_SECRETS_PLACEHOLDERS" = "true" ]; then
+            log_info "Migrating secrets (clone/placeholder mode — may overwrite existing secret values on target)..."
+        else
+            log_info "Migrating secrets..."
+        fi
         secrets_migration_cmd=("$PROJECT_ROOT/scripts/components/secrets_migration.sh" "$source" "$target")
+        if [ "$CLONE_SECRETS_PLACEHOLDERS" = "true" ]; then
+            secrets_migration_cmd+=("--clone-placeholders")
+        fi
         if ! prompt_proceed "Secrets Migration" "Proceed with secrets migration from $source to $target?"; then
             log_warning "Secrets migration skipped by user."
             SKIPPED_COMPONENTS+=("secrets")

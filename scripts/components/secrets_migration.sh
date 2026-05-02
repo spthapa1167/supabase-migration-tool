@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
 
 # Secrets Migration Component Script
-# Migrates secret keys (names only) from source to target with blank values
-# Only creates new keys if they don't exist in target
-# 
-# CRITICAL SAFETY POLICY:
-# =======================
-# NEVER modifies or overwrites existing secrets in target - they are preserved unchanged
-# Existing secret keys and values in target are NEVER touched, updated, or impacted
-# Only NEW secret keys from source are added (with blank/placeholder values)
-# Multiple safety checks prevent any overwrite of existing secrets
+# Default: migrates secret keys (names) from source to target with blank/placeholder values;
+#          only creates keys that do not already exist in target.
+# --clone-placeholders: for every source key (non-reserved), set target to blank/placeholder
+#          even if the key already exists (intended for supabase_clone parity).
 #
-# Skips secrets starting with 'SUPABASE' (reserved)
+# Default mode – CRITICAL SAFETY POLICY:
+# NEVER overwrites existing secrets in target. Only new keys are added.
+#
+# Skips secrets starting with 'SUPABASE' (reserved) in all modes
 
 set -euo pipefail
 
@@ -23,31 +21,53 @@ cd "$PROJECT_ROOT"
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
 
-# Configuration
-SOURCE_ENV=${1:-}
-TARGET_ENV=${2:-}
+# Optional: --clone-placeholders (set after source/target)
+CLONE_PLACEHOLDERS=false
+PLACEHOLDER_VALUE="PLACEHOLDER_UPDATE_REQUIRED"
 
 # Usage
 usage() {
     cat << EOF
-Usage: $0 <source_env> <target_env>
+Usage: $0 <source_env> <target_env> [--clone-placeholders]
 
-Migrates secret keys (names only) from source to target with blank values.
-Only creates new keys if they don't already exist in target.
-Skips secrets starting with 'SUPABASE' (reserved by Supabase).
+Default: migrates secret key names from source; values are blank/placeholder. Only
+adds keys that do not already exist (existing values never overwritten).
+
+  --clone-placeholders   Set every non-reserved source key on the target to blank/placeholder
+                         even if the key already exists (overwrites values). Use for clone.
+
+Skips secret names starting with 'SUPABASE' (reserved by Supabase).
 
 Arguments:
-  source_env     Source environment (prod, test, dev)
-  target_env     Target environment (prod, test, dev)
+  source_env     Source environment (prod, test, dev, backup)
+  target_env     Target environment (prod, test, dev, backup)
 
 Examples:
-  $0 dev test    # Migrate secret keys from dev to test
+  $0 dev test
+  $0 prod test --clone-placeholders
 
 EOF
     exit 1
 }
 
-# Check arguments
+if [ $# -lt 2 ]; then
+    usage
+fi
+SOURCE_ENV=$1
+TARGET_ENV=$2
+shift 2
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --clone-placeholders)
+            CLONE_PLACEHOLDERS=true
+            shift
+            ;;
+        *)
+            echo "[ERROR] Unknown option: $1" >&2
+            usage
+            ;;
+    esac
+done
 if [ -z "$SOURCE_ENV" ] || [ -z "$TARGET_ENV" ]; then
     usage
 fi
@@ -99,6 +119,9 @@ TARGET_SECRETS_FILE="$TEMP_DIR/target_secrets.json"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info "  Secrets Migration: $SOURCE_ENV → $TARGET_ENV"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+if [ "$CLONE_PLACEHOLDERS" = "true" ]; then
+    log_warning "  Mode: --clone-placeholders (overwrites existing secret values on target with blank/placeholder)"
+fi
 log_info ""
 
 # Step 1: Fetch secrets from source
@@ -168,6 +191,7 @@ migrated_count=0
 skipped_existing=0
 skipped_reserved=0
 failed_count=0
+clone_overwrote=0
 
 # Function to check if secret exists in target (fresh check via API)
 # This prevents overwriting existing secrets even if cached list is stale
@@ -194,10 +218,51 @@ check_secret_exists_fresh() {
 }
 
 # Process each source secret
-for secret_name in $source_secret_names; do
+if [ "$CLONE_PLACEHOLDERS" = "true" ]; then
+    for secret_name in $source_secret_names; do
+        secret_name=$(echo "$secret_name" | xargs)
+        [ -z "$secret_name" ] && continue
+
+        secret_name_upper=$(echo "$secret_name" | tr '[:lower:]' '[:upper:]')
+        if [[ "$secret_name_upper" == SUPABASE_* ]]; then
+            log_info "  ⏭️  Skipping reserved secret: $secret_name (starts with SUPABASE_)"
+            skipped_reserved=$((skipped_reserved + 1))
+            continue
+        fi
+
+        existed=false
+        if [ -n "$target_secret_names" ] && echo "$target_secret_names" | grep -qFx "$secret_name" 2>/dev/null; then
+            existed=true
+        fi
+
+        log_info "  Clone/placeholder: $secret_name"
+        export SUPABASE_ACCESS_TOKEN="$TARGET_ACCESS_TOKEN"
+        if supabase secrets set "${secret_name}=" --project-ref "$TARGET_REF" 2>&1; then
+            if [ "$existed" = "true" ]; then
+                clone_overwrote=$((clone_overwrote + 1))
+                log_success "    Set (overwrote existing): $secret_name — blank; update with real value before use"
+            else
+                log_success "    Set: $secret_name — blank; update with real value before use"
+            fi
+            migrated_count=$((migrated_count + 1))
+        elif supabase secrets set "${secret_name}=${PLACEHOLDER_VALUE}" --project-ref "$TARGET_REF" 2>&1; then
+            if [ "$existed" = "true" ]; then
+                clone_overwrote=$((clone_overwrote + 1))
+                log_success "    Set (overwrote existing): $secret_name — $PLACEHOLDER_VALUE; replace before use"
+            else
+                log_success "    Set: $secret_name — $PLACEHOLDER_VALUE; replace before use"
+            fi
+            migrated_count=$((migrated_count + 1))
+        else
+            log_error "    Failed: $secret_name"
+            failed_count=$((failed_count + 1))
+        fi
+    done
+else
+    for secret_name in $source_secret_names; do
     secret_name=$(echo "$secret_name" | xargs)
     [ -z "$secret_name" ] && continue
-    
+
     # Skip secrets starting with 'SUPABASE' (reserved) - case-insensitive check
     secret_name_upper=$(echo "$secret_name" | tr '[:lower:]' '[:upper:]')
     if [[ "$secret_name_upper" == SUPABASE_* ]]; then
@@ -205,7 +270,7 @@ for secret_name in $source_secret_names; do
         skipped_reserved=$((skipped_reserved + 1))
         continue
     fi
-    
+
     # Check if secret already exists in target
     exists_in_target=false
     if [ -n "$target_secret_names" ]; then
@@ -379,6 +444,7 @@ for secret_name in $source_secret_names; do
     
     rm -f "$tmp_output"
 done
+fi
 
 # Summary
 log_info ""
@@ -386,8 +452,13 @@ log_info "━━━━━━━━━━━━━━━━━━━━━━━�
 log_info "  Migration Summary"
 log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 log_info ""
-log_info "  Created:        $migrated_count secret(s)"
-log_info "  Skipped (existing): $skipped_existing secret(s)"
+log_info "  Set / created:  $migrated_count secret(s)"
+if [ "$CLONE_PLACEHOLDERS" = "true" ] && [ "$clone_overwrote" -gt 0 ]; then
+    log_info "  Overwritten:    $clone_overwrote existing key(s) on target (clone/placeholder mode)"
+fi
+if [ "$CLONE_PLACEHOLDERS" != "true" ]; then
+    log_info "  Skipped (existing): $skipped_existing secret(s)"
+fi
 log_info "  Skipped (reserved): $skipped_reserved secret(s)"
 log_info "  Failed:         $failed_count secret(s)"
 log_info ""
@@ -408,9 +479,14 @@ fi
 log_info ""
 log_success "✅ Secrets migration completed successfully"
 log_info ""
-log_success "✓ IMPORTANT: All existing secret keys and values in target were preserved unchanged"
-log_success "✓ Only new secret keys from source were added (with blank/placeholder values)"
-log_success "✓ No existing secrets were modified, updated, or impacted"
+if [ "$CLONE_PLACEHOLDERS" = "true" ]; then
+    log_success "✓ Clone mode: target secret names aligned to source; values set to blank/placeholder (existing values may have been overwritten)"
+    log_warning "  Set real values before running production traffic: supabase secrets set KEY=value --project-ref $TARGET_REF"
+else
+    log_success "✓ All existing secret keys and values in target that were not newly created were preserved unchanged"
+    log_success "✓ Only new secret keys from source were added (with blank/placeholder values)"
+    log_success "✓ No existing secret values were modified"
+fi
 log_info ""
 exit 0
 

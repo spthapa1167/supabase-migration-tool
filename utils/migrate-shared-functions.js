@@ -6,6 +6,9 @@
  *
  * Deploy tuning (same as edge-functions-migration.js): EDGE_DEPLOY_STRATEGY,
  * EDGE_DEPLOY_TIMEOUT_USE_API_MS, EDGE_DEPLOY_TIMEOUT_USE_DOCKER_MS
+ *
+ * Docker (same as edge-functions-migration.js): auto-starts Docker Desktop on macOS
+ * unless EDGE_DOCKER_NO_AUTO_START=true. EDGE_DOCKER_START_WAIT_SEC (default 120).
  */
 
 const fs = require('fs');
@@ -18,6 +21,7 @@ const {
     deployWithProbeAndSticky,
     getDeployStrategyOrder
 } = require('./lib/edgeFunctionDeploy');
+const dockerPreflight = require('./lib/dockerPreflight');
 const LOCAL_FUNCTIONS_DIR = path.join(PROJECT_ROOT, 'supabase', 'functions');
 
 // ANSI color codes
@@ -101,16 +105,6 @@ MIGRATION_DIR = path.resolve(MIGRATION_DIR);
 const FUNCTIONS_DIR = path.join(MIGRATION_DIR, 'edge_functions');
 const SHARED_DIR = path.join(FUNCTIONS_DIR, '_shared');
 
-// Check Docker
-function checkDocker() {
-    try {
-        execSync('docker ps', { stdio: 'pipe', timeout: 5000 });
-        return true;
-    } catch {
-        return false;
-    }
-}
-
 // Link project
 function linkProject(projectRef, dbPassword, accessToken = null) {
     try {
@@ -167,7 +161,7 @@ function mergeDirectories(srcDir, destDir) {
 
 // Download function with shared files
 async function downloadFunctionWithShared(functionName, projectRef, downloadDir, dbPassword, accessToken = null) {
-    if (!checkDocker()) {
+    if (!dockerPreflight.checkDocker()) {
         throw new Error('Docker is not running');
     }
 
@@ -679,6 +673,15 @@ async function main() {
     logInfo(`Source: ${SOURCE_REF}`);
     logInfo(`Target: ${TARGET_REF}`);
     logInfo(`Migration Directory: ${MIGRATION_DIR}`);
+    console.log('');
+
+    logInfo('Docker preflight (may start Docker Desktop on macOS; can take up to ~90s)…');
+    await dockerPreflight.ensureDockerRunning({
+        info: logInfo,
+        success: logSuccess,
+        error: logError,
+        warning: logWarning
+    });
     console.log('');
 
     // Get source config

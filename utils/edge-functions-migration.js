@@ -27,6 +27,9 @@
  *   EDGE_DEPLOY_TIMEOUT_USE_DOCKER_MS Per-strategy timeout for --use-docker (default 180000).
  *   EDGE_DOCKER_NO_AUTO_START=true   Do not open Docker Desktop / systemctl start docker from this utility.
  *   EDGE_DOCKER_START_WAIT_SEC       Max seconds to poll after auto-start (default 120).
+ *   EDGE_SHARED_EXPLICIT_SEED_MAX    Max per-function CLI retries to populate edge_functions/_shared when still empty (default 20).
+ *   EDGE_FUNCTIONS_SHARED_SOURCE_DIR Optional absolute path to your app's supabase/functions/_shared (auto-filled when discoverable).
+ *   EDGE_BULK_SHARED_MAX_DOWNLOADS   Cap bulk source downloads for _shared (0 = unlimited; early exit when _shared fills).
  */
 
 const https = require('https');
@@ -40,6 +43,8 @@ const {
     deployWithProbeAndSticky,
     getDeployStrategyOrder
 } = require('./lib/edgeFunctionDeploy');
+const dockerPreflight = require('./lib/dockerPreflight');
+const { createManagementClient, ensureUnzip } = require('./lib/edgeFunctionsClient');
 
 // When stdout is a pipe (e.g. `node … | tee`), Node uses block buffering — logs appear stuck.
 // setBlocking makes writes flush promptly on Unix/macOS.
@@ -110,6 +115,35 @@ function mergeDirectories(srcDir, destDir) {
             fs.copyFileSync(srcPath, destPath);
         }
     }
+}
+
+/** All files under baseDir as paths relative to baseDir (forward slashes for stable logs). */
+function listRelativeFilesRecursive(baseDir) {
+    if (!baseDir || !fs.existsSync(baseDir)) return [];
+    const out = [];
+    function walk(absDir, relPrefix) {
+        let entries = [];
+        try {
+            entries = fs.readdirSync(absDir, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const e of entries) {
+            const rel = relPrefix ? `${relPrefix}/${e.name}` : e.name;
+            const abs = path.join(absDir, e.name);
+            try {
+                if (e.isDirectory()) {
+                    walk(abs, rel);
+                } else if (e.isFile()) {
+                    out.push(rel.replace(/\\/g, '/'));
+                }
+            } catch {
+                // skip broken symlinks / race
+            }
+        }
+    }
+    walk(baseDir, '');
+    return out;
 }
 
 function normalizeFunctionLayout(functionDir, downloadRoot) {
@@ -241,17 +275,8 @@ function collectSharedFiles(functionsDir, functionDirs = []) {
         }
     }
     
-    // Get final list of files in global directory
-    const finalFiles = fs.existsSync(globalSharedDir) 
-        ? fs.readdirSync(globalSharedDir).filter(f => {
-            const filePath = path.join(globalSharedDir, f);
-            try {
-                return fs.statSync(filePath).isFile();
-            } catch {
-                return false;
-            }
-        })
-        : [];
+    // Count all files under global _shared (nested dirs — CLI may place modules in subfolders)
+    const finalFiles = listRelativeFilesRecursive(globalSharedDir);
     
     return {
         success: finalFiles.length > 0,
@@ -263,8 +288,8 @@ function collectSharedFiles(functionsDir, functionDirs = []) {
 
 // Explicitly download shared files by downloading a function that uses them
 // This is a workaround when shared files aren't automatically downloaded
-async function downloadSharedFilesExplicitly(projectRef, downloadDir, dbPassword, functionName, quiet = false) {
-    if (!checkDocker()) {
+async function downloadSharedFilesExplicitly(projectRef, downloadDir, dbPassword, functionName, quiet = false, accessToken = null) {
+    if (!dockerPreflight.checkDocker()) {
         if (!quiet) {
             logWarning(`    Docker not running - cannot download shared files explicitly`);
         }
@@ -280,10 +305,15 @@ async function downloadSharedFilesExplicitly(projectRef, downloadDir, dbPassword
         fs.mkdirSync(functionsDir, { recursive: true });
         fs.writeFileSync(path.join(supabaseDir, 'config.toml'), `project_id = "${projectRef}"\n`);
         
+        const env = { ...process.env };
+        if (accessToken) {
+            env.SUPABASE_ACCESS_TOKEN = accessToken;
+        }
+        
         process.chdir(tempDir);
         
         // Linking is optional - try to link, but continue if it fails
-        if (!linkProject(projectRef, dbPassword)) {
+        if (!linkProject(projectRef, dbPassword, accessToken)) {
             logWarning(`    ⚠ Could not link to project ${projectRef} - continuing anyway (project might already be linked)`);
         }
         
@@ -293,7 +323,8 @@ async function downloadSharedFilesExplicitly(projectRef, downloadDir, dbPassword
             await retryWithBackoff(async () => {
                 execSync(`supabase functions download ${functionName}`, {
                     stdio: 'pipe',
-                    timeout: 60000
+                    timeout: 60000,
+                    env
                 });
             }, 3, 2000, true); // quiet mode for this retry
         } catch (e) {
@@ -315,23 +346,13 @@ async function downloadSharedFilesExplicitly(projectRef, downloadDir, dbPassword
         let foundAny = false;
         for (const tempSharedDir of tempSharedDirs) {
             if (fs.existsSync(tempSharedDir) && fs.lstatSync(tempSharedDir).isDirectory()) {
-                const files = fs.readdirSync(tempSharedDir);
-                if (files.length > 0) {
-                    const actualFiles = files.filter(f => {
-                        const filePath = path.join(tempSharedDir, f);
-                        try {
-                            return fs.statSync(filePath).isFile();
-                        } catch {
-                            return false;
-                        }
-                    });
-                    
-                    if (actualFiles.length > 0) {
-                        mergeDirectories(tempSharedDir, migrationSharedDir);
-                        foundAny = true;
-                        if (!quiet) {
-                            logInfo(`    Found ${actualFiles.length} shared file(s) in explicit download: ${actualFiles.join(', ')}`);
-                        }
+                const relFiles = listRelativeFilesRecursive(tempSharedDir);
+                if (relFiles.length > 0) {
+                    mergeDirectories(tempSharedDir, migrationSharedDir);
+                    foundAny = true;
+                    if (!quiet) {
+                        const preview = relFiles.slice(0, 12).join(', ');
+                        logInfo(`    Found ${relFiles.length} shared file(s) in explicit download: ${preview}${relFiles.length > 12 ? ', …' : ''}`);
                     }
                 }
             }
@@ -347,6 +368,478 @@ async function downloadSharedFilesExplicitly(projectRef, downloadDir, dbPassword
         process.chdir(originalCwd);
         fs.rmSync(tempDir, { recursive: true, force: true });
     }
+}
+
+/**
+ * One Docker/CLI workspace linked to source: sequential `supabase functions download` for each name,
+ * merging any emitted _shared trees into migration `edge_functions/_shared`. Stops early when populated.
+ * Requires Docker (same as per-function download). Set EDGE_BULK_SHARED_MAX_DOWNLOADS>0 to cap attempts.
+ */
+async function bulkSeedSharedFromSourceCli(
+    functionsDir,
+    orderedFunctionNames,
+    sourceRef,
+    sourceDbPassword,
+    sourceAccessToken
+) {
+    const destShared = path.join(functionsDir, '_shared');
+    const hasSharedFiles = () => listRelativeFilesRecursive(destShared).length > 0;
+    if (hasSharedFiles() || !orderedFunctionNames.length) {
+        return true;
+    }
+
+    if (!dockerPreflight.checkDocker()) {
+        logWarning(
+            '  Bulk shared seed from source: Docker not reachable — start Docker Desktop and rerun, or set EDGE_FUNCTIONS_SHARED_SOURCE_DIR'
+        );
+        return false;
+    }
+
+    let maxDownloads = parseInt(process.env.EDGE_BULK_SHARED_MAX_DOWNLOADS || '0', 10);
+    const names =
+        maxDownloads > 0 ? orderedFunctionNames.slice(0, maxDownloads) : [...orderedFunctionNames];
+
+    logInfo(
+        `  Bulk shared seed from source: single link + sequential downloads (up to ${names.length} name(s); ` +
+            'stops when edge_functions/_shared is non-empty)…'
+    );
+
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'edge-bulk-shared-'));
+    const originalCwd = process.cwd();
+    const env = { ...process.env };
+    if (sourceAccessToken) {
+        env.SUPABASE_ACCESS_TOKEN = sourceAccessToken;
+    }
+
+    const sweepTempIntoMigration = (functionsRoot) => {
+        fs.mkdirSync(destShared, { recursive: true });
+        const candidates = [
+            path.join(functionsRoot, '_shared'),
+            path.join(tempDir, 'functions', '_shared'),
+            path.join(tempDir, '_shared')
+        ];
+        if (fs.existsSync(functionsRoot)) {
+            for (const e of fs.readdirSync(functionsRoot, { withFileTypes: true })) {
+                if (!e.isDirectory() || e.name === '_shared') continue;
+                candidates.push(path.join(functionsRoot, e.name, '_shared'));
+            }
+        }
+        for (const sd of candidates) {
+            if (fs.existsSync(sd) && fs.lstatSync(sd).isDirectory()) {
+                const rels = listRelativeFilesRecursive(sd);
+                if (rels.length > 0) {
+                    mergeDirectories(sd, destShared);
+                }
+            }
+        }
+    };
+
+    try {
+        const supabaseDir = path.join(tempDir, 'supabase');
+        const functionsRoot = path.join(supabaseDir, 'functions');
+        fs.mkdirSync(functionsRoot, { recursive: true });
+        fs.writeFileSync(path.join(supabaseDir, 'config.toml'), `project_id = "${sourceRef}"\n`);
+
+        process.chdir(tempDir);
+        linkProject(sourceRef, sourceDbPassword, sourceAccessToken);
+
+        const runDownload = async (fnName, legacy) => {
+            const cmd = legacy
+                ? `supabase functions download --legacy-bundle ${fnName}`
+                : `supabase functions download ${fnName}`;
+            await retryWithBackoff(
+                async () => {
+                    execSync(cmd, {
+                        stdio: 'pipe',
+                        timeout: 120000,
+                        env,
+                        cwd: tempDir
+                    });
+                },
+                2,
+                2500,
+                true
+            );
+        };
+
+        for (let i = 0; i < names.length; i++) {
+            if (hasSharedFiles()) {
+                break;
+            }
+            const fnName = names[i];
+            try {
+                await runDownload(fnName, false);
+            } catch (e1) {
+                const stderr = e1.stderr ? e1.stderr.toString() : '';
+                const combined = `${e1.message || ''}\n${stderr}`;
+                if (/docker|legacy[- ]bundle|invalid eszip|eszip v2/i.test(combined)) {
+                    try {
+                        await runDownload(fnName, true);
+                    } catch {
+                        /* continue */
+                    }
+                }
+            }
+            sweepTempIntoMigration(functionsRoot);
+            const n = listRelativeFilesRecursive(destShared).length;
+            if (n > 0) {
+                logSuccess(`  Bulk shared seed: ${n} file(s) in edge_functions/_shared after ${i + 1} download(s)`);
+                break;
+            }
+            if ((i + 1) % 15 === 0) {
+                logInfo(`  Bulk shared seed progress: ${i + 1}/${names.length} download(s), _shared still empty…`);
+            }
+        }
+
+        if (!hasSharedFiles()) {
+            logWarning(
+                '  Bulk shared seed finished without populating _shared (CLI may not emit shared modules as files for this project).'
+            );
+        }
+        return hasSharedFiles();
+    } catch (e) {
+        logWarning(`  Bulk shared seed aborted: ${e.message || e}`);
+        return hasSharedFiles();
+    } finally {
+        process.chdir(originalCwd);
+        try {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+        } catch {
+            /* ignore */
+        }
+    }
+}
+
+/** Every directory named `_shared` under root (does not recurse into `_shared` children). */
+function findAllDirsNamedSharedDeep(root, maxDepth = 35) {
+    const out = [];
+    function walk(abs, depth) {
+        if (depth > maxDepth) return;
+        let entries = [];
+        try {
+            entries = fs.readdirSync(abs, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const e of entries) {
+            if (!e.isDirectory() || e.name.startsWith('.')) continue;
+            const p = path.join(abs, e.name);
+            if (e.name === '_shared') {
+                out.push(p);
+                continue;
+            }
+            walk(p, depth + 1);
+        }
+    }
+    if (root && fs.existsSync(root)) walk(root, 0);
+    return out;
+}
+
+/**
+ * When `supabase functions download` never materializes `_shared`, Management API zip bundles
+ * often include the full function tree including shared modules.
+ * @returns {boolean} true if `functionsDir/_shared` has at least one file after attempts
+ */
+async function bulkSeedSharedFromManagementApi(functionsDir, orderedFunctionNames, projectRef, accessToken) {
+    const destShared = path.join(functionsDir, '_shared');
+    const hasSharedFiles = () => listRelativeFilesRecursive(destShared).length > 0;
+    if (hasSharedFiles() || !orderedFunctionNames?.length || !projectRef || !accessToken) {
+        return hasSharedFiles();
+    }
+
+    let client;
+    try {
+        ensureUnzip();
+        client = createManagementClient(accessToken);
+    } catch (e) {
+        logWarning(`  Management API shared seed skipped: ${e.message}`);
+        return false;
+    }
+
+    let maxZips = parseInt(process.env.EDGE_BULK_MGMT_SHARED_MAX_DOWNLOADS || '0', 10);
+    const uniq = [...new Set(orderedFunctionNames.filter(Boolean))];
+    const names = maxZips > 0 ? uniq.slice(0, maxZips) : uniq;
+
+    logInfo(
+        `  Bulk shared seed via Management API (zip extract, up to ${names.length} function(s); early exit when _shared fills)…`
+    );
+
+    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'edge-mgmt-shared-'));
+    try {
+        for (let i = 0; i < names.length; i++) {
+            if (hasSharedFiles()) break;
+            const fnName = names[i];
+            const extractOne = path.join(tmpRoot, fnName);
+            try {
+                fs.rmSync(extractOne, { recursive: true, force: true });
+            } catch {
+                /* ignore */
+            }
+            try {
+                await client.downloadFunctionCode(projectRef, fnName, extractOne);
+            } catch {
+                continue;
+            }
+
+            fs.mkdirSync(destShared, { recursive: true });
+            for (const sd of findAllDirsNamedSharedDeep(extractOne, 40)) {
+                if (listRelativeFilesRecursive(sd).length > 0) {
+                    mergeDirectories(sd, destShared);
+                }
+            }
+            try {
+                fs.rmSync(extractOne, { recursive: true, force: true });
+            } catch {
+                /* ignore */
+            }
+
+            if (hasSharedFiles()) {
+                logSuccess(
+                    `  Management API shared seed: ${listRelativeFilesRecursive(destShared).length} file(s) in edge_functions/_shared after ${fnName}`
+                );
+                break;
+            }
+            if ((i + 1) % 20 === 0) {
+                logInfo(`  Management API shared seed progress: ${i + 1}/${names.length}, _shared still empty…`);
+            }
+        }
+        if (!hasSharedFiles()) {
+            logWarning(
+                '  Management API bulk zip seed did not populate _shared (verify SUPABASE_*_ACCESS_TOKEN and project ref).'
+            );
+        }
+        return hasSharedFiles();
+    } finally {
+        try {
+            fs.rmSync(tmpRoot, { recursive: true, force: true });
+        } catch {
+            /* ignore */
+        }
+    }
+}
+
+/**
+ * After all planned function folders exist on disk, ensure `edge_functions/_shared` is populated
+ * when any function imports shared code. Tries explicit per-function CLI downloads if needed.
+ */
+async function ensureGlobalSharedFromDownloads(
+    functionsDir,
+    functionsToMigrate,
+    sourceRef,
+    sourceDbPassword,
+    sourceAccessToken,
+    allSourceEdgeFunctionNamesForSharedSeed = null
+) {
+    const allFunctionDirs = [];
+    for (const { function: sf } of functionsToMigrate) {
+        const n = sf?.name;
+        if (!n) continue;
+        const d = path.join(functionsDir, n);
+        if (fs.existsSync(d)) allFunctionDirs.push(d);
+    }
+    materializeSharedLibraryFromDisk(functionsDir);
+    let agg = collectSharedFiles(functionsDir, allFunctionDirs);
+    if (agg.success && agg.files.length > 0) return;
+
+    const namesNeedingShared = [];
+    for (const { function: sf } of functionsToMigrate) {
+        const name = sf?.name;
+        if (!name) continue;
+        const dir = path.join(functionsDir, name);
+        let code = '';
+        const ipTs = path.join(dir, 'index.ts');
+        const ipJs = path.join(dir, 'index.js');
+        try {
+            if (fs.existsSync(ipTs)) code = fs.readFileSync(ipTs, 'utf8');
+            else if (fs.existsSync(ipJs)) code = fs.readFileSync(ipJs, 'utf8');
+        } catch {
+            continue;
+        }
+        if (hasSharedFileImports(code)) namesNeedingShared.push(name);
+    }
+    if (namesNeedingShared.length === 0) return;
+
+    const plannedNames = [...new Set(functionsToMigrate.map(({ function: sf }) => sf?.name).filter(Boolean))].sort(
+        (a, b) => a.length - b.length || a.localeCompare(b)
+    );
+    const catalogSorted =
+        Array.isArray(allSourceEdgeFunctionNamesForSharedSeed) && allSourceEdgeFunctionNamesForSharedSeed.length > 0
+            ? [...new Set(allSourceEdgeFunctionNamesForSharedSeed.filter(Boolean))].sort(
+                  (a, b) => a.length - b.length || a.localeCompare(b)
+              )
+            : null;
+    // Filtered runs (e.g. one function): only seed from requested function(s) — fast. Full-project zip sweep
+    // is opt-in via EDGE_SHARED_SEED_FULL_PROJECT=true (needed if CLI/API zips omit _shared for that fn only).
+    const useFullCatalogForSeed =
+        Boolean(catalogSorted && catalogSorted.length > plannedNames.length) &&
+        (!uniqueFilterSet || envFlagTrue('EDGE_SHARED_SEED_FULL_PROJECT'));
+    const seedNameList = [...new Set([...namesNeedingShared, ...(useFullCatalogForSeed ? catalogSorted : plannedNames)])];
+    if (useFullCatalogForSeed && plannedNames.length < catalogSorted.length) {
+        logInfo(
+            `  Shared seed: full project list (${catalogSorted.length} name(s); EDGE_SHARED_SEED_FULL_PROJECT) before ` +
+                `deploying ${plannedNames.length} filtered function(s)…`
+        );
+    } else if (uniqueFilterSet && namesNeedingShared.length > 0) {
+        logInfo(
+            `  Shared seed: scoped to ${seedNameList.length} filtered function name(s) only (set EDGE_SHARED_SEED_FULL_PROJECT=true to sweep all source functions for _shared).`
+        );
+    }
+    // Management API zips first (no Docker); CLI bulk is slow and often omits _shared on disk.
+    if (seedNameList.length > 0 && sourceRef && sourceAccessToken) {
+        await bulkSeedSharedFromManagementApi(functionsDir, seedNameList, sourceRef, sourceAccessToken);
+        agg = collectSharedFiles(functionsDir, allFunctionDirs);
+        if (agg.success && agg.files.length > 0) return;
+    }
+
+    if (seedNameList.length > 0 && sourceRef && sourceDbPassword) {
+        await bulkSeedSharedFromSourceCli(
+            functionsDir,
+            seedNameList,
+            sourceRef,
+            sourceDbPassword,
+            sourceAccessToken
+        );
+        agg = collectSharedFiles(functionsDir, allFunctionDirs);
+        if (agg.success && agg.files.length > 0) return;
+    }
+
+    let maxSeed = parseInt(process.env.EDGE_SHARED_EXPLICIT_SEED_MAX || '20', 10);
+    if (!Number.isFinite(maxSeed) || maxSeed < 1) maxSeed = 20;
+    // Prefer shorter names first (often smaller/simpler functions; CLI may return shared sooner).
+    const unique = [...new Set(namesNeedingShared)].sort(
+        (a, b) => a.length - b.length || a.localeCompare(b)
+    );
+    const toTry = unique.slice(0, maxSeed);
+    const skipped = unique.length - toTry.length;
+
+    logInfo(
+        `${colors.cyan}  Shared bundle is empty but ${unique.length} function(s) import shared code — ` +
+            `trying up to ${toTry.length} explicit CLI seed download(s) (EDGE_SHARED_EXPLICIT_SEED_MAX=${maxSeed})…${colors.reset}`
+    );
+    if (skipped > 0) {
+        logInfo(
+            `  (${skipped} additional name(s) skipped to avoid a long sequential run; raise EDGE_SHARED_EXPLICIT_SEED_MAX if needed.)`
+        );
+    }
+
+    for (let i = 0; i < toTry.length; i++) {
+        const name = toTry[i];
+        const quiet = i > 0;
+        logInfo(`  Shared seed ${i + 1}/${toTry.length}: ${name}…`);
+        await downloadSharedFilesExplicitly(
+            sourceRef,
+            functionsDir,
+            sourceDbPassword,
+            name,
+            quiet,
+            sourceAccessToken
+        );
+        agg = collectSharedFiles(functionsDir, allFunctionDirs);
+        if (agg.success && agg.files.length > 0) {
+            logSuccess(`  ✓ Populated edge_functions/_shared (${agg.files.length} file(s)) after seeding from ${name}`);
+            return;
+        }
+    }
+
+    logWarning(
+        `  edge_functions/_shared is still empty after ${toTry.length} seed attempt(s). ` +
+            `Set EDGE_FUNCTIONS_SHARED_SOURCE_DIR in .env.local to your app’s supabase/functions/_shared, or copy files into ` +
+            `${path.join(functionsDir, '_shared')}. Phase 2 will try per-deploy materialize + rescue.`
+    );
+}
+
+const SHARED_DISCOVERY_SKIP_DIRS = new Set([
+    'node_modules',
+    '.git',
+    'dist',
+    'build',
+    '.next',
+    'coverage',
+    'backups',
+    'vendor',
+    '.turbo',
+    '.cache'
+]);
+
+/**
+ * Walk rootDir (bounded depth) for directories matching .../supabase/functions/_shared with at least one .ts/.js file.
+ * @returns {{ path: string, count: number }[]}
+ */
+function discoverSupabaseFunctionsSharedDirs(rootDir, maxDepth = 12) {
+    const matches = [];
+    if (!rootDir || !fs.existsSync(rootDir)) return matches;
+
+    const queue = [{ dir: rootDir, depth: 0 }];
+    while (queue.length > 0) {
+        const { dir, depth } = queue.shift();
+        if (depth > maxDepth) continue;
+        let entries = [];
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const e of entries) {
+            if (!e.isDirectory() || e.name.startsWith('.')) continue;
+            if (SHARED_DISCOVERY_SKIP_DIRS.has(e.name)) continue;
+            const p = path.join(dir, e.name);
+            if (e.name === '_shared' && path.basename(dir) === 'functions' && path.basename(path.dirname(dir)) === 'supabase') {
+                const rels = listRelativeFilesRecursive(p);
+                const codeCount = rels.filter((r) => r.endsWith('.ts') || r.endsWith('.js')).length;
+                if (codeCount > 0) {
+                    matches.push({ path: p, count: codeCount });
+                }
+                continue;
+            }
+            queue.push({ dir: p, depth: depth + 1 });
+        }
+    }
+    return matches;
+}
+
+/**
+ * Merge a usable _shared tree into edge_functions/_shared from env, this repo, My-Projects, or repo parent.
+ * @returns {boolean} true if migration edge_functions/_shared now has at least one file
+ */
+function materializeSharedLibraryFromDisk(functionsDir) {
+    const dest = path.join(functionsDir, '_shared');
+    fs.mkdirSync(dest, { recursive: true });
+
+    const tryMerge = (label, srcDir) => {
+        if (!srcDir || !fs.existsSync(srcDir)) return false;
+        mergeDirectories(srcDir, dest);
+        const n = listRelativeFilesRecursive(dest).length;
+        if (n > 0) {
+            logSuccess(`    ✓ Materialized edge_functions/_shared from ${label} (${n} file(s))`);
+            return true;
+        }
+        return false;
+    };
+
+    const explicit = process.env.EDGE_FUNCTIONS_SHARED_SOURCE_DIR;
+    if (explicit && String(explicit).trim()) {
+        const p = path.resolve(String(explicit).trim());
+        if (tryMerge(`EDGE_FUNCTIONS_SHARED_SOURCE_DIR (${p})`, p)) return true;
+    }
+
+    const projectShared = path.join(PROJECT_ROOT, 'supabase', 'functions', '_shared');
+    if (tryMerge('project supabase/functions/_shared', projectShared)) return true;
+
+    const myProjects = path.join(PROJECT_ROOT, 'My-Projects');
+    if (fs.existsSync(myProjects)) {
+        const found = discoverSupabaseFunctionsSharedDirs(myProjects, 14);
+        found.sort((a, b) => b.count - a.count);
+        if (found[0] && tryMerge(`discovered ${found[0].path}`, found[0].path)) return true;
+    }
+
+    const parent = path.resolve(PROJECT_ROOT, '..');
+    if (parent !== PROJECT_ROOT && fs.existsSync(parent)) {
+        const found = discoverSupabaseFunctionsSharedDirs(parent, 8);
+        found.sort((a, b) => b.count - a.count);
+        if (found[0] && tryMerge(`discovered ${found[0].path}`, found[0].path)) return true;
+    }
+
+    return listRelativeFilesRecursive(dest).length > 0;
 }
 
 // Load environment variables from .env.local or .env file
@@ -559,7 +1052,8 @@ function hasSharedFileImports(functionCode) {
     // - require('../_shared/...')
     // - from '../_shared/...' (ES6 imports)
     const sharedImportPattern = /(?:import|require|from)\s+['"](?:\.\.?\/)?_shared\/[^'"]+['"]/i;
-    return sharedImportPattern.test(functionCode);
+    const atSharedPattern = /(?:import|require|from)\s+['"]@shared\/[^'"]+['"]/i;
+    return sharedImportPattern.test(functionCode) || atSharedPattern.test(functionCode);
 }
 
 // Get Supabase URLs, access token, and database password from environment
@@ -1003,91 +1497,6 @@ function getEdgeFunctionsViaCLI(projectRef, projectName, dbPassword, accessToken
     }
 }
 
-// Check if Docker is running
-function checkDocker() {
-    try {
-        execSync('docker ps', { stdio: 'pipe', timeout: 5000 });
-        return true;
-    } catch (e) {
-        return false;
-    }
-}
-
-// Ensure Docker is running before edge function download/deploy. Tries to start Docker on macOS/Linux unless EDGE_DOCKER_NO_AUTO_START=true.
-async function ensureDockerRunning() {
-    logInfo('Preflight: checking Docker (`docker ps`)…');
-    if (checkDocker()) {
-        logSuccess('Preflight: Docker is reachable.');
-        return;
-    }
-    if (process.env.EDGE_DOCKER_NO_AUTO_START === 'true') {
-        logError('Docker is not running and EDGE_DOCKER_NO_AUTO_START=true (auto-start disabled).');
-        throw new Error('Docker is not running');
-    }
-
-    let waitSec = parseInt(process.env.EDGE_DOCKER_START_WAIT_SEC || '120', 10);
-    if (!Number.isFinite(waitSec) || waitSec < 1) {
-        waitSec = 120;
-    }
-    const maxWaitMs = waitSec * 1000;
-    const pollIntervalMs = 3000;
-
-    const waitForDockerDaemon = async () => {
-        for (let waited = 0; waited < maxWaitMs; waited += pollIntervalMs) {
-            logInfo(`Waiting for Docker to be ready... (${waited / 1000}s / ${maxWaitMs / 1000}s)`);
-            try {
-                execSync('docker ps', { stdio: 'pipe', timeout: 10000 });
-                logSuccess('Docker is running.');
-                return true;
-            } catch (e) {
-                /* keep polling */
-            }
-            await new Promise((r) => setTimeout(r, pollIntervalMs));
-        }
-        return false;
-    };
-
-    const isMac = process.platform === 'darwin';
-    const isLinux = process.platform === 'linux';
-
-    if (isMac) {
-        logInfo('Docker is not running. Attempting to start Docker Desktop...');
-        try {
-            execSync('open -a Docker', { stdio: 'pipe', timeout: 5000 });
-        } catch (e) {
-            logWarning('Could not launch Docker Desktop (open -a Docker failed).');
-        }
-        if (await waitForDockerDaemon()) {
-            return;
-        }
-    } else if (isLinux) {
-        logInfo('Docker is not running. Attempting systemctl start docker...');
-        try {
-            execSync('systemctl start docker', { stdio: 'pipe', timeout: 15000 });
-        } catch (e) {
-            try {
-                execSync('sudo -n systemctl start docker', { stdio: 'pipe', timeout: 15000 });
-            } catch (e2) {
-                logWarning('Could not start docker via systemctl (try: sudo systemctl start docker).');
-            }
-        }
-        if (await waitForDockerDaemon()) {
-            return;
-        }
-    }
-
-    logError('Docker is not running - required for edge function download and deploy.');
-    logInfo('Please start Docker and run this migration again.');
-    if (isMac) {
-        logInfo('  macOS: Open Docker from Applications, or run: open -a Docker');
-    } else if (isLinux) {
-        logInfo('  Linux: sudo systemctl start docker (or start your container runtime)');
-    } else {
-        logInfo('  Windows: Start Docker Desktop from the Start menu');
-    }
-    throw new Error('Docker is not running');
-}
-
 // Link project using Supabase CLI
 function linkProject(projectRef, dbPassword, accessToken = null) {
     try {
@@ -1243,7 +1652,7 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             env.SUPABASE_ACCESS_TOKEN = accessToken;
         }
 
-        if (!checkDocker()) {
+        if (!dockerPreflight.checkDocker()) {
             if (!quiet) {
                 logError(`    ✗ Docker is not running - required for downloading functions via CLI`);
             }
@@ -1342,40 +1751,23 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             
             for (const tempSharedDir of tempSharedDirs) {
                 if (fs.existsSync(tempSharedDir) && fs.lstatSync(tempSharedDir).isDirectory()) {
-                    const files = fs.readdirSync(tempSharedDir);
-                    if (files.length > 0) {
-                        // Count actual files (not directories)
-                        const actualFiles = files.filter(f => {
-                            const filePath = path.join(tempSharedDir, f);
-                            try {
-                                return fs.statSync(filePath).isFile();
-                            } catch {
-                                return false;
-                            }
-                        });
-                        
-                        if (actualFiles.length > 0) {
-                            foundSharedLocations.push({ path: tempSharedDir, files: actualFiles });
-                            mergeDirectories(tempSharedDir, migrationSharedDir);
-                            totalSharedFiles += actualFiles.length;
-                        }
+                    const relFiles = listRelativeFilesRecursive(tempSharedDir);
+                    if (relFiles.length > 0) {
+                        foundSharedLocations.push({ path: tempSharedDir, files: relFiles });
+                        mergeDirectories(tempSharedDir, migrationSharedDir);
+                        totalSharedFiles += relFiles.length;
                     }
                 }
             }
             
-            // Log what was copied
+            // Log what was copied (nested _shared/ trees, not only top-level files)
             if (totalSharedFiles > 0) {
-                const finalSharedFiles = fs.readdirSync(migrationSharedDir).filter(f => {
-                    const filePath = path.join(migrationSharedDir, f);
-                    try {
-                        return fs.statSync(filePath).isFile();
-                    } catch {
-                        return false;
-                    }
-                });
-                
+                const finalSharedFiles = listRelativeFilesRecursive(migrationSharedDir);
                 if (!quiet) {
-                    logInfo(`    Found and copied ${finalSharedFiles.length} shared file(s) from ${foundSharedLocations.length} location(s): ${finalSharedFiles.join(', ')}`);
+                    const prev = finalSharedFiles.slice(0, 15).join(', ');
+                    logInfo(
+                        `    Found and copied ${finalSharedFiles.length} shared file(s) from ${foundSharedLocations.length} location(s): ${prev}${finalSharedFiles.length > 15 ? ', …' : ''}`
+                    );
                 }
             }
             
@@ -1417,40 +1809,23 @@ async function downloadEdgeFunction(functionName, projectRef, downloadDir, dbPas
             
             for (const localSharedDir of localSharedDirs) {
                 if (fs.existsSync(localSharedDir) && fs.lstatSync(localSharedDir).isDirectory()) {
-                    const files = fs.readdirSync(localSharedDir);
-                    if (files.length > 0) {
-                        // Count actual files (not directories)
-                        const actualFiles = files.filter(f => {
-                            const filePath = path.join(localSharedDir, f);
-                            try {
-                                return fs.statSync(filePath).isFile();
-                            } catch {
-                                return false;
-                            }
-                        });
-                        
-                        if (actualFiles.length > 0) {
-                            foundSharedLocations.push({ path: localSharedDir, files: actualFiles });
-                            mergeDirectories(localSharedDir, migrationSharedDir);
-                            totalSharedFiles += actualFiles.length;
-                        }
+                    const relFiles = listRelativeFilesRecursive(localSharedDir);
+                    if (relFiles.length > 0) {
+                        foundSharedLocations.push({ path: localSharedDir, files: relFiles });
+                        mergeDirectories(localSharedDir, migrationSharedDir);
+                        totalSharedFiles += relFiles.length;
                     }
                 }
             }
             
             // Log what was copied
             if (totalSharedFiles > 0) {
-                const finalSharedFiles = fs.readdirSync(migrationSharedDir).filter(f => {
-                    const filePath = path.join(migrationSharedDir, f);
-                    try {
-                        return fs.statSync(filePath).isFile();
-                    } catch {
-                        return false;
-                    }
-                });
-                
+                const finalSharedFiles = listRelativeFilesRecursive(migrationSharedDir);
                 if (!quiet) {
-                    logInfo(`    Found and copied ${finalSharedFiles.length} shared file(s) from ${foundSharedLocations.length} location(s): ${finalSharedFiles.join(', ')}`);
+                    const prev = finalSharedFiles.slice(0, 15).join(', ');
+                    logInfo(
+                        `    Found and copied ${finalSharedFiles.length} shared file(s) from ${foundSharedLocations.length} location(s): ${prev}${finalSharedFiles.length > 15 ? ', …' : ''}`
+                    );
                 }
             }
             
@@ -1675,6 +2050,7 @@ async function deployEdgeFunction(
     dbPassword,
     sourceRef = null,
     sourceDbPassword = null,
+    sourceAccessToken = null,
     targetAccessToken = null,
     deployStrategyContext
 ) {
@@ -1753,20 +2129,12 @@ async function deployEdgeFunction(
             // Use mergeDirectories to copy all files recursively
             mergeDirectories(sharedFilesResult.globalDir, sharedDestDir);
             
-            // Verify files were copied
-            const copiedFiles = fs.existsSync(sharedDestDir) 
-                ? fs.readdirSync(sharedDestDir).filter(f => {
-                    const filePath = path.join(sharedDestDir, f);
-                    try {
-                        return fs.statSync(filePath).isFile();
-                    } catch {
-                        return false;
-                    }
-                })
-                : [];
+            // Verify files were copied (include nested paths under _shared/)
+            const copiedFiles = fs.existsSync(sharedDestDir) ? listRelativeFilesRecursive(sharedDestDir) : [];
             
             if (copiedFiles.length > 0) {
-                logInfo(`    ✓ Successfully copied ${copiedFiles.length} shared file(s): ${copiedFiles.join(', ')}`);
+                const prev = copiedFiles.slice(0, 15).join(', ');
+                logInfo(`    ✓ Successfully copied ${copiedFiles.length} shared file(s): ${prev}${copiedFiles.length > 15 ? ', …' : ''}`);
             } else {
                 logError(`    ✗ Failed to copy shared files - destination directory is empty`);
                 if (functionNeedsSharedFiles) {
@@ -1818,20 +2186,12 @@ async function deployEdgeFunction(
                     mergeDirectories(directSharedDir, sharedDestDir);
                 }
                 
-                // Verify again
-                const retryCopiedFiles = fs.existsSync(sharedDestDir) 
-                    ? fs.readdirSync(sharedDestDir).filter(f => {
-                        const filePath = path.join(sharedDestDir, f);
-                        try {
-                            return fs.statSync(filePath).isFile();
-                        } catch {
-                            return false;
-                        }
-                    })
-                    : [];
+                // Verify again (nested _shared/)
+                const retryCopiedFiles = fs.existsSync(sharedDestDir) ? listRelativeFilesRecursive(sharedDestDir) : [];
                 
                 if (retryCopiedFiles.length > 0) {
-                    logInfo(`    ✓ Successfully copied ${retryCopiedFiles.length} shared file(s) on retry: ${retryCopiedFiles.join(', ')}`);
+                    const prev = retryCopiedFiles.slice(0, 15).join(', ');
+                    logInfo(`    ✓ Successfully copied ${retryCopiedFiles.length} shared file(s) on retry: ${prev}${retryCopiedFiles.length > 15 ? ', …' : ''}`);
                     // Update sharedFilesResult for later use
                     sharedFilesResult.success = true;
                     sharedFilesResult.files = retryCopiedFiles;
@@ -1861,16 +2221,7 @@ async function deployEdgeFunction(
                         }
                         
                         // Final check
-                        const finalCheck = fs.existsSync(sharedDestDir) 
-                            ? fs.readdirSync(sharedDestDir).filter(f => {
-                                const filePath = path.join(sharedDestDir, f);
-                                try {
-                                    return fs.statSync(filePath).isFile();
-                                } catch {
-                                    return false;
-                                }
-                            })
-                            : [];
+                        const finalCheck = fs.existsSync(sharedDestDir) ? listRelativeFilesRecursive(sharedDestDir) : [];
                         
                         if (finalCheck.length > 0) {
                             logInfo(`    ✓ Final copy successful: ${finalCheck.length} file(s)`);
@@ -1912,19 +2263,11 @@ async function deployEdgeFunction(
                             }
                             mergeDirectories(functionSharedDir, sharedDestDir);
                             
-                            const emergencyFiles = fs.existsSync(sharedDestDir) 
-                                ? fs.readdirSync(sharedDestDir).filter(f => {
-                                    const filePath = path.join(sharedDestDir, f);
-                                    try {
-                                        return fs.statSync(filePath).isFile();
-                                    } catch {
-                                        return false;
-                                    }
-                                })
-                                : [];
+                            const emergencyFiles = fs.existsSync(sharedDestDir) ? listRelativeFilesRecursive(sharedDestDir) : [];
                             
                             if (emergencyFiles.length > 0) {
-                                logInfo(`    ✓ Emergency copy successful: ${emergencyFiles.length} file(s): ${emergencyFiles.join(', ')}`);
+                                const prev = emergencyFiles.slice(0, 12).join(', ');
+                                logInfo(`    ✓ Emergency copy successful: ${emergencyFiles.length} file(s): ${prev}${emergencyFiles.length > 12 ? ', …' : ''}`);
                                 sharedFilesResult.success = true;
                                 sharedFilesResult.files = emergencyFiles;
                             }
@@ -1946,7 +2289,8 @@ async function deployEdgeFunction(
                         functionsParentDir,
                         sourceDbPassword,
                         functionName,
-                        false
+                        false,
+                        sourceAccessToken
                     );
                     
                     if (explicitSuccess) {
@@ -1959,7 +2303,105 @@ async function deployEdgeFunction(
                     }
                 }
                 
-                // Final check after all attempts
+                // Final check after all attempts — materialize, Management API zip seed, then CLI bulk (Docker), then re-collect
+                if (!sharedFilesResult.success || sharedFilesResult.files.length === 0) {
+                    logInfo(
+                        `    Attempting last-rescue: materialize _shared, Management API zip seed, then CLI bulk (Docker) if needed…`
+                    );
+                    materializeSharedLibraryFromDisk(functionsParentDir);
+                    if (sourceRef && fs.existsSync(functionsParentDir)) {
+                        const bulkNames = [];
+                        for (const entry of fs.readdirSync(functionsParentDir, { withFileTypes: true })) {
+                            if (
+                                !entry.isDirectory() ||
+                                entry.name === '_shared' ||
+                                entry.name.startsWith('supabase')
+                            ) {
+                                continue;
+                            }
+                            const otherDir = path.join(functionsParentDir, entry.name);
+                            if (
+                                fs.existsSync(path.join(otherDir, 'index.ts')) ||
+                                fs.existsSync(path.join(otherDir, 'index.js'))
+                            ) {
+                                bulkNames.push(entry.name);
+                            }
+                        }
+                        bulkNames.sort((a, b) => a.length - b.length || a.localeCompare(b));
+                        let sharedSeedOrder = [functionName, ...bulkNames.filter((n) => n !== functionName)];
+                        if (
+                            sourceAccessToken &&
+                            sourceRef &&
+                            (!uniqueFilterSet || envFlagTrue('EDGE_SHARED_SEED_FULL_PROJECT'))
+                        ) {
+                            try {
+                                const mgmt = createManagementClient(sourceAccessToken);
+                                const remoteNames = await mgmt.fetchFunctionList(sourceRef);
+                                if (Array.isArray(remoteNames) && remoteNames.length > bulkNames.length) {
+                                    sharedSeedOrder = [...new Set([functionName, ...remoteNames])];
+                                    logInfo(
+                                        `    Shared seed: using ${sharedSeedOrder.length} function name(s) from Management API (only ${bulkNames.length} on disk in migration dir)…`
+                                    );
+                                }
+                            } catch (listErr) {
+                                logWarning(`    Could not expand shared seed list via Management API: ${listErr.message || listErr}`);
+                            }
+                        }
+                        if (sharedSeedOrder.length > 0 && sourceAccessToken) {
+                            await bulkSeedSharedFromManagementApi(
+                                functionsParentDir,
+                                sharedSeedOrder,
+                                sourceRef,
+                                sourceAccessToken
+                            );
+                        }
+                        if (
+                            (!sharedFilesResult.success || sharedFilesResult.files.length === 0) &&
+                            sourceDbPassword &&
+                            sharedSeedOrder.length > 0
+                        ) {
+                            await bulkSeedSharedFromSourceCli(
+                                functionsParentDir,
+                                sharedSeedOrder,
+                                sourceRef,
+                                sourceDbPassword,
+                                sourceAccessToken
+                            );
+                        }
+                    }
+                    const rescueDirs = [functionDir];
+                    if (fs.existsSync(functionsParentDir)) {
+                        for (const entry of fs.readdirSync(functionsParentDir, { withFileTypes: true })) {
+                            if (
+                                !entry.isDirectory() ||
+                                entry.name === functionName ||
+                                entry.name === '_shared' ||
+                                entry.name.startsWith('supabase')
+                            ) {
+                                continue;
+                            }
+                            const otherDir = path.join(functionsParentDir, entry.name);
+                            if (
+                                fs.existsSync(path.join(otherDir, 'index.ts')) ||
+                                fs.existsSync(path.join(otherDir, 'index.js'))
+                            ) {
+                                rescueDirs.push(otherDir);
+                            }
+                        }
+                    }
+                    const rescued = collectSharedFiles(functionsParentDir, rescueDirs);
+                    if (rescued.success && rescued.files.length > 0) {
+                        sharedFilesResult = rescued;
+                        if (!fs.existsSync(sharedDestDir)) {
+                            fs.mkdirSync(sharedDestDir, { recursive: true });
+                        }
+                        mergeDirectories(rescued.globalDir, sharedDestDir);
+                        logSuccess(
+                            `    ✓ Recovered shared bundle (${rescued.files.length} file(s)) — continuing deploy`
+                        );
+                    }
+                }
+
                 if (!sharedFilesResult.success || sharedFilesResult.files.length === 0) {
                     logError(`    ✗ CRITICAL: Function ${functionName} references _shared files but none were found!`);
                     logError(`    Deployment will fail. Please ensure shared files are available.`);
@@ -1967,6 +2409,7 @@ async function deployEdgeFunction(
                     logError(`      1. ${path.join(functionsParentDir, '_shared')}`);
                     logError(`      2. ${path.join(PROJECT_ROOT, 'supabase', 'functions', '_shared')}`);
                     logError(`      3. ${path.join(functionDir, '_shared')}`);
+                    logError(`    Or set EDGE_FUNCTIONS_SHARED_SOURCE_DIR in .env.local to your app's supabase/functions/_shared`);
                     logError(`    Workaround options:`);
                     logError(`      1. Download a function that uses shared files first (they will be collected automatically)`);
                     logError(`      2. Manually copy shared files from source project to: ${path.join(functionsParentDir, '_shared')}`);
@@ -2001,14 +2444,7 @@ async function deployEdgeFunction(
                 }
                 
                 const deploymentFiles = fs.existsSync(deploymentSharedPath)
-                    ? fs.readdirSync(deploymentSharedPath).filter(f => {
-                        const filePath = path.join(deploymentSharedPath, f);
-                        try {
-                            return fs.statSync(filePath).isFile();
-                        } catch {
-                            return false;
-                        }
-                    })
+                    ? listRelativeFilesRecursive(deploymentSharedPath)
                     : [];
                 
                 if (deploymentFiles.length > 0) {
@@ -2195,6 +2631,151 @@ function getEnvNameFromRef(projectRef) {
     return projectRef;
 }
 
+function envFlagTrue(name) {
+    const v = (process.env[name] || '').trim().toLowerCase();
+    return v === '1' || v === 'true' || v === 'yes';
+}
+
+/**
+ * After `supabase functions …/download` zip extract, find the folder that holds the edge entrypoint.
+ */
+function resolveExtractedFunctionRoot(absRoot, functionName) {
+    if (!absRoot || !fs.existsSync(absRoot)) return null;
+    const hasEntry = (d) =>
+        fs.existsSync(path.join(d, 'index.ts')) ||
+        fs.existsSync(path.join(d, 'index.js')) ||
+        fs.existsSync(path.join(d, 'deno.json'));
+    if (hasEntry(absRoot)) return absRoot;
+    const named = path.join(absRoot, functionName);
+    if (fs.existsSync(named) && hasEntry(named)) return named;
+    try {
+        for (const e of fs.readdirSync(absRoot, { withFileTypes: true })) {
+            if (!e.isDirectory()) continue;
+            const p = path.join(absRoot, e.name);
+            if (hasEntry(p)) return p;
+        }
+        for (const e of fs.readdirSync(absRoot, { withFileTypes: true })) {
+            if (!e.isDirectory()) continue;
+            const p1 = path.join(absRoot, e.name);
+            for (const e2 of fs.readdirSync(p1, { withFileTypes: true })) {
+                if (!e2.isDirectory()) continue;
+                const p2 = path.join(p1, e2.name);
+                if (hasEntry(p2)) return p2;
+            }
+        }
+    } catch {
+        /* ignore */
+    }
+    return null;
+}
+
+/**
+ * Download each function from source and target via Management API and byte-compare extracted trees.
+ */
+async function runManagementApiByteParityProbe(names, sourceRef, targetRef, sourceToken, targetToken) {
+    ensureUnzip();
+    const srcClient = createManagementClient(sourceToken);
+    const tgtClient = createManagementClient(targetToken);
+    const rows = [];
+    const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'edge-parity-byte-'));
+    try {
+        for (let i = 0; i < names.length; i++) {
+            const name = names[i];
+            const srcExtract = path.join(tmpBase, `s_${i}`);
+            const tgtExtract = path.join(tmpBase, `t_${i}`);
+            fs.mkdirSync(srcExtract, { recursive: true });
+            fs.mkdirSync(tgtExtract, { recursive: true });
+            try {
+                await srcClient.downloadFunctionCode(sourceRef, name, srcExtract);
+            } catch (e) {
+                rows.push({
+                    name,
+                    status: 'source_download_failed',
+                    detail: String(e.message || e).slice(0, 240)
+                });
+                continue;
+            }
+            try {
+                await tgtClient.downloadFunctionCode(targetRef, name, tgtExtract);
+            } catch (e) {
+                rows.push({
+                    name,
+                    status: 'target_download_failed',
+                    detail: String(e.message || e).slice(0, 240)
+                });
+                continue;
+            }
+            const rs = resolveExtractedFunctionRoot(srcExtract, name);
+            const rt = resolveExtractedFunctionRoot(tgtExtract, name);
+            if (!rs || !rt) {
+                rows.push({ name, status: 'layout_unresolved', sourceRoot: !!rs, targetRoot: !!rt });
+            } else {
+                const identical = compareFunctionDirectories(rs, rt);
+                rows.push({ name, status: identical ? 'byte_identical' : 'byte_different' });
+            }
+            try {
+                fs.rmSync(srcExtract, { recursive: true, force: true });
+                fs.rmSync(tgtExtract, { recursive: true, force: true });
+            } catch {
+                /* ignore */
+            }
+            if ((i + 1) % 15 === 0) {
+                logInfo(`  Byte parity probe progress: ${i + 1}/${names.length}…`);
+            }
+        }
+    } finally {
+        try {
+            fs.rmSync(tmpBase, { recursive: true, force: true });
+        } catch {
+            /* ignore */
+        }
+    }
+    return rows;
+}
+
+function buildDeploymentAlignmentReport({
+    sourceNamesSorted,
+    targetNameSet,
+    migratedSet,
+    failedSet,
+    incompatibleSet,
+    skippedSharedSet,
+    skippedSet,
+    identicalSet
+}) {
+    const notAligned = [];
+    const aligned = [];
+    for (const name of sourceNamesSorted) {
+        if (failedSet.has(name)) {
+            notAligned.push({ name, reasons: ['deploy_failed'] });
+            continue;
+        }
+        if (incompatibleSet.has(name)) {
+            notAligned.push({ name, reasons: ['incompatible_native_deps'] });
+            continue;
+        }
+        if (skippedSharedSet.has(name)) {
+            notAligned.push({ name, reasons: ['skipped_shared_dependency'] });
+            continue;
+        }
+        if (!targetNameSet.has(name)) {
+            notAligned.push({ name, reasons: ['missing_on_target'] });
+            continue;
+        }
+        if (migratedSet.has(name)) {
+            aligned.push({ name, note: 'deployed_this_run' });
+        } else if (skippedSet.has(name)) {
+            aligned.push({
+                name,
+                note: identicalSet.has(name) ? 'skipped_incremental_identical_metadata' : 'skipped_without_new_deploy'
+            });
+        } else {
+            aligned.push({ name, note: 'present_on_target_no_deploy_this_run' });
+        }
+    }
+    return { aligned, notAligned };
+}
+
 // Main migration function
 async function migrateEdgeFunctions() {
     logSeparator();
@@ -2208,13 +2789,21 @@ async function migrateEdgeFunctions() {
 
     // Ensure Docker is running (required for CLI download/deploy). On macOS, try to start Docker Desktop.
     logInfo('Step 0/4: Docker preflight (this can take up to ~90s if Docker is starting)…');
-    await ensureDockerRunning();
+    await dockerPreflight.ensureDockerRunning({
+        info: logInfo,
+        success: logSuccess,
+        error: logError,
+        warning: logWarning
+    });
 
     // Step 1: Get source edge functions
     logStep(1, 4, 'Fetching source edge functions...');
     let sourceFunctions = [];
+    /** Full source project function names (before CLI filter / retry-missing) — used to populate _shared when migrating a subset. */
+    let allSourceEdgeFunctionNamesForSharedSeed = [];
     try {
         sourceFunctions = await getEdgeFunctions(SOURCE_REF, sourceConfig.accessToken, 'Source', sourceConfig.dbPassword);
+        allSourceEdgeFunctionNamesForSharedSeed = sourceFunctions.map((f) => f?.name).filter(Boolean);
         if (sourceFunctions.length === 0) {
             logWarning('No edge functions found in source project (or permission denied)');
             logInfo('Continuing migration without edge functions...');
@@ -2224,6 +2813,7 @@ async function migrateEdgeFunctions() {
         if (error.message && error.message.includes('403')) {
             logWarning('Permission denied for source edge functions - continuing migration without edge functions');
             sourceFunctions = [];
+            allSourceEdgeFunctionNamesForSharedSeed = [];
         } else {
             logError('Failed to fetch source edge functions - cannot continue migration');
             logError(`  Error: ${error.message || JSON.stringify(error)}`);
@@ -2495,63 +3085,29 @@ async function migrateEdgeFunctions() {
         );
         console.log('');
         
-        // Pre-deployment: Collect all shared files from all functions before deploying
-        // This ensures shared dependencies are available for all functions
-        logInfo('Collecting shared files from all functions...');
-        
-        // Collect function directories
-        const functionDirsToCheck = [];
-        for (const { function: sourceFunction } of functionsToMigrate) {
-            const functionName = sourceFunction.name;
-            if (!functionName) continue;
-            
-            const functionDir = path.join(functionsDir, functionName);
-            if (fs.existsSync(functionDir)) {
-                functionDirsToCheck.push(functionDir);
-            }
-        }
-        
-        // Use the new collectSharedFiles helper
-        const sharedFilesResult = collectSharedFiles(functionsDir, functionDirsToCheck);
-        
-        if (sharedFilesResult.success && sharedFilesResult.files.length > 0) {
-            logInfo(`  ✓ Collected ${sharedFilesResult.files.length} shared file(s) from ${sharedFilesResult.locations.length} location(s): ${sharedFilesResult.files.join(', ')}`);
-            if (sharedFilesResult.locations.length > 0) {
-                logInfo(`  Sources: ${sharedFilesResult.locations.map(loc => path.relative(functionsDir, loc)).join(', ')}`);
-            }
-        } else {
-            logInfo(`  ℹ No shared files found (functions may not have shared dependencies)`);
-        }
+        // Phase 1: Download every planned function first so edge_functions/_shared is populated
+        // before any deploy. API order no longer causes "shared-only-first" deploy failures.
+        logSeparator();
+        logInfo(`${colors.bright}Phase 1: Download all function sources from source${colors.reset}`);
+        logSeparator();
         console.log('');
-        
-        // Process each function
+
         for (let i = 0; i < functionsToMigrate.length; i++) {
-            const { function: sourceFunction, isNew, existing, versionMatches, updatedMatches } = functionsToMigrate[i];
+            const { function: sourceFunction } = functionsToMigrate[i];
             const functionName = sourceFunction.name;
             const indexLabel = `${i + 1}/${functionsToMigrate.length}`;
-            
+
             if (!functionName) {
-                logError(`Function ${indexLabel} has no name: ${JSON.stringify(sourceFunction)}`);
+                logError(`[Download ${indexLabel}] has no name: ${JSON.stringify(sourceFunction)}`);
                 failedFunctions.push('(unknown)');
+                console.log('');
                 continue;
             }
-            
-            logInfo(`${colors.bright}Function ${indexLabel}: ${functionName}${colors.reset}`);
-            
-            if (isNew) {
-                logInfo(`  Status: NEW - will create in target`);
-            } else {
-                logInfo(
-                    `  Status: EXISTS - will ${compareWithTarget ? 'compare with target then deploy if different' : 'deploy from source (overwrite target)'}` 
-                );
-                logInfo(`  Source ID: ${sourceFunction.id || 'N/A'}`);
-                logInfo(`  Target ID: ${existing?.id || 'N/A'}`);
-            }
-            
-            // Download function from source (shared imports are bundled in deployEdgeFunction via _shared)
+
+            logInfo(`${colors.bright}[Download ${indexLabel}] ${functionName}${colors.reset}`);
             const functionDir = path.join(functionsDir, functionName);
-            logInfo(`  Downloading edge function from source...`);
-            
+            logInfo(`  Downloading from source...`);
+
             const downloadSuccess = await downloadEdgeFunction(
                 functionName,
                 SOURCE_REF,
@@ -2560,45 +3116,95 @@ async function migrateEdgeFunctions() {
                 false,
                 sourceConfig.accessToken
             );
-            
+
             if (!downloadSuccess) {
-                logWarning(`  ⚠ Could not download function code - skipping deployment`);
+                logWarning(`  ⚠ Could not download function code`);
                 logWarning(`    Function may need to be deployed manually from codebase`);
                 failedFunctions.push(functionName);
                 console.log('');
                 continue;
             }
-            
-            // Check if function directory was created
+
             if (!fs.existsSync(functionDir)) {
-                logWarning(`  ⚠ Function directory not found after download - skipping`);
+                logWarning(`  ⚠ Function directory not found after download`);
                 failedFunctions.push(functionName);
                 console.log('');
                 continue;
             }
-            
-            // Ensure shared files are normalized to functionsDir/_shared after download
-            // This is important for deployment to find shared files
+
             normalizeFunctionLayout(functionDir, functionsDir);
-            
-            // Re-collect shared files after each download to ensure they're captured
-            // This is critical because shared files might be downloaded with any function
-            const updatedFunctionDirs = [];
-            for (let j = 0; j <= i; j++) {
-                const { function: f } = functionsToMigrate[j];
-                if (f?.name) {
-                    const fd = path.join(functionsDir, f.name);
-                    if (fs.existsSync(fd)) {
-                        updatedFunctionDirs.push(fd);
-                    }
-                }
+            logSuccess(`  ✓ ${functionName} saved under edge_functions/`);
+            console.log('');
+        }
+
+        const downloadedFunctionDirs = functionsToMigrate
+            .map(({ function: sf }) => (sf?.name ? path.join(functionsDir, sf.name) : null))
+            .filter(Boolean)
+            .filter((d) => fs.existsSync(d));
+
+        materializeSharedLibraryFromDisk(functionsDir);
+        let bootstrapShared = collectSharedFiles(functionsDir, downloadedFunctionDirs);
+        if (bootstrapShared.success && bootstrapShared.files.length > 0) {
+            const preview = bootstrapShared.files.slice(0, 20).join(', ');
+            logInfo(
+                `Phase 1 merge: ${bootstrapShared.files.length} file(s) in edge_functions/_shared — ${preview}${bootstrapShared.files.length > 20 ? ', …' : ''}`
+            );
+        } else {
+            logInfo('Phase 1 merge: edge_functions/_shared still empty (or only nested; explicit step may populate)');
+        }
+
+        await ensureGlobalSharedFromDownloads(
+            functionsDir,
+            functionsToMigrate,
+            SOURCE_REF,
+            sourceConfig.dbPassword,
+            sourceConfig.accessToken,
+            allSourceEdgeFunctionNamesForSharedSeed
+        );
+
+        bootstrapShared = collectSharedFiles(functionsDir, downloadedFunctionDirs);
+        if (bootstrapShared.success && bootstrapShared.files.length > 0) {
+            logSuccess(`Phase 1 complete: ${bootstrapShared.files.length} shared file(s) ready for deployment`);
+        } else {
+            logInfo('Phase 1 complete: no shared bundle on disk (functions may not use _shared)');
+        }
+        console.log('');
+
+        logSeparator();
+        logInfo(`${colors.bright}Phase 2: Deploy to target${colors.reset}`);
+        logSeparator();
+        console.log('');
+
+        for (let i = 0; i < functionsToMigrate.length; i++) {
+            const { function: sourceFunction, isNew, existing, versionMatches, updatedMatches } = functionsToMigrate[i];
+            const functionName = sourceFunction.name;
+            const indexLabel = `${i + 1}/${functionsToMigrate.length}`;
+
+            if (!functionName) {
+                logError(`Function ${indexLabel} has no name: ${JSON.stringify(sourceFunction)}`);
+                failedFunctions.push('(unknown)');
+                continue;
             }
-            const updatedSharedResult = collectSharedFiles(functionsDir, updatedFunctionDirs);
-            if (updatedSharedResult.success && updatedSharedResult.files.length > 0) {
-                logInfo(`  ✓ Updated shared files collection: ${updatedSharedResult.files.length} file(s) available (${updatedSharedResult.files.join(', ')})`);
+
+            const functionDir = path.join(functionsDir, functionName);
+            if (!fs.existsSync(functionDir)) {
+                logWarning(`${colors.bright}Function ${indexLabel}: ${functionName}${colors.reset} — skipped (download failed in phase 1)`);
+                console.log('');
+                continue;
             }
-            
-            // Check if downloaded function actually needs shared files (verify from downloaded code)
+
+            logInfo(`${colors.bright}Function ${indexLabel}: ${functionName}${colors.reset}`);
+
+            if (isNew) {
+                logInfo(`  Status: NEW - will create in target`);
+            } else {
+                logInfo(
+                    `  Status: EXISTS - will ${compareWithTarget ? 'compare with target then deploy if different' : 'deploy from source (overwrite target)'}`
+                );
+                logInfo(`  Source ID: ${sourceFunction.id || 'N/A'}`);
+                logInfo(`  Target ID: ${existing?.id || 'N/A'}`);
+            }
+
             const downloadedIndexPath = path.join(functionDir, 'index.ts');
             const downloadedIndexJsPath = path.join(functionDir, 'index.js');
             let downloadedFunctionCode = '';
@@ -2608,11 +3214,9 @@ async function migrateEdgeFunctions() {
                 downloadedFunctionCode = fs.readFileSync(downloadedIndexJsPath, 'utf8');
             }
             if (hasSharedFileImports(downloadedFunctionCode)) {
-                logInfo(`  ✓ Confirmed: imports from _shared (will bundle during deploy)`);
+                logInfo(`  Source imports shared code (bundled during deploy from edge_functions/_shared)`);
             }
-            
-            logSuccess(`  ✓ Downloaded function: ${functionName}`);
-            
+
             // Optional: download target and byte-compare (slow); default is deploy source → target without compare
             if (!isNew && !replaceMode && compareWithTarget) {
                 logInfo(`  Comparing with target function...`);
@@ -2672,6 +3276,7 @@ async function migrateEdgeFunctions() {
                 targetConfig.dbPassword,
                 SOURCE_REF,
                 sourceConfig.dbPassword,
+                sourceConfig.accessToken,
                 targetConfig.accessToken,
                 edgeDeployContext
             );
@@ -2761,6 +3366,149 @@ async function migrateEdgeFunctions() {
     failedCount = uniqueFailedFunctions.length;
     skippedCount = uniqueSkippedFunctions.length;
 
+    let postMigrationTargetList = [];
+    let postMigrationTargetFetchOk = false;
+    if (sourceNameSet.size > 0 && targetConfig.accessToken) {
+        try {
+            logInfo('Re-fetching target edge functions for post-migration alignment report…');
+            postMigrationTargetList = await getEdgeFunctions(
+                TARGET_REF,
+                targetConfig.accessToken,
+                'Target (post-migration)',
+                targetConfig.dbPassword
+            );
+            postMigrationTargetFetchOk = true;
+        } catch (e) {
+            logWarning(`Post-migration target list fetch failed: ${e.message || e}`);
+        }
+    }
+    const targetVerifySet = new Set(postMigrationTargetList.map((f) => f?.name).filter(Boolean));
+    const sourceNamesSorted = [...sourceNameSet].sort((a, b) => a.localeCompare(b));
+    const alignment = buildDeploymentAlignmentReport({
+        sourceNamesSorted,
+        targetNameSet: targetVerifySet,
+        migratedSet: new Set(uniqueMigratedFunctions),
+        failedSet: new Set(uniqueFailedFunctions),
+        incompatibleSet: new Set(uniqueIncompatibleFunctions),
+        skippedSharedSet: new Set(uniqueSkippedSharedFunctions),
+        skippedSet: new Set(uniqueSkippedFunctions),
+        identicalSet: new Set(dedupe(identicalFunctions))
+    });
+    const extraOnTarget = [...targetVerifySet].filter((n) => !sourceNameSet.has(n)).sort();
+
+    let byteParityRows = null;
+    let byteParitySummary = null;
+    const wantByteParity = envFlagTrue('EDGE_PARITY_FULL_COMPARE');
+    let maxByte = parseInt(process.env.EDGE_PARITY_MAX_FUNCTIONS || '300', 10);
+    if (!Number.isFinite(maxByte) || maxByte < 1) maxByte = 300;
+    if (
+        wantByteParity &&
+        postMigrationTargetFetchOk &&
+        sourceConfig.accessToken &&
+        targetConfig.accessToken
+    ) {
+        const intersection = sourceNamesSorted.filter((n) => targetVerifySet.has(n));
+        const toProbe = intersection.slice(0, maxByte);
+        if (intersection.length > maxByte) {
+            logWarning(
+                `Byte parity: probing first ${maxByte} of ${intersection.length} function(s) present on both sides (raise EDGE_PARITY_MAX_FUNCTIONS).`
+            );
+        }
+        logInfo(
+            `Byte-level parity: Management API zip compare for ${toProbe.length} function(s) (EDGE_PARITY_FULL_COMPARE)…`
+        );
+        try {
+            byteParityRows = await runManagementApiByteParityProbe(
+                toProbe,
+                SOURCE_REF,
+                TARGET_REF,
+                sourceConfig.accessToken,
+                targetConfig.accessToken
+            );
+            const diff = byteParityRows.filter((r) => r.status === 'byte_different');
+            const idem = byteParityRows.filter((r) => r.status === 'byte_identical');
+            const probs = byteParityRows.filter((r) => r.status !== 'byte_identical' && r.status !== 'byte_different');
+            byteParitySummary = {
+                probed: byteParityRows.length,
+                byte_identical: idem.length,
+                byte_different: diff.length,
+                other: probs.length,
+                byte_different_names: diff.map((r) => r.name).sort(),
+                other_rows: probs
+            };
+        } catch (e) {
+            logWarning(`Byte parity probe aborted: ${e.message || e}`);
+            byteParitySummary = { error: String(e.message || e) };
+        }
+    }
+
+    const alignmentReportPath = path.join(MIGRATION_DIR, 'edge_functions_alignment_report.json');
+    const alignmentPayload = {
+        timestamp: new Date().toISOString(),
+        sourceRef: SOURCE_REF,
+        targetRef: TARGET_REF,
+        filteredRun: Boolean(uniqueFilterSet || retryMissingMode),
+        targetListFetchOk: postMigrationTargetFetchOk,
+        nameCounts: { source: sourceNameSet.size, target_post_migration: targetVerifySet.size },
+        extraOnTarget,
+        notAlignedWithTarget: alignment.notAligned,
+        alignedWithTarget: alignment.aligned,
+        byteParitySummary,
+        byteParityRows
+    };
+    fs.writeFileSync(alignmentReportPath, JSON.stringify(alignmentPayload, null, 2), 'utf8');
+
+    logSeparator();
+    logInfo(`${colors.bright}Post-migration alignment report${colors.reset}`);
+    logInfo(`  Written: ${alignmentReportPath}`);
+    logInfo(
+        `  Source names: ${sourceNameSet.size} — target names after run: ${targetVerifySet.size}` +
+            (postMigrationTargetFetchOk ? '' : ' (target re-list failed)')
+    );
+    if (alignment.notAligned.length > 0) {
+        logWarning(`  Not aligned with source intent (${alignment.notAligned.length}):`);
+        alignment.notAligned.slice(0, 45).forEach((row) => {
+            logWarning(`    - ${row.name}: ${row.reasons.join(', ')}`);
+        });
+        if (alignment.notAligned.length > 45) {
+            logWarning(`    … and ${alignment.notAligned.length - 45} more (see JSON)`);
+        }
+    } else if (postMigrationTargetFetchOk && sourceNameSet.size > 0) {
+        logSuccess(
+            `  Every source function is listed on target with no deploy-fail / incompatible / skipped-shared flags.`
+        );
+    }
+    if (extraOnTarget.length > 0) {
+        logInfo(
+            `  Target-only (not in source): ${extraOnTarget.length} — ${extraOnTarget.slice(0, 30).join(', ')}${
+                extraOnTarget.length > 30 ? ', …' : ''
+            }`
+        );
+    }
+    if (byteParitySummary && !byteParitySummary.error) {
+        if (byteParitySummary.byte_different > 0) {
+            logWarning(
+                `  Byte parity: ${byteParitySummary.byte_different} function(s) differ (source zip vs target zip): ${byteParitySummary.byte_different_names.join(', ')}`
+            );
+        } else if (byteParitySummary.probed > 0) {
+            logSuccess(
+                `  Byte parity: all ${byteParitySummary.byte_identical} probed function bundle(s) match byte-for-byte.`
+            );
+        }
+    } else if (wantByteParity && !sourceConfig.accessToken) {
+        logInfo(`  Byte parity skipped: missing source access token.`);
+    } else if (wantByteParity && !targetConfig.accessToken) {
+        logInfo(`  Byte parity skipped: missing target access token.`);
+    } else if (wantByteParity && !postMigrationTargetFetchOk) {
+        logInfo(`  Byte parity skipped: target function list unavailable.`);
+    } else if (!wantByteParity) {
+        logInfo(
+            `  Byte-for-byte bundle compare not run (set EDGE_PARITY_FULL_COMPARE=true; optional EDGE_PARITY_MAX_FUNCTIONS).`
+        );
+    }
+    logSeparator();
+    console.log('');
+
     const summary = {
         timestamp: new Date().toISOString(),
         sourceRef: SOURCE_REF,
@@ -2782,7 +3530,12 @@ async function migrateEdgeFunctions() {
         deployStrategyChanges: edgeDeployContext ? edgeDeployContext.strategyChanges : [],
         pruneTarget: allowPruneTarget,
         prunedTargetOnly: dedupe(prunedTargetOnlyNames),
-        pruneFailed: uniquePruneFailed
+        pruneFailed: uniquePruneFailed,
+        alignmentReportPath,
+        alignmentNotAlignedCount: alignment.notAligned.length,
+        alignmentAlignedCount: alignment.aligned.length,
+        extraOnTargetCount: extraOnTarget.length,
+        byteParitySummary
     };
 
     const failedFilePath = path.join(MIGRATION_DIR, 'edge_functions_failed.txt');
@@ -2864,38 +3617,31 @@ ${sourceFunctions.map(f => `- ${f.name} (id: ${f.id || 'N/A'})`).join('\n')}
     logInfo(`Created README: ${readmePath}`);
 
     if (!uniqueFilterSet && !retryMissingMode && sourceNameSet.size > 0) {
-        try {
-            const verifyTargetList = await getEdgeFunctions(
-                TARGET_REF,
-                targetConfig.accessToken,
-                'Target',
-                targetConfig.dbPassword
-            );
-            const targetVerifySet = new Set(verifyTargetList.map((f) => f?.name).filter(Boolean));
+        if (postMigrationTargetFetchOk) {
             const namesMatch =
                 targetVerifySet.size === sourceNameSet.size &&
                 [...sourceNameSet].every((n) => targetVerifySet.has(n));
             if (namesMatch) {
                 logSuccess(
-                    `Edge function parity: source and target both have ${sourceNameSet.size} function(s) with the same names.`
+                    `Edge function name parity: source and target both have ${sourceNameSet.size} function(s) with the same names.`
                 );
             } else {
                 const missingOnTarget = [...sourceNameSet].filter((n) => !targetVerifySet.has(n)).sort();
-                const extraOnTarget = [...targetVerifySet].filter((n) => !sourceNameSet.has(n)).sort();
+                const extraOnly = [...targetVerifySet].filter((n) => !sourceNameSet.has(n)).sort();
                 logWarning(
-                    `Edge function parity: source has ${sourceNameSet.size} named function(s), target has ${targetVerifySet.size}.`
+                    `Edge function name parity: source has ${sourceNameSet.size} named function(s), target has ${targetVerifySet.size}.`
                 );
                 if (missingOnTarget.length > 0) {
-                    logWarning(`  Missing on target (deploy failed, skipped, or incompatible): ${missingOnTarget.join(', ')}`);
+                    logWarning(`  Missing on target: ${missingOnTarget.join(', ')}`);
                 }
-                if (extraOnTarget.length > 0) {
+                if (extraOnly.length > 0) {
                     logWarning(
-                        `  Extra on target only: ${extraOnTarget.join(', ')} — use ${colors.cyan}--prune-target${colors.reset} on the next run to remove them.`
+                        `  Extra on target only: ${extraOnly.join(', ')} — use ${colors.cyan}--prune-target${colors.reset} on the next run to remove them.`
                     );
                 }
             }
-        } catch (parityErr) {
-            logWarning(`Could not verify edge function parity: ${parityErr.message || parityErr}`);
+        } else {
+            logWarning('Could not verify edge function name parity (target re-list failed).');
         }
         console.log('');
     }

@@ -16,6 +16,7 @@ cd "$PROJECT_ROOT"
 # Source utilities
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
+source "$PROJECT_ROOT/lib/edge_docker_preflight.sh"
 
 # Usage function (must be defined before it's called)
 usage() {
@@ -48,6 +49,15 @@ Environment (Docker):
   EDGE_DOCKER_NO_AUTO_START=true   Do not run open/systemctl; fail if Docker is down
   EDGE_DOCKER_START_WAIT_SEC       Seconds to wait after auto-start (default 120)
   EDGE_DOCKER_PS_TIMEOUT_SEC       Initial docker ps probe timeout (default 30)
+
+Environment (shared _shared seeding in Node utility):
+  EDGE_SHARED_EXPLICIT_SEED_MAX       Max CLI retries to populate edge_functions/_shared when empty (default 20)
+  EDGE_FUNCTIONS_SHARED_SOURCE_DIR   Absolute path to your app’s supabase/functions/_shared (when CLI omits _shared)
+  EDGE_BULK_SHARED_MAX_DOWNLOADS     Cap bulk CLI downloads used to fill _shared from source (0 = unlimited)
+  EDGE_BULK_MGMT_SHARED_MAX_DOWNLOADS Cap Management API zip downloads for _shared seed (0 = unlimited; needs access token)
+  EDGE_SHARED_SEED_FULL_PROJECT   When migrating a filtered subset, still sweep all source function zips for _shared (default: off; slow)
+  EDGE_PARITY_FULL_COMPARE         After migration, byte-compare source vs target zip per function (Management API; slow)
+  EDGE_PARITY_MAX_FUNCTIONS        Max functions to include in byte parity (default 300)
 
 Examples:
   $0 prod test                          # Migrate edge functions from prod to test
@@ -181,78 +191,6 @@ if [ "${#EDGE_FUNCTION_NAMES[@]}" -gt 0 ]; then
     PRUNE_TARGET_EDGE="false"
 fi
 
-# Args: max_seconds. Returns 0 if docker ps succeeds, non-zero if failed, 124 if timed out
-_edge_docker_ps_timed() {
-    local max="${1:-30}"
-    docker ps >/dev/null 2>&1 &
-    local dp=$!
-    local i=0
-    while kill -0 "$dp" 2>/dev/null && [ "$i" -lt "$max" ]; do
-        sleep 1
-        i=$((i + 1))
-    done
-    if kill -0 "$dp" 2>/dev/null; then
-        log_warning "docker ps exceeded ${max}s — treating as hung."
-        kill -9 "$dp" 2>/dev/null || true
-        wait "$dp" 2>/dev/null || true
-        return 124
-    fi
-    wait "$dp"
-    return $?
-}
-
-_edge_docker_ps_with_timeout() {
-    _edge_docker_ps_timed "${EDGE_DOCKER_PS_TIMEOUT_SEC:-30}"
-}
-
-# Try to launch Docker (macOS / Linux). Set EDGE_DOCKER_NO_AUTO_START=true to disable.
-_edge_force_start_docker() {
-    case "$(uname -s)" in
-        Darwin)
-            log_info "Starting Docker Desktop (open -a Docker)…"
-            if open -a Docker 2>/dev/null; then
-                return 0
-            fi
-            log_warning "Could not run \`open -a Docker\`. Install Docker Desktop from https://docker.com/products/docker-desktop"
-            return 1
-            ;;
-        Linux)
-            if command -v systemctl >/dev/null 2>&1; then
-                log_info "Trying to start Docker service (systemctl)…"
-                if systemctl start docker 2>/dev/null; then
-                    return 0
-                fi
-                if sudo -n systemctl start docker 2>/dev/null; then
-                    return 0
-                fi
-            fi
-            log_warning "Could not start Docker via systemctl. Run: sudo systemctl start docker"
-            return 1
-            ;;
-        *)
-            log_warning "Start Docker manually for this OS, then re-run this script."
-            return 1
-            ;;
-    esac
-}
-
-# Poll until docker ps works or EDGE_DOCKER_START_WAIT_SEC elapsed (default 120)
-_edge_wait_for_docker_ready() {
-    local total="${EDGE_DOCKER_START_WAIT_SEC:-120}"
-    local interval=3
-    local elapsed=0
-    log_info "Waiting for Docker daemon (up to ${total}s, poll every ${interval}s)…"
-    while [ "$elapsed" -lt "$total" ]; do
-        if _edge_docker_ps_timed 12; then
-            return 0
-        fi
-        elapsed=$((elapsed + interval))
-        log_info "  … Docker not ready yet (${elapsed}s / ${total}s)"
-        sleep "$interval"
-    done
-    return 1
-}
-
 component_prompt_proceed() {
     local title=$1
     local message=${2:-"Proceed?"}
@@ -349,7 +287,7 @@ case "${AUTO_CONFIRM_COMPONENT}" in
         ;;
 esac
 
-log_info "Preflight: checking Node.js, Docker, and CLI…"
+log_info "Preflight: checking Node.js and Supabase CLI…"
 
 # Check for Node.js
 if ! command -v node >/dev/null 2>&1; then
@@ -358,49 +296,7 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
-if command -v docker >/dev/null 2>&1; then
-    DOCKER_AVAILABLE=true
-else
-    if [ "${SKIP_DOCKER_CHECK:-false}" = "true" ]; then
-        log_warning "Docker CLI not found, continuing with Management API only."
-        DOCKER_AVAILABLE=false
-    else
-        log_error "Supabase CLI requires Docker for edge function download/deploy. Install Docker or set SKIP_DOCKER_CHECK=true to skip."
-        exit 1
-    fi
-fi
-
-# Ensure Docker daemon is running: probe, then try to start + wait (unless EDGE_DOCKER_NO_AUTO_START=true)
-if [ "$DOCKER_AVAILABLE" = "true" ] && [ "${SKIP_DOCKER_CHECK:-false}" != "true" ]; then
-    log_info "Docker: checking daemon (probe max ${EDGE_DOCKER_PS_TIMEOUT_SEC:-30}s — set EDGE_DOCKER_PS_TIMEOUT_SEC to adjust)…"
-    _edge_docker_ps_with_timeout
-    _dock_rc=$?
-    if [ "$_dock_rc" -eq 0 ]; then
-        log_success "Docker is responding."
-    else
-        if [ "${EDGE_DOCKER_NO_AUTO_START:-false}" = "true" ]; then
-            if [ "$_dock_rc" -eq 124 ]; then
-                log_error "Docker probe timed out. Set EDGE_DOCKER_NO_AUTO_START=false to allow auto-start, or start Docker manually."
-            else
-                log_error "Docker is not running. Start Docker manually or unset EDGE_DOCKER_NO_AUTO_START."
-            fi
-            exit 1
-        fi
-        if [ "$_dock_rc" -eq 124 ]; then
-            log_warning "Docker probe timed out — will try to start Docker and wait (daemon may be starting)."
-        else
-            log_warning "Docker is not responding — attempting to start Docker automatically…"
-        fi
-        _edge_force_start_docker || true
-        if ! _edge_wait_for_docker_ready; then
-            log_error "Docker still not ready after ${EDGE_DOCKER_START_WAIT_SEC:-120}s."
-            log_info "Start Docker Desktop (or \`sudo systemctl start docker\` on Linux), wait until it is fully up, then retry."
-            log_info "Increase wait with: EDGE_DOCKER_START_WAIT_SEC=180"
-            exit 1
-        fi
-        log_success "Docker is responding."
-    fi
-fi
+edge_docker_preflight_or_exit
 
 # Check for environment-specific access tokens
 SOURCE_ACCESS_TOKEN=$(get_env_access_token "$SOURCE_ENV")

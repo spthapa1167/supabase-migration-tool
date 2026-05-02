@@ -9,6 +9,7 @@ cd "$PROJECT_ROOT"
 
 source "$PROJECT_ROOT/lib/logger.sh"
 source "$PROJECT_ROOT/lib/supabase_utils.sh"
+source "$PROJECT_ROOT/lib/edge_docker_preflight.sh"
 
 usage() {
     cat <<EOF
@@ -95,11 +96,13 @@ TARGET_REF=$(get_project_ref "$TARGET_ENV")
 find_latest_migration_dir() {
     local pattern_source="backups/edge_functions_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
     local pattern_retry="backups/edge_functions_retry_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
+    local pattern_schema="backups/schema_migration_${SOURCE_ENV}_to_${TARGET_ENV}_*"
 
     local candidates=()
     shopt -s nullglob
     candidates+=($pattern_source)
     candidates+=($pattern_retry)
+    candidates+=($pattern_schema)
     shopt -u nullglob
 
     if [ ${#candidates[@]} -eq 0 ]; then
@@ -202,6 +205,13 @@ if [ -d "$PROJECT_SHARED_DIR" ]; then
         fi
     done
 fi
+
+if ! command -v node >/dev/null 2>&1; then
+    log_error "Node.js not found - please install Node.js"
+    exit 1
+fi
+
+edge_docker_preflight_or_exit
 
 EDGE_FUNCTIONS_UTIL="$PROJECT_ROOT/utils/edge-functions-migration.js"
 if [ ! -f "$EDGE_FUNCTIONS_UTIL" ]; then
