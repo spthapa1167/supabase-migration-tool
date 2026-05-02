@@ -2537,6 +2537,31 @@ FINAL_TARGET_POLICIES=$(run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASS
 [ -z "$FINAL_TARGET_POLICIES" ] || ! [[ "$FINAL_TARGET_POLICIES" =~ ^[0-9]+$ ]] && FINAL_TARGET_POLICIES=0
 log_to_file "$LOG_FILE" "RLS Policies after migration - Source: $FINAL_SOURCE_POLICIES, Target: $FINAL_TARGET_POLICIES"
 
+# Integrated policy gap closure (previously invoked separately from supabase_migration.sh)
+POLICY_COMPLETE_SCRIPT="$PROJECT_ROOT/scripts/main/policy_migration_complete.sh"
+if [ "${SKIP_POLICY_MIGRATION_COMPLETE:-}" != "true" ] && [ -x "$POLICY_COMPLETE_SCRIPT" ] &&
+    [[ "${FINAL_SOURCE_POLICIES:-0}" =~ ^[0-9]+$ ]] && [[ "${FINAL_TARGET_POLICIES:-0}" =~ ^[0-9]+$ ]] &&
+    [ "$FINAL_TARGET_POLICIES" -lt "$FINAL_SOURCE_POLICIES" ]; then
+    log_info "Target has fewer RLS policies than source (${FINAL_TARGET_POLICIES} < ${FINAL_SOURCE_POLICIES}); running ${POLICY_COMPLETE_SCRIPT##*/}…"
+    log_to_file "$LOG_FILE" "Integrated policy_migration_complete: target < source"
+    set +e
+    "$POLICY_COMPLETE_SCRIPT" "$SOURCE_ENV" "$TARGET_ENV" 2>&1 | tee -a "$LOG_FILE"
+    _policy_complete_exit=${PIPESTATUS[0]}
+    set -e
+    if [ "${_policy_complete_exit:-1}" -ne 0 ]; then
+        log_warning "Integrated policy script exited with code ${_policy_complete_exit} — see $LOG_FILE"
+        log_to_file "$LOG_FILE" "policy_migration_complete exit: ${_policy_complete_exit}"
+    else
+        log_success "Integrated policy sync finished successfully"
+        log_to_file "$LOG_FILE" "policy_migration_complete: SUCCESS"
+    fi
+    FINAL_SOURCE_POLICIES=$(run_psql_query_with_fallback "$SOURCE_REF" "$SOURCE_PASSWORD" "$SOURCE_POOLER_REGION" "$SOURCE_POOLER_PORT" "$FINAL_COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+    FINAL_TARGET_POLICIES=$(run_psql_query_with_fallback "$TARGET_REF" "$TARGET_PASSWORD" "$TARGET_POOLER_REGION" "$TARGET_POOLER_PORT" "$FINAL_COUNT_POLICIES_QUERY" 2>/dev/null | head -1 | tr -d '[:space:]' || echo "0")
+    [ -z "$FINAL_SOURCE_POLICIES" ] || ! [[ "$FINAL_SOURCE_POLICIES" =~ ^[0-9]+$ ]] && FINAL_SOURCE_POLICIES=0
+    [ -z "$FINAL_TARGET_POLICIES" ] || ! [[ "$FINAL_TARGET_POLICIES" =~ ^[0-9]+$ ]] && FINAL_TARGET_POLICIES=0
+    log_to_file "$LOG_FILE" "RLS Policies after integrated follow-up - Source: $FINAL_SOURCE_POLICIES, Target: $FINAL_TARGET_POLICIES"
+fi
+
 # Create summary
 SUMMARY_FILE="$MIGRATION_DIR_ABS/migration_summary.txt"
 {

@@ -798,6 +798,44 @@ function discoverSupabaseFunctionsSharedDirs(rootDir, maxDepth = 12) {
 }
 
 /**
+ * Merge each .../supabase/functions/<fn>/_shared into dest (not only functions/_shared).
+ * Repos often keep modules next to the edge function (e.g. visitor-geo-hint/_shared/visitorGeoFromRequest.ts).
+ * @returns {number} number of per-function _shared directories merged
+ */
+function mergePerFunctionSharedTreesFromFunctionsRoot(functionsRoot, dest) {
+    if (!functionsRoot || !fs.existsSync(functionsRoot) || !fs.lstatSync(functionsRoot).isDirectory()) return 0;
+    if (path.basename(functionsRoot) !== 'functions') return 0;
+    let count = 0;
+    try {
+        for (const e of fs.readdirSync(functionsRoot, { withFileTypes: true })) {
+            if (!e.isDirectory() || e.name === '_shared' || e.name.startsWith('.')) continue;
+            const sub = path.join(functionsRoot, e.name, '_shared');
+            if (fs.existsSync(sub) && fs.lstatSync(sub).isDirectory()) {
+                mergeDirectories(sub, dest);
+                count++;
+            }
+        }
+    } catch {
+        /* ignore */
+    }
+    return count;
+}
+
+/** When EDGE_FUNCTIONS_SHARED_SOURCE_DIR points at .../functions/_shared, also merge each .../functions/<fn>/_shared into dest. */
+function mergeExplicitPerFunctionSharedIntoDest(destDir) {
+    const explicitShared = process.env.EDGE_FUNCTIONS_SHARED_SOURCE_DIR;
+    if (!explicitShared || !String(explicitShared).trim() || !destDir) return 0;
+    const resolved = path.resolve(String(explicitShared).trim());
+    const functionsRoot = path.dirname(resolved);
+    if (path.basename(resolved) !== '_shared' || path.basename(functionsRoot) !== 'functions') return 0;
+    const k = mergePerFunctionSharedTreesFromFunctionsRoot(functionsRoot, destDir);
+    if (k > 0) {
+        logInfo(`    Merged ${k} app repo per-function _shared folder(s) into bundle (${functionsRoot})`);
+    }
+    return k;
+}
+
+/**
  * Merge a usable _shared tree into edge_functions/_shared from env, this repo, My-Projects, or repo parent.
  * @returns {boolean} true if migration edge_functions/_shared now has at least one file
  */
@@ -819,24 +857,70 @@ function materializeSharedLibraryFromDisk(functionsDir) {
     const explicit = process.env.EDGE_FUNCTIONS_SHARED_SOURCE_DIR;
     if (explicit && String(explicit).trim()) {
         const p = path.resolve(String(explicit).trim());
-        if (tryMerge(`EDGE_FUNCTIONS_SHARED_SOURCE_DIR (${p})`, p)) return true;
+        if (fs.existsSync(p) && fs.lstatSync(p).isDirectory()) {
+            mergeDirectories(p, dest);
+            const functionsRoot = path.dirname(p);
+            if (path.basename(p) === '_shared' && path.basename(functionsRoot) === 'functions') {
+                const k = mergePerFunctionSharedTreesFromFunctionsRoot(functionsRoot, dest);
+                if (k > 0) {
+                    logInfo(`    Also merged ${k} per-function _shared folder(s) under ${functionsRoot}`);
+                }
+            }
+            const n = listRelativeFilesRecursive(dest).length;
+            if (n > 0) {
+                logSuccess(`    ✓ Materialized edge_functions/_shared from EDGE_FUNCTIONS_SHARED_SOURCE_DIR (${n} file(s))`);
+                return true;
+            }
+        }
     }
 
-    const projectShared = path.join(PROJECT_ROOT, 'supabase', 'functions', '_shared');
-    if (tryMerge('project supabase/functions/_shared', projectShared)) return true;
+    const projectFunctionsRoot = path.join(PROJECT_ROOT, 'supabase', 'functions');
+    const projectShared = path.join(projectFunctionsRoot, '_shared');
+    if (fs.existsSync(projectShared) && fs.lstatSync(projectShared).isDirectory()) {
+        mergeDirectories(projectShared, dest);
+        const k = mergePerFunctionSharedTreesFromFunctionsRoot(projectFunctionsRoot, dest);
+        if (k > 0) {
+            logInfo(`    Also merged ${k} per-function _shared folder(s) under ${projectFunctionsRoot}`);
+        }
+        const n = listRelativeFilesRecursive(dest).length;
+        if (n > 0) {
+            logSuccess(
+                `    ✓ Materialized edge_functions/_shared from project supabase/functions (+ per-fn _shared) (${n} file(s))`
+            );
+            return true;
+        }
+    }
+
+    const mergeDiscoveredShared = (labelPrefix, foundPath) => {
+        if (!foundPath || !fs.existsSync(foundPath)) return false;
+        mergeDirectories(foundPath, dest);
+        const functionsRoot = path.dirname(foundPath);
+        if (path.basename(foundPath) === '_shared' && path.basename(functionsRoot) === 'functions') {
+            const k = mergePerFunctionSharedTreesFromFunctionsRoot(functionsRoot, dest);
+            if (k > 0) {
+                logInfo(`    Also merged ${k} per-function _shared folder(s) under ${functionsRoot}`);
+            }
+        }
+        const n = listRelativeFilesRecursive(dest).length;
+        if (n > 0) {
+            logSuccess(`    ✓ Materialized edge_functions/_shared from ${labelPrefix} (${n} file(s))`);
+            return true;
+        }
+        return false;
+    };
 
     const myProjects = path.join(PROJECT_ROOT, 'My-Projects');
     if (fs.existsSync(myProjects)) {
         const found = discoverSupabaseFunctionsSharedDirs(myProjects, 14);
         found.sort((a, b) => b.count - a.count);
-        if (found[0] && tryMerge(`discovered ${found[0].path}`, found[0].path)) return true;
+        if (found[0] && mergeDiscoveredShared(`discovered ${found[0].path}`, found[0].path)) return true;
     }
 
     const parent = path.resolve(PROJECT_ROOT, '..');
     if (parent !== PROJECT_ROOT && fs.existsSync(parent)) {
         const found = discoverSupabaseFunctionsSharedDirs(parent, 8);
         found.sort((a, b) => b.count - a.count);
-        if (found[0] && tryMerge(`discovered ${found[0].path}`, found[0].path)) return true;
+        if (found[0] && mergeDiscoveredShared(`discovered ${found[0].path}`, found[0].path)) return true;
     }
 
     return listRelativeFilesRecursive(dest).length > 0;
@@ -2128,7 +2212,8 @@ async function deployEdgeFunction(
             
             // Use mergeDirectories to copy all files recursively
             mergeDirectories(sharedFilesResult.globalDir, sharedDestDir);
-            
+            mergeExplicitPerFunctionSharedIntoDest(sharedDestDir);
+
             // Verify files were copied (include nested paths under _shared/)
             const copiedFiles = fs.existsSync(sharedDestDir) ? listRelativeFilesRecursive(sharedDestDir) : [];
             
@@ -2185,7 +2270,8 @@ async function deployEdgeFunction(
                     // They should be the same, but copy from direct location too just in case
                     mergeDirectories(directSharedDir, sharedDestDir);
                 }
-                
+                mergeExplicitPerFunctionSharedIntoDest(sharedDestDir);
+
                 // Verify again (nested _shared/)
                 const retryCopiedFiles = fs.existsSync(sharedDestDir) ? listRelativeFilesRecursive(sharedDestDir) : [];
                 
@@ -2396,6 +2482,7 @@ async function deployEdgeFunction(
                             fs.mkdirSync(sharedDestDir, { recursive: true });
                         }
                         mergeDirectories(rescued.globalDir, sharedDestDir);
+                        mergeExplicitPerFunctionSharedIntoDest(sharedDestDir);
                         logSuccess(
                             `    ✓ Recovered shared bundle (${rescued.files.length} file(s)) — continuing deploy`
                         );

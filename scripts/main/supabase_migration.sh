@@ -1467,7 +1467,6 @@ perform_migration() {
     local missing_scripts=()
     local required_scripts=(
         "scripts/main/database_and_policy_migration.sh"
-        "scripts/main/policies_migration_new.sh"
         "scripts/main/storage_buckets_migration.sh"
         "scripts/main/edge_functions_migration.sh"
     )
@@ -1530,41 +1529,6 @@ perform_migration() {
             FAILED_COMPONENTS+=("database schema & policies")
             exit_code=1
             log_to_file "$LOG_FILE" "Database schema & policies migration: FAILED (exit code: $db_policy_exit_code) - CRITICAL ISSUE"
-        fi
-        
-        # Step 1a: Also run policies_migration_new.sh to ensure all policies are migrated
-        # This provides a second pass to catch any policies that might have been missed
-        log_info "Running additional policies migration (policies_migration_new.sh) to ensure complete policy coverage..."
-        local policies_migration_args=("$source" "$target" "$migration_dir")
-        
-        if [ "$AUTO_CONFIRM" = "true" ]; then
-            policies_migration_args+=("--auto-confirm")
-        fi
-        
-        if ! prompt_proceed "Additional Policies Migration" "Run additional policies migration to ensure all policies are migrated?"; then
-            log_warning "⚠️  Additional policies migration skipped by user."
-            SKIPPED_COMPONENTS+=("additional policies migration")
-            log_to_file "$LOG_FILE" "Additional policies migration: SKIPPED (user cancelled)"
-        else
-            log_to_file "$LOG_FILE" "Additional policies migration (policies_migration_new.sh): STARTING"
-            set +e  # Temporarily disable exit on error for component execution
-            set +o pipefail  # Disable pipefail to capture exit code properly
-            "$PROJECT_ROOT/scripts/main/policies_migration_new.sh" "${policies_migration_args[@]}" 2>&1 | tee -a "$LOG_FILE"
-            local policies_exit_code=${PIPESTATUS[0]}
-            set -o pipefail  # Re-enable pipefail
-            set -e
-            
-            if [ "$policies_exit_code" -eq 0 ]; then
-                log_success "Additional policies migration completed successfully"
-                SUCCEEDED_COMPONENTS+=("additional policies migration")
-                log_to_file "$LOG_FILE" "Additional policies migration: SUCCESS"
-            else
-                log_warning "⚠️  Additional policies migration encountered errors (exit code: $policies_exit_code)"
-                log_warning "   Continuing with remaining components..."
-                FAILED_COMPONENTS+=("additional policies migration")
-                exit_code=1
-                log_to_file "$LOG_FILE" "Additional policies migration: FAILED (exit code: $policies_exit_code)"
-            fi
         fi
     fi
     
@@ -1817,35 +1781,8 @@ perform_migration() {
         fi
     fi
 
-    # Final step: Run policy_migration_complete.sh to ensure all RLS policies are synced (closes any policy gap)
-    POLICY_COMPLETE_SCRIPT="$PROJECT_ROOT/scripts/main/policy_migration_complete.sh"
-    if [ -x "$POLICY_COMPLETE_SCRIPT" ]; then
-        log_info "Running policy migration complete (final pass to ensure all RLS policies are synced)..."
-        log_to_file "$LOG_FILE" "Policy migration complete (final pass): STARTING"
-        set +e
-        set +o pipefail
-        "$POLICY_COMPLETE_SCRIPT" "$source" "$target" 2>&1 | tee -a "$LOG_FILE"
-        local policy_complete_exit_code=${PIPESTATUS[0]}
-        set -o pipefail
-        set -e
-        if [ "${policy_complete_exit_code:-1}" -eq 0 ]; then
-            log_success "Policy migration complete finished successfully"
-            SUCCEEDED_COMPONENTS+=("policy migration complete")
-            log_to_file "$LOG_FILE" "Policy migration complete: SUCCESS"
-        else
-            log_warning "Policy migration complete had errors or remaining gap (exit code: ${policy_complete_exit_code:-1}); check log for manual SQL file path"
-            FAILED_COMPONENTS+=("policy migration complete")
-            exit_code=1
-            log_to_file "$LOG_FILE" "Policy migration complete: completed with gap or errors (exit code: ${policy_complete_exit_code:-1})"
-        fi
-    else
-        log_warning "policy_migration_complete.sh not found or not executable; skipping final policy pass"
-        log_to_file "$LOG_FILE" "Policy migration complete: SKIPPED (script not found)"
-    fi
+    # RLS policy gap closure (when needed) runs inside database_and_policy_migration.sh — not here.
 
-    # Note: Policies migration is now handled in Step 1 together with database schema
-    # via database_and_policy_migration.sh, so no separate policies migration step is needed
-    
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "  COMPONENT SUMMARY"
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
