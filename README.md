@@ -1,5 +1,44 @@
 # Supabase Project Duplication Tool
 
+#Sample .env.local file:
+# Supabase Migration Tool Configuration
+
+SUPABSE_APP_NAME="KNC_Online_Platform"
+
+#To support edge function with share file
+EDGE_SHARED_SEED_FULL_PROJECT=true
+EDGE_FUNCTIONS_SHARED_SOURCE_DIR=/Users/satyathapa/codebase/KNC-Projects/knc-online-platform/supabase/functions/_shared
+
+# Development Environment
+SUPABASE_DEV_ACCESS_TOKEN=xxx
+SUPABASE_DEV_PROJECT_NAME=KNC_Online_Platform-Dev
+SUPABASE_DEV_PROJECT_REF=htqfxkbuuqgwthwxqnxf
+SUPABASE_DEV_DB_PASSWORD=xxx
+SUPABASE_DEV_POOLER_REGION=aws-1-us-east-1
+SUPABASE_DEV_ANON_KEY=xxx
+SUPABASE_DEV_SERVICE_ROLE_KEY=xxx
+
+# Test/Staging Environment
+SUPABASE_TEST_PROJECT_NAME=KNC_Online_Platform-Test
+SUPABASE_TEST_ACCESS_TOKEN=xxx
+SUPABASE_TEST_PROJECT_REF=xvlawjjvronwaukcpnwt
+SUPABASE_TEST_DB_PASSWORD=xxx
+SUPABASE_TEST_POOLER_REGION=aws-1-us-east-2
+SUPABASE_TEST_ANON_KEY=xxx
+SUPABASE_TEST_SERVICE_ROLE_KEY=eyJhbjUtMxx6Rvs
+
+
+# Production Environment
+SUPABASE_PROD_PROJECT_NAME=KNC_Online_Platform-Prod
+SUPABASE_PROD_ACCESS_TOKEN=xxx
+SUPABASE_PROD_PROJECT_REF=llpfqjrnzfewnhebfmza
+SUPABASE_PROD_DB_PASSWORD=xxx
+SUPABASE_PROD_POOLER_REGION=aws-0-us-west-2
+SUPABASE_PROD_ANON_KEY=xxx
+SUPABASE_PROD_SERVICE_ROLE_KEY=xxx
+
+
+
 A comprehensive, reusable tool for duplicating and synchronizing Supabase projects between three environments (Production, Test, and Develop). Simply configure your project references in `.env.local` and start using it with any Supabase projects.
 
 ## 🌟 Features
